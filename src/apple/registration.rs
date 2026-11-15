@@ -1,20 +1,14 @@
-use std::{
-    io::{Read, Write},
-    time::Duration,
-};
-
 use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use openssl::{
     ec::{EcGroup, EcKey},
     nid::Nid,
-    pkey::PKey,
+    pkey::{PKey, Private},
     rsa::Rsa,
 };
 use plist::{Data, Dictionary, Value};
 use reqwest::{
-    Certificate, Client,
+    Client,
     header::{HeaderMap, HeaderName, HeaderValue},
 };
 use serde::Deserialize;
@@ -24,76 +18,132 @@ use crate::address;
 
 use super::{
     Identity, Session,
-    aps::{CERTIFICATES, TOPIC},
+    aps::TOPIC,
     certified_rsa,
     crypto::KeyPair,
+    http::{apple_client, plist_xml_gzip, read_response},
     nonce, rsa_signature,
 };
 
 const REGISTER_URL: &str =
     "https://identity.ess.apple.com/WebObjects/TDIdentityService.woa/wa/register";
-const MAX_RESPONSE: usize = 256 * 1024;
 
 #[derive(Deserialize)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
 struct Registration {
-    version: u32,
+    #[serde(flatten)]
+    device: DeviceRegistration,
     user_id: String,
+    auth_certificate: Data,
+    auth_private_key: Data,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(super) struct DeviceRegistration {
+    version: u32,
     handle: String,
     push_token: Data,
     push_certificate: Data,
     push_private_key: Data,
-    auth_certificate: Data,
-    auth_private_key: Data,
-    protocol_version: u32,
-    user_agent: String,
+    pub(super) protocol_version: u32,
+    pub(super) user_agent: String,
     device_name: String,
     hardware_version: String,
     os_version: String,
     software_version: String,
     private_device_data: Dictionary,
-    validation_data: Data,
+    pub(super) validation_data: Data,
+}
+
+pub(super) struct AccountAuth {
+    pub user_id: String,
+    pub certificate: Data,
+    pub key: PKey<Private>,
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        use zeroize::Zeroize;
+        clear_data(&mut self.auth_private_key);
+    }
+}
+
+impl Drop for DeviceRegistration {
+    fn drop(&mut self) {
         for field in [
             &mut self.push_token,
             &mut self.push_private_key,
-            &mut self.auth_private_key,
             &mut self.validation_data,
         ] {
-            let mut bytes: Vec<u8> = std::mem::replace(field, Data::new(Vec::new())).into();
-            bytes.zeroize();
+            clear_data(field);
         }
+    }
+}
+
+fn clear_data(data: &mut Data) {
+    use zeroize::Zeroize;
+    let mut bytes: Vec<u8> = std::mem::replace(data, Data::new(Vec::new())).into();
+    bytes.zeroize();
+}
+
+impl DeviceRegistration {
+    pub(super) fn token(&self) -> Result<[u8; 32]> {
+        self.push_token
+            .as_ref()
+            .try_into()
+            .context("Expected a 32-byte APNs device token")
+    }
+
+    pub(super) fn validate(&self) -> Result<()> {
+        ensure!(
+            self.version == 1 && self.protocol_version > 0,
+            "Invalid registration version"
+        );
+        ensure!(
+            !self.validation_data.as_ref().is_empty(),
+            "Apple device validation data is required"
+        );
+        ensure!(
+            !self.user_agent.is_empty()
+                && self.user_agent.len() <= 256
+                && self
+                    .user_agent
+                    .bytes()
+                    .all(|byte| byte == b' ' || byte.is_ascii_graphic()),
+            "Invalid Apple device user agent"
+        );
+        address(&self.handle)?;
+        self.token()?;
+        certified_rsa(&self.push_certificate, &self.push_private_key)?;
+        Ok(())
     }
 }
 
 pub async fn register_device(input: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     let registration: Registration =
         plist::from_bytes(input).context("Could not decode registration plist")?;
-    ensure!(
-        registration.version == 1 && registration.protocol_version > 0,
-        "Invalid registration version"
-    );
-    ensure!(
-        !registration.validation_data.as_ref().is_empty(),
-        "Apple device validation data is required"
-    );
+    registration.device.validate()?;
+    let auth = AccountAuth {
+        user_id: registration.user_id.clone(),
+        certificate: registration.auth_certificate.clone(),
+        key: certified_rsa(
+            &registration.auth_certificate,
+            &registration.auth_private_key,
+        )?,
+    };
+    register(&apple_client()?, &registration.device, auth).await
+}
+
+pub(super) async fn register(
+    client: &Client,
+    registration: &DeviceRegistration,
+    auth: AccountAuth,
+) -> Result<Zeroizing<Vec<u8>>> {
     let handle = address(&registration.handle)?;
-    let token: [u8; 32] = registration
-        .push_token
-        .as_ref()
-        .try_into()
-        .context("Expected a 32-byte APNs device token")?;
+    let token = registration.token()?;
     let push = certified_rsa(
         &registration.push_certificate,
         &registration.push_private_key,
-    )?;
-    let auth = certified_rsa(
-        &registration.auth_certificate,
-        &registration.auth_private_key,
     )?;
     let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
     let signing = PKey::from_ec_key(
@@ -104,11 +154,8 @@ pub async fn register_device(input: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     let encryption_bytes = Zeroizing::new(encryption.private_key_to_der()?);
     let pair = KeyPair::private(&signing_bytes, &encryption_bytes)?;
 
-    let document = registration_document(&registration, &handle, pair.public_der()?);
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    plist::to_writer_xml(&mut encoder, &document)?;
-    encoder.flush()?;
-    let body = encoder.finish()?;
+    let document = registration_document(registration, &auth.user_id, &handle, pair.public_der()?);
+    let body = plist_xml_gzip(&document)?;
     let mut headers = HeaderMap::new();
     for (key, value) in [
         ("x-push-token", STANDARD.encode(token)),
@@ -123,7 +170,7 @@ pub async fn register_device(input: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
                 registration.user_agent
             ),
         ),
-        ("x-auth-user-id-0", registration.user_id.clone()),
+        ("x-auth-user-id-0", auth.user_id.clone()),
         ("content-type", "application/x-apple-plist".into()),
         ("content-encoding", "gzip".into()),
         ("accept-encoding", "gzip".into()),
@@ -132,7 +179,7 @@ pub async fn register_device(input: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     }
     for (name, suffix, cert, key) in [
         ("push", "", &registration.push_certificate, &push),
-        ("auth", "-0", &registration.auth_certificate, &auth),
+        ("auth", "-0", &auth.certificate, &auth.key),
     ] {
         let nonce = nonce(1)?;
         let mut signed = nonce.to_vec();
@@ -156,8 +203,7 @@ pub async fn register_device(input: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
             );
         }
     }
-    let client = apple_client()?;
-    let mut response = client
+    let response = client
         .post(REGISTER_URL)
         .headers(headers)
         .body(body)
@@ -165,28 +211,10 @@ pub async fn register_device(input: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         .await
         .context("Could not reach Apple's registration endpoint")?
         .error_for_status()?;
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        ensure!(
-            bytes.len() + chunk.len() <= MAX_RESPONSE,
-            "Apple registration response exceeds size limit"
-        );
-        bytes.extend_from_slice(&chunk);
-    }
-    if bytes.starts_with(&[0x1f, 0x8b]) {
-        let mut decoded = Vec::new();
-        GzDecoder::new(bytes.as_slice())
-            .take(MAX_RESPONSE as u64 + 1)
-            .read_to_end(&mut decoded)?;
-        ensure!(
-            decoded.len() <= MAX_RESPONSE,
-            "Apple registration response exceeds size limit"
-        );
-        bytes = decoded;
-    }
+    let bytes = read_response(response).await?;
     let response: RegisterReply =
         plist::from_bytes(&bytes).context("Could not decode Apple's registration response")?;
-    let cert = registered_certificate(response, &registration.user_id, &handle)?;
+    let cert = registered_certificate(response, &auth.user_id, &handle)?;
     let session = Session {
         version: 1,
         handle,
@@ -194,7 +222,7 @@ pub async fn register_device(input: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         push_certificate: registration.push_certificate.clone(),
         push_private_key: registration.push_private_key.clone(),
         ids_certificate: cert,
-        ids_private_key: registration.auth_private_key.clone(),
+        ids_private_key: Data::new(auth.key.private_key_to_der()?),
         signing_private_key: Data::new(signing_bytes.to_vec()),
         encryption_private_key: Data::new(encryption_bytes.to_vec()),
         protocol_version: registration.protocol_version,
@@ -207,20 +235,12 @@ pub async fn register_device(input: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     Ok(serialized)
 }
 
-fn apple_client() -> Result<Client> {
-    let mut client = Client::builder()
-        .tls_built_in_root_certs(false)
-        .https_only(true)
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(20));
-    for certificate in CERTIFICATES {
-        client = client.add_root_certificate(Certificate::from_der(certificate)?);
-    }
-    Ok(client.build()?)
-}
-
-fn registration_document(input: &Registration, handle: &str, public_identity: Vec<u8>) -> Value {
+fn registration_document(
+    input: &DeviceRegistration,
+    user_id: &str,
+    handle: &str,
+    public_identity: Vec<u8>,
+) -> Value {
     let map = |fields: &[(&str, Value)]| {
         Value::Dictionary(
             fields
@@ -235,7 +255,7 @@ fn registration_document(input: &Registration, handle: &str, public_identity: Ve
         ("ec-version", 1.into()),
     ]);
     let account = map(&[
-        ("user-id", input.user_id.as_str().into()),
+        ("user-id", user_id.into()),
         ("uris", Value::Array(vec![map(&[("uri", handle.into())])])),
         ("client-data", client_data),
     ]);

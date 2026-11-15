@@ -17,7 +17,7 @@ Use **+** or **Ctrl+N** to start a conversation. Enter sends and Shift+Enter add
 
 ## Connect to iMessage
 
-The engine implements the Apple courier connection, IDS address lookup and legacy registration, and the legacy encrypted text format for one-to-one conversations. It uses an existing Apple device identity and validation credentials. Fresh Apple Account sign-in, 2FA, initial APNs activation, and hardware validation generation are still missing. Live registration and message delivery have yet to be verified with an Apple Account.
+The engine implements Apple Account sign-in with SMS verification, the Apple courier connection, IDS address lookup and legacy registration, and the legacy encrypted text format for one-to-one conversations. Sign-in uses fresh Anisette headers, an existing APNs identity, and device validation material. Live SMS delivery, Apple registration, and iMessage delivery have yet to be verified with an Apple Account.
 
 The [Apple provisioning guide](docs/apple-session.md) lists the materials and import formats. Once a session is stored in Secret Service, open **Settings → This computer**. The app will connect directly from Linux. This mode uses the engine inside the desktop app.
 

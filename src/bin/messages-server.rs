@@ -9,6 +9,7 @@ use axum_server::{Handle, tls_rustls::RustlsConfig};
 use clap::{Parser, Subcommand};
 use linux_imessage::{
     api::{self, AccessPolicy},
+    apple::{SmsPrompts, TrustedPhone, login_device_sms},
     engine::Engine,
     install_tls_provider, storage,
 };
@@ -38,6 +39,17 @@ enum Command {
     RegisterSession {
         #[arg(value_name = "PRIVATE_REGISTRATION_PLIST")]
         registration: PathBuf,
+        /// Use a separate 32-byte encryption key file instead of Secret Service
+        #[arg(long)]
+        vault_key_file: Option<PathBuf>,
+    },
+    /// Sign in to Apple with SMS verification and register the supplied device
+    Login {
+        #[arg(value_name = "PRIVATE_DEVICE_PLIST")]
+        device: PathBuf,
+        /// Executable that supplies fresh Anisette headers as JSON
+        #[arg(long)]
+        anisette_helper: PathBuf,
         /// Use a separate 32-byte encryption key file instead of Secret Service
         #[arg(long)]
         vault_key_file: Option<PathBuf>,
@@ -92,6 +104,37 @@ fn main() -> Result<()> {
             println!("Apple IDS registration stored");
             Ok(())
         }
+        Command::Login {
+            device,
+            anisette_helper,
+            vault_key_file,
+        } => {
+            let input = storage::read_private(&device)?;
+            if let Some(path) = &vault_key_file {
+                ensure!(
+                    storage::read_private(path)?.len() == 32,
+                    "The vault key must be 32 raw bytes"
+                );
+            }
+            let account = Zeroizing::new(rpassword::prompt_password(
+                "Apple Account email or phone: ",
+            )?);
+            let password = Zeroizing::new(rpassword::prompt_password("Apple Account password: ")?);
+            install_tls_provider();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let session = runtime.block_on(login_device_sms(
+                &input,
+                &anisette_helper,
+                &account,
+                password,
+                &mut TerminalSms,
+            ))?;
+            storage::save_session(&root, &session, vault_key_file.as_deref())?;
+            println!("Apple Account signed in and iMessage device session stored");
+            Ok(())
+        }
         Command::SetPassword { username } => {
             api::validate_username(&username)?;
             let password = Zeroizing::new(rpassword::prompt_password("Server password: ")?);
@@ -133,6 +176,45 @@ fn main() -> Result<()> {
                 let engine = Engine::start(&root, identity)?;
                 serve(bind, tls, api::router(engine, access)).await
             })
+        }
+    }
+}
+
+struct TerminalSms;
+
+impl SmsPrompts for TerminalSms {
+    fn choose_phone(&mut self, phones: &[TrustedPhone]) -> Result<usize> {
+        for (index, phone) in phones.iter().enumerate() {
+            println!("{}  ••••{}", index + 1, phone.last_two_digits);
+        }
+        loop {
+            let answer =
+                rpassword::prompt_password("Choose a trusted number or press Enter to cancel: ")?;
+            ensure!(!answer.trim().is_empty(), "Apple sign-in canceled");
+            if let Some(index) = answer
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .and_then(|number| number.checked_sub(1))
+                && index < phones.len()
+            {
+                return Ok(index);
+            }
+            println!("Enter one of the listed choices");
+        }
+    }
+
+    fn read_code(&mut self) -> Result<Zeroizing<String>> {
+        loop {
+            let code = Zeroizing::new(rpassword::prompt_password(
+                "Apple SMS code (press Enter to cancel): ",
+            )?);
+            let trimmed = code.trim();
+            ensure!(!trimmed.is_empty(), "Apple sign-in canceled");
+            if trimmed.len() == 6 && trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Ok(code);
+            }
+            println!("Enter the six digits from Apple's text message");
         }
     }
 }

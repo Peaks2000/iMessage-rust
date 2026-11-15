@@ -1,6 +1,6 @@
 # Apple device provisioning
 
-The Linux engine can use an already registered Apple device session. It also has an experimental legacy IDS registration command for a device that already has a push session, Apple authentication credentials, and fresh device validation data. The required credentials must be available from an Apple device and account you control. Extracting keys, generating validation data, and signing in to set up the initial Apple session require external provisioning today.
+The Linux engine can sign in to an Apple Account with SMS verification and register a legacy iMessage device. You can also import a previously registered session or register a device using an existing Apple authentication certificate. Initial APNs activation and Apple hardware validation are separate provisioning steps.
 
 Use a private directory and set the input plist to mode `0600`. Both commands accept binary or XML property lists. Use plist `data` values for bytes, including certificates and private keys encoded in DER. In an XML plist, a `data` value holds base64.
 
@@ -26,6 +26,34 @@ The plist is a dictionary with the following keys.
 | `user-agent` | User-agent version string from that device, without a service-specific prefix |
 
 The CLI validates the file shape, token size, key types, and certificate/key matches. Apple checks the credentials when the engine connects and looks up a recipient.
+
+## Sign in to an Apple Account with SMS
+
+```sh
+chmod 600 apple-device.plist
+./target/release/messages-server login apple-device.plist \
+  --anisette-helper /absolute/path/to/anisette-headers
+```
+
+Use the device fields from [legacy IDS registration](#request-a-legacy-ids-registration). Leave out `user-id`, `auth-certificate`, and `auth-private-key` because the command obtains them after Apple sign-in. Include the original APNs token and certificate/key pair, device metadata, and fresh `validation-data` from your validation device.
+
+Enter your Apple Account and password in the terminal. If Apple requests a verification code, select one of the account's trusted phone numbers when given a choice. Enter the six digits from Apple's text. If Apple has already sent a code, the command uses the existing challenge. When Apple accepts the sign-in and registration, the command saves the device session through Secret Service or the supplied `--vault-key-file`. The password, SMS code, and intermediate Apple login tokens are held in memory for the sign-in. [Apple's guide to receiving verification codes](https://support.apple.com/102606)
+
+### Anisette helper contract
+
+Supply a trusted local executable that calls your provisioned Anisette provider. The command runs it without arguments or input and reads a single JSON object of string-valued headers from stdout. The helper supplies device authentication data and receives no account details or SMS codes. It must return fresh time and one-time password values and use the same provisioned device identity across calls.
+
+| Required JSON key | Provider value |
+| --- | --- |
+| `X-Apple-I-MD` | Fresh device one-time password |
+| `X-Apple-I-MD-M` | Provisioned machine identifier |
+| `X-Apple-I-MD-RINFO` | Routing info as a decimal string |
+| `X-Apple-I-MD-LU` | Stable local user identifier |
+| `X-Mme-Device-Id` | Stable device UUID |
+| `X-Apple-I-Client-Time` | Current UTC timestamp in ISO 8601 format |
+| `X-Mme-Client-Info`, `User-Agent` | Values matching the provider's device platform |
+
+The command also accepts `X-Apple-I-SRL-NO`, `X-Apple-I-TimeZone`, `X-Apple-Locale`, `X-Apple-I-ROM`, and `X-Apple-I-MLB`. Anisette generation remains with the operator's provider. [Anisette v3 provider](https://github.com/Dadoum/anisette-v3-server) · [GrandSlam SMS protocol reference](https://github.com/OpenBubbles/apple-private-apis/blob/b8598d2c1656ae73fbe0f1be1b18222ea7cadb0a/icloud-auth/src/client.rs)
 
 ## Request a legacy IDS registration
 

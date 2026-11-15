@@ -1,7 +1,11 @@
 mod aps;
 mod crypto;
+mod gsa;
+mod http;
+mod ids_auth;
 mod madrid;
 mod registration;
+pub use gsa::{SmsPrompts, TrustedPhone, login_device_sms};
 pub use registration::register_device;
 
 use anyhow::{Context, Result, ensure};
