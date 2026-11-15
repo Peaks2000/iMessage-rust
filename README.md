@@ -1,6 +1,6 @@
 # Messages for Linux
 
-A macOS Messages-inspired Linux desktop app, an optional self-hosted server, and an experimental Rust engine that talks directly to Apple's APNs and Identity Service (IDS). The desktop app can run the engine on the same computer or connect to the Rust server.
+A desktop app for Linux modelled on macOS Sequoia Messages, an optional self-hosted server, and an experimental Rust engine that talks directly to Apple's APNs and Identity Service (IDS). The desktop app can run the engine on the same computer or connect to the Rust server.
 
 ![Messages for Linux showing a demo conversation](docs/desktop.png)
 
@@ -13,7 +13,9 @@ cargo build --locked --release
 ./target/release/messages --demo
 ```
 
-Use **+** or **Ctrl+N** to start a conversation. Enter sends and Shift+Enter adds a line break. Demo mode uses local sample conversations and saves messages to a separate demo database.
+Use the compose icon or **Ctrl+N** to start a conversation. Enter sends and Shift+Enter adds a line break. Open **Settings** with **Ctrl+,** or from the conversation’s details button. Right-click a conversation to pin or unpin it. Demo mode uses local sample conversations and saves messages to a separate demo database.
+
+The Sequoia layout includes animated conversation selection, message arrival, the composer’s send button, and settings sheets. Calling and Apple message effects remain outside this build. [Apple’s Sequoia Messages guide](https://support.apple.com/guide/messages/welcome/14.0/mac/15.0)
 
 ## Connect to iMessage
 

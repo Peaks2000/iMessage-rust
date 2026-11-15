@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use clap::Parser;
 use eframe::egui;
 
+#[path = "messages/chrome.rs"]
+mod chrome;
 #[path = "messages/connection.rs"]
 mod connection;
 #[path = "messages/window.rs"]
@@ -30,7 +32,8 @@ fn main() -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id("io.github.Peaks2000.LinuxMessages")
-            .with_inner_size([1050., 690.])
+            .with_inner_size([932., 700.])
+            .with_decorations(false)
             .with_min_inner_size([700., 480.]),
         ..Default::default()
     };
