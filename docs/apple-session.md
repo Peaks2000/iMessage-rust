@@ -1,6 +1,6 @@
 # Apple device provisioning
 
-The Linux engine can sign in to an Apple Account with SMS verification and register a legacy iMessage device. You can also import a previously registered session or register a device using an existing Apple authentication certificate. The automatic desktop flow requests APNs activation and uses a configured Mac or Hackintosh to supply fresh hardware validation and Anisette.
+The Linux engine can sign in to an Apple Account with SMS verification and register a legacy iMessage device. You can also import a previously registered session or register a device using an existing Apple authentication certificate. The on-device desktop flow provisions Anisette and requests APNs activation from Linux, using a prepared profile to supply the Apple validation proofs and activation credentials.
 
 Use a private directory and give only your user access to the input plist. On Linux, you can set this in your file manager under **Properties → Permissions** or use mode `0600`. Setup accepts binary and XML property lists. Use plist `data` values for bytes, including certificates and private keys encoded in DER. In an XML plist, a `data` value holds base64.
 
@@ -8,10 +8,45 @@ Use a private directory and give only your user access to the input plist. On Li
 
 Open **Settings** with **Ctrl+,** or from the conversation details button. Under **This Computer**, choose one of these options.
 
-- **Set Up Apple Account** uses [automatic device setup](#automatic-device-setup) with a configured Mac or Hackintosh. Select **Use a device plist instead…** inside that form if you have the device plist and Anisette helper used by the manual flow.
+- **Set Up Apple Account** opens [on-device setup](#on-device-setup). **Device Options** also offers [a Mac helper](#automatic-device-setup) and the original [device plist](#sign-in-to-an-apple-account-with-sms) workflow.
 - **Import Session** opens an existing registered session plist. The session format is described below.
 
-Both options save the session in Linux Secret Service and switch the app to **This Computer**. Browse uses Zenity on Linux when it is available. You can enter file paths directly in either form. The desktop keeps the password and SMS code in memory during the sign-in.
+Both options save the session in Linux Secret Service and switch the app to **This Computer**. Browse uses Zenity on Linux when it is available. You can enter file paths directly. The desktop keeps the password and SMS code in memory during sign-in.
+
+## On-device setup
+
+Linux generates Anisette headers locally, handles the Apple Account password and SMS code, and performs Apple push activation and iMessage registration. This path uses native ADI cryptographic code from [apple-auth](https://github.com/apple-auth/apple-auth/tree/98c862f7bebc8283a9b87f1578e703f0765dc81d). The profile still needs two separate, fresh Apple validation proofs issued for its device identity. Prepare the profile shortly before signing in. Apple decides whether to accept the proofs and activate the identity.
+
+### Build the local Anisette library
+
+Install CMake, a C++20 compiler and the development headers for Mbed TLS. Then run the build script on Linux.
+
+```sh
+tools/build-local-adi.sh "$HOME/.local/lib/linux-imessage"
+```
+
+The Rust app looks for the library at that path. An installation with a different library path can set `IMESSAGE_ANISETTE_LIBRARY`.
+
+### Prepare the profile and sign in
+
+If you have access to an authorised Mac, configure the activation material and build the [macOS helper](#set-up-the-helper-on-macos). Run this command locally on that Mac.
+
+```sh
+"$HOME/.local/bin/imessage-mac-device" export-local "$HOME/local-device.plist"
+```
+
+Transfer the profile privately and open **Settings → This Computer → Set Up Apple Account** on Linux. Choose the profile, enter your Apple Account and password, then select **Sign In**. To prefill the path, put the file in the Linux app's data directory as `local-device.plist` or set `IMESSAGE_LOCAL_DEVICE`. The file needs mode `0600`. It contains private activation credentials, so keep it private and remove the transferred copy after sign-in. Your registered session and ADI identity are saved in Linux Secret Service.
+
+A profile from another authorised provider can use this format.
+
+| Key | Value |
+| --- | --- |
+| `version` | Integer `1` |
+| `computer` | The same six values returned by `describe` below, including the UUID as a string |
+| `qualification-data` | Fresh Apple device validation proof as plist data for account authorization |
+| `registration-data` | A separate fresh Apple device validation proof as plist data for iMessage registration |
+| `activation` | Dictionary with the PEM certificate `chain` and matching DER RSA signing `key`, both plist data |
+| `push` | Alternative to `activation`. Dictionary with matching DER push `certificate` and RSA `key` as plist data, and an optional 32-byte push `token` |
 
 ## Automatic device setup
 
@@ -38,7 +73,7 @@ Enable SSH access on the Mac. From Linux, verify its SSH host key and configure 
 
 ### Sign in from Linux
 
-1. Open **Settings → This Computer → Set Up Apple Account** and enter the Mac's SSH address or your SSH alias.
+1. Open **Settings → This Computer → Set Up Apple Account → Device Options → Use a Mac helper** and enter the Mac's SSH address or your SSH alias.
 2. Enter your Apple Account and password. If your iMessage address differs from the account name, enter it under **Device Options**.
 3. Select **Sign In**. Choose a trusted phone number and enter Apple's SMS code if prompted.
 

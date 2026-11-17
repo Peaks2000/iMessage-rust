@@ -9,8 +9,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use openssl::{
     hash::MessageDigest,
     pkey::{PKey, Private},
-    rsa::Rsa,
+    rsa::{Padding, Rsa},
     sha::sha256,
+    sign::Signer,
     x509::{X509, X509NameBuilder, X509ReqBuilder},
 };
 use plist::{Data, Dictionary, Value};
@@ -23,6 +24,7 @@ use super::{
     certified_rsa,
     gsa::{Anisette, SmsPrompts, login, validate_login},
     http::{client_builder, plist_xml, read_response},
+    local_adi::LocalAdi,
     provider_command,
     registration::DeviceRegistration,
 };
@@ -42,6 +44,7 @@ pub struct AutomaticSetup {
 pub enum DeviceConnection {
     MacOverSsh(String),
     LocalHelper(PathBuf),
+    OnDevice(PathBuf),
 }
 
 impl AutomaticSetup {
@@ -60,6 +63,11 @@ impl AutomaticSetup {
         .context("Enter a registered iMessage email address or international phone number")?;
         validate_login(account, &password)?;
         let provider = DeviceProvider::new(self.connection)?;
+        if let DeviceProvider::OnDevice(local) = &provider {
+            return local
+                .sign_in(root, handle, account, password, prompts)
+                .await;
+        }
         let computer = provider.describe().await?;
         if let Some(path) = &self.opencore_config {
             let file =
@@ -74,13 +82,13 @@ impl AutomaticSetup {
         }
         let profile = computer.profile();
         let _activation_lock = lock_profile(root, &profile)?;
-        let (push, token) = provision_push(root, &profile, &computer, &provider).await?;
+        let (push, token) = provision_push(root, &profile, &computer, &provider, None).await?;
         let mut device = computer.registration(handle, token, &push);
         let mut anisette = Anisette::from_provider(provider.clone());
         login(
             &mut device,
             &mut anisette,
-            Some(&provider),
+            Some(Proofs::Provider(&provider)),
             account,
             password,
             prompts,
@@ -101,15 +109,41 @@ pub fn default_device_helper(root: &Path) -> Option<PathBuf> {
 }
 
 #[derive(Clone)]
-pub(super) struct DeviceProvider {
-    connection: DeviceConnection,
+pub(super) enum DeviceProvider {
+    LocalHelper(PathBuf),
+    MacOverSsh(String),
+    OnDevice(std::sync::Arc<LocalDevice>),
+}
+
+pub(super) enum Proofs<'a> {
+    Provider(&'a DeviceProvider),
+    Local {
+        qualification: Data,
+        registration: Data,
+    },
+}
+
+impl Proofs<'_> {
+    pub(super) async fn qualification(&self) -> Result<Data> {
+        match self {
+            Self::Provider(source) => source.validation().await,
+            Self::Local { qualification, .. } => Ok(qualification.clone()),
+        }
+    }
+
+    pub(super) async fn registration(self) -> Result<Data> {
+        match self {
+            Self::Provider(source) => source.validation().await,
+            Self::Local { registration, .. } => Ok(registration),
+        }
+    }
 }
 
 impl DeviceProvider {
     fn new(connection: DeviceConnection) -> Result<Self> {
-        let connection = match connection {
+        Ok(match connection {
             DeviceConnection::LocalHelper(path) => {
-                DeviceConnection::LocalHelper(provider_command::executable(&path)?)
+                Self::LocalHelper(provider_command::executable(&path)?)
             }
             DeviceConnection::MacOverSsh(host) => {
                 let host = host.trim();
@@ -121,10 +155,12 @@ impl DeviceProvider {
                             .all(|byte| byte.is_ascii_alphanumeric() || b"._@:-[]".contains(&byte)),
                     "Enter an SSH host or alias such as user@mac.local"
                 );
-                DeviceConnection::MacOverSsh(host.to_owned())
+                Self::MacOverSsh(host.to_owned())
             }
-        };
-        Ok(Self { connection })
+            DeviceConnection::OnDevice(path) => {
+                Self::OnDevice(std::sync::Arc::new(LocalDevice::load(&path)?))
+            }
+        })
     }
 
     pub(in crate::apple) async fn call(
@@ -133,11 +169,11 @@ impl DeviceProvider {
         input: &[u8],
         maximum: u64,
     ) -> Result<Zeroizing<Vec<u8>>> {
-        match &self.connection {
-            DeviceConnection::LocalHelper(path) => {
+        match self {
+            Self::LocalHelper(path) => {
                 provider_command::run(path, &[operation], operation, input, maximum).await
             }
-            DeviceConnection::MacOverSsh(host) => {
+            Self::MacOverSsh(host) => {
                 let remote = format!("~/.local/bin/imessage-mac-device {operation}");
                 provider_command::run(Path::new("/usr/bin/ssh"), &[
                     "-T", "-oBatchMode=yes", "-oStrictHostKeyChecking=yes", "-oConnectTimeout=8",
@@ -146,6 +182,7 @@ impl DeviceProvider {
                     "The Mac helper could not complete {operation}. Check SSH access and the Mac helper installation"
                 ))
             }
+            Self::OnDevice(_) => anyhow::bail!("This operation needs an external device helper"),
         }
     }
 
@@ -172,6 +209,20 @@ impl DeviceProvider {
     }
 
     async fn activation_signature(&self, payload: &[u8]) -> Result<ActivationSignature> {
+        if let Self::OnDevice(device) = self {
+            let signing = device
+                .activation
+                .as_ref()
+                .context("The device file has no activation credential")?;
+            let key = PKey::private_key_from_der(signing.key.as_ref())
+                .context("Invalid local activation signing key")?;
+            let mut signer = Signer::new(MessageDigest::sha1(), &key)?;
+            signer.set_rsa_padding(Padding::PKCS1)?;
+            return Ok(ActivationSignature {
+                certificate_chain: STANDARD.encode(&signing.chain),
+                signature: STANDARD.encode(signer.sign_oneshot_to_vec(payload)?),
+            });
+        }
         let bytes = self
             .call("activation-sign", payload, MAX_HELPER_OUTPUT)
             .await?;
@@ -182,13 +233,114 @@ impl DeviceProvider {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub(super) struct LocalDevice {
+    version: u32,
+    computer: Computer,
+    qualification_data: Data,
+    registration_data: Data,
+    push: Option<PushActivation>,
+    activation: Option<LocalActivation>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct LocalActivation {
+    key: Data,
+    chain: Data,
+}
+
+impl Drop for LocalActivation {
+    fn drop(&mut self) {
+        let mut key = Vec::<u8>::from(std::mem::replace(&mut self.key, Data::new(Vec::new())));
+        key.zeroize();
+    }
+}
+
+impl LocalDevice {
+    fn load(path: &Path) -> Result<Self> {
+        let bytes =
+            storage::read_private(path).context("Could not open the private Apple device file")?;
+        let device: Self =
+            plist::from_bytes(&bytes).context("Could not read the on-device Apple profile")?;
+        ensure!(
+            device.version == 1,
+            "Unsupported on-device Apple profile version"
+        );
+        device.computer.validate()?;
+        let valid = |proof: &Data| (1..=MAX_HELPER_OUTPUT as usize).contains(&proof.as_ref().len());
+        ensure!(
+            valid(&device.qualification_data)
+                && valid(&device.registration_data)
+                && device.qualification_data != device.registration_data,
+            "The device file needs two separate, fresh Apple validation proofs"
+        );
+        ensure!(
+            device.push.is_some() != device.activation.is_some(),
+            "The device file needs one set of Apple push or activation credentials"
+        );
+        if let Some(push) = &device.push {
+            certified_rsa(&push.certificate, &push.key)?;
+            ensure!(
+                push.token
+                    .as_ref()
+                    .is_none_or(|token| token.as_ref().len() == 32),
+                "Invalid Apple push token"
+            );
+        }
+        if let Some(activation) = &device.activation {
+            let chain = X509::stack_from_pem(activation.chain.as_ref())
+                .context("Invalid local activation certificate chain")?;
+            let leaf = chain
+                .first()
+                .context("Missing local activation certificate")?;
+            let key = certified_rsa(&Data::new(leaf.to_der()?), &activation.key)?;
+            drop(key);
+        }
+        Ok(device)
+    }
+
+    async fn sign_in(
+        self: &std::sync::Arc<Self>,
+        root: &Path,
+        handle: String,
+        account: &str,
+        password: Zeroizing<String>,
+        prompts: &mut impl SmsPrompts,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        let profile = self.computer.profile();
+        let _activation_lock = lock_profile(root, &profile)?;
+        let mut adi = LocalAdi::new(format!("adi:{}:{profile}", root.display()), &self.computer)?;
+        // Check account-independent provisioning before making an Apple activation request.
+        let _ = adi.headers().await?;
+        let provider = DeviceProvider::OnDevice(self.clone());
+        let (push, token) =
+            provision_push(root, &profile, &self.computer, &provider, self.push.clone()).await?;
+        let mut device = self.computer.registration(handle, token, &push);
+        let mut anisette = Anisette::from_local(adi);
+        login(
+            &mut device,
+            &mut anisette,
+            Some(Proofs::Local {
+                qualification: self.qualification_data.clone(),
+                registration: self.registration_data.clone(),
+            }),
+            account,
+            password,
+            prompts,
+        )
+        .await
+    }
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
-struct Computer {
-    model: String,
-    serial: String,
-    uuid: Uuid,
-    os_version: String,
-    build_version: String,
+pub(super) struct Computer {
+    pub(super) model: String,
+    pub(super) serial: String,
+    pub(super) uuid: Uuid,
+    pub(super) os_version: String,
+    pub(super) build_version: String,
     device_name: String,
 }
 
@@ -306,7 +458,8 @@ impl GenericIdentity {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct PushActivation {
     certificate: Data,
     key: Data,
@@ -328,7 +481,7 @@ fn lock_profile(root: &Path, profile: &str) -> Result<std::fs::File> {
         .write(true)
         .open(root.join(format!("activation-{profile}.lock")))?;
     fs2::FileExt::try_lock_exclusive(&lock)
-        .context("Device setup is already running for this Mac")?;
+        .context("Device setup is already running for this Apple identity")?;
     Ok(lock)
 }
 
@@ -337,12 +490,29 @@ async fn provision_push(
     profile: &str,
     computer: &Computer,
     provider: &DeviceProvider,
+    imported: Option<PushActivation>,
 ) -> Result<(PushActivation, [u8; 32])> {
     let keyring_id = format!("activation:{}:{profile}", root.display());
-    let mut push = match storage::read_activation(&keyring_id)? {
-        Some(bytes) => plist::from_bytes::<PushActivation>(&bytes)
-            .context("Could not read the saved Apple push identity")?,
-        None => {
+    let saved = storage::read_activation(&keyring_id)?
+        .map(|bytes| {
+            plist::from_bytes::<PushActivation>(&bytes)
+                .context("Could not read the saved Apple push identity")
+        })
+        .transpose()?;
+    let import = imported.is_some();
+    let mut push = match (imported, saved) {
+        (Some(mut push), saved) => {
+            if push.token.is_none()
+                && let Some(saved) = saved
+                && push.certificate == saved.certificate
+                && push.key == saved.key
+            {
+                push.token = saved.token.clone();
+            }
+            push
+        }
+        (None, Some(saved)) => saved,
+        (None, None) => {
             let push =
                 request_push_activation(computer, provider, &client_builder().build()?, ACTIVATE)
                     .await?;
@@ -361,10 +531,12 @@ async fn provision_push(
         None => {
             let token = enroll_push_token(push.certificate.as_ref(), &key, None).await?;
             push.token = Some(Data::new(token.to_vec()));
-            save_activation(&keyring_id, &push)?;
             token
         }
     };
+    if import || cached.is_none() {
+        save_activation(&keyring_id, &push)?;
+    }
     Ok((push, token))
 }
 
@@ -543,6 +715,66 @@ mod tests {
         let mut another = computer;
         another.uuid = Uuid::new_v4();
         assert!(config.platform_info.generic.check(&another).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn private_local_profile_supplies_two_proofs_and_signs_on_linux() -> Result<()> {
+        use openssl::sign::Verifier;
+
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("local-device.plist");
+        let computer: Dictionary = serde_json::from_str(DEVICE)?;
+        let key = PKey::from_rsa(Rsa::generate(2048)?)?;
+        let mut name = X509NameBuilder::new()?;
+        name.append_entry_by_text("CN", "Test activation")?;
+        let name = name.build();
+        let mut cert = X509::builder()?;
+        cert.set_version(2)?;
+        cert.set_subject_name(&name)?;
+        cert.set_issuer_name(&name)?;
+        cert.set_pubkey(&key)?;
+        cert.set_not_before(Asn1Time::days_from_now(0)?.as_ref())?;
+        cert.set_not_after(Asn1Time::days_from_now(1)?.as_ref())?;
+        cert.sign(&key, MessageDigest::sha256())?;
+        let cert = cert.build();
+        let mut profile = Dictionary::from_iter([
+            ("version", 1.into()),
+            ("computer", Value::Dictionary(computer)),
+            (
+                "qualification-data",
+                Value::Data(b"fixture qualification".to_vec()),
+            ),
+            (
+                "registration-data",
+                Value::Data(b"fixture registration".to_vec()),
+            ),
+            (
+                "activation",
+                Value::Dictionary(Dictionary::from_iter([
+                    ("key", Value::Data(key.private_key_to_der()?)),
+                    ("chain", Value::Data(cert.to_pem()?)),
+                ])),
+            ),
+        ]);
+        storage::write_private(&path, &plist_xml(&profile)?)?;
+        let provider = DeviceProvider::new(DeviceConnection::OnDevice(path.clone()))?;
+        let signed = provider.activation_signature(b"test push request").await?;
+        let mut verifier = Verifier::new(MessageDigest::sha1(), &key)?;
+        assert!(
+            verifier.verify_oneshot(&STANDARD.decode(signed.signature)?, b"test push request")?
+        );
+        assert_eq!(STANDARD.decode(signed.certificate_chain)?, cert.to_pem()?);
+        let DeviceProvider::OnDevice(local) = provider else {
+            unreachable!()
+        };
+        assert_ne!(local.qualification_data, local.registration_data);
+        profile.insert(
+            "registration-data".into(),
+            profile["qualification-data"].clone(),
+        );
+        storage::write_private(&path, &plist_xml(&profile)?)?;
+        assert!(LocalDevice::load(&path).is_err());
         Ok(())
     }
 

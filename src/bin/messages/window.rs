@@ -1176,7 +1176,7 @@ impl MessagesApp {
                                     )
                                     .clicked()
                                 {
-                                    setup = Some(SetupMethod::Automatic);
+                                    setup = Some(SetupMethod::OnDevice);
                                 }
                                 if ui
                                     .add_enabled(

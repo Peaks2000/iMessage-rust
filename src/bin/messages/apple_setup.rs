@@ -23,6 +23,7 @@ const GUIDE: &str = "https://github.com/Peaks2000/linux-imessage/blob/main/docs/
 
 #[derive(Clone, Copy)]
 pub(super) enum Method {
+    OnDevice,
     Automatic,
     SignIn,
     Import,
@@ -52,6 +53,7 @@ pub(super) struct AppleSetup {
 
 #[derive(Clone, Copy)]
 enum FileField {
+    LocalDevice,
     Device,
     Session,
     Anisette,
@@ -62,6 +64,7 @@ enum FileField {
 impl FileField {
     fn label(self) -> &'static str {
         match self {
+            Self::LocalDevice => "Apple device profile",
             Self::Device => "Apple device plist",
             Self::Session => "Registered session plist",
             Self::Anisette => "Anisette helper",
@@ -121,9 +124,17 @@ impl AppleSetup {
                 .unwrap_or_default(),
             _ => String::new(),
         };
+        let local = std::env::var_os("IMESSAGE_LOCAL_DEVICE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.join("local-device.plist"));
+        let file = if matches!(method, Method::OnDevice) && local.is_file() {
+            local.to_string_lossy().into_owned()
+        } else {
+            String::new()
+        };
         Self {
             method,
-            file: String::new(),
+            file,
             helper,
             mac_host: std::env::var("IMESSAGE_MAC_HOST").unwrap_or_default(),
             account: String::new(),
@@ -147,8 +158,9 @@ impl AppleSetup {
         let mut cancel = false;
         let mut browse = None;
         let mut submit = false;
-        let mut manual = false;
+        let mut alternate = None;
         let dialog = match self.method {
+            Method::OnDevice => "local-apple-setup",
             Method::Automatic => "automatic-apple-setup",
             Method::SignIn => "manual-apple-setup",
             Method::Import => "apple-session-import",
@@ -159,7 +171,7 @@ impl AppleSetup {
                 ui.set_width(404.);
                 ui.label(chrome::bold(
                     match self.method {
-                        Method::Automatic => "Set Up Apple Account",
+                        Method::OnDevice | Method::Automatic => "Set Up Apple Account",
                         Method::SignIn => "Use an Apple Device File",
                         Method::Import => "Import Apple Session",
                     },
@@ -171,7 +183,7 @@ impl AppleSetup {
                         let height = (context.content_rect().height() - 120.).max(100.);
                         let (action, ready) = egui::ScrollArea::vertical()
                             .auto_shrink([false, true]).max_height(height)
-                            .show(ui, |ui| self.form(ui, &mut browse, &mut manual)).inner;
+                            .show(ui, |ui| self.form(ui, &mut browse, &mut alternate)).inner;
                         (action, ready && self.picker.is_none())
                     }
                     Step::Phone {
@@ -228,10 +240,13 @@ impl AppleSetup {
         if can_cancel && (cancel || panel.should_close()) {
             return Outcome::Closed;
         }
-        if manual {
-            self.method = Method::SignIn;
+        if let Some(method) = alternate {
+            self.method = method;
             self.file.clear();
-            self.helper.clear();
+            self.helper = default_device_helper(root)
+                .filter(|_| matches!(method, Method::Automatic))
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
             self.error = None;
         }
         if let Some(field) = browse {
@@ -247,9 +262,25 @@ impl AppleSetup {
         &mut self,
         ui: &mut Ui,
         browse: &mut Option<FileField>,
-        manual: &mut bool,
+        alternate: &mut Option<Method>,
     ) -> (&'static str, bool) {
         ui.add_enabled_ui(self.picker.is_none(), |ui| match self.method {
+            Method::OnDevice => {
+                ui.label(RichText::new("Sign in from this computer using a prepared Apple device profile with fresh validation proofs and push credentials.").color(MUTED));
+                file_input(ui, FileField::LocalDevice, &mut self.file, browse);
+                edit(ui, "Apple Account", &mut self.account, "Email or phone number", false);
+                edit(ui, "Password", &mut self.password, "", true);
+                ui.collapsing("Device Options", |ui| {
+                    edit(ui, "iMessage address", &mut self.address, "Optional · defaults to your Apple Account", false);
+                    if ui.small_button("Use a Mac helper…").clicked() {
+                        *alternate = Some(Method::Automatic);
+                    }
+                    if ui.small_button("Use a legacy device plist…").clicked() {
+                        *alternate = Some(Method::SignIn);
+                    }
+                });
+                ("Sign In", !self.file.trim().is_empty() && !self.account.trim().is_empty() && !self.password.is_empty())
+            }
             Method::Automatic => {
                 ui.label(RichText::new("Use a trusted Mac or Hackintosh to validate this device. iMessage will request its push credentials and register after sign-in.").color(MUTED));
                 ui.hyperlink_to("Configure a Mac device helper", format!("{GUIDE}#automatic-device-setup"));
@@ -263,7 +294,9 @@ impl AppleSetup {
                     file_input(ui, FileField::OpenCore, &mut self.file, browse);
                     edit(ui, "iMessage address", &mut self.address, "Optional · defaults to your Apple Account", false);
                 });
-                *manual = ui.small_button("Use a device plist instead…").clicked();
+                if ui.small_button("Use a device plist instead…").clicked() {
+                    *alternate = Some(Method::SignIn);
+                }
                 ("Sign In", (!self.helper.trim().is_empty() || !self.mac_host.trim().is_empty())
                     && !self.account.trim().is_empty() && !self.password.is_empty())
             }
@@ -293,6 +326,15 @@ impl AppleSetup {
             Step::Form => {
                 let file = PathBuf::from(self.file.trim());
                 let request = match self.method {
+                    Method::OnDevice => Request::Automatic {
+                        setup: AutomaticSetup {
+                            connection: DeviceConnection::OnDevice(file),
+                            opencore_config: None,
+                            address: self.address.trim().to_owned(),
+                        },
+                        account: self.account.trim().to_owned(),
+                        password: std::mem::take(&mut self.password),
+                    },
                     Method::Automatic => Request::Automatic {
                         setup: AutomaticSetup {
                             connection: if self.helper.trim().is_empty() {
@@ -315,7 +357,9 @@ impl AppleSetup {
                     Method::Import => Request::Import(file),
                 };
                 self.step = Step::Working(match self.method {
-                    Method::Automatic => "Provisioning the device and signing in to Apple…",
+                    Method::OnDevice | Method::Automatic => {
+                        "Provisioning the device and signing in to Apple…"
+                    }
                     Method::SignIn => "Signing in to Apple…",
                     Method::Import => "Validating the Apple session…",
                 });
@@ -347,9 +391,10 @@ impl AppleSetup {
                     match result {
                         Ok(Some(path)) => {
                             let target = match field {
-                                FileField::Device | FileField::Session | FileField::OpenCore => {
-                                    &mut self.file
-                                }
+                                FileField::Device
+                                | FileField::LocalDevice
+                                | FileField::Session
+                                | FileField::OpenCore => &mut self.file,
                                 FileField::Anisette | FileField::Provider => &mut self.helper,
                             };
                             *target = path.to_string_lossy().into_owned();

@@ -3,6 +3,7 @@ mod crypto;
 mod gsa;
 mod http;
 mod ids_auth;
+mod local_adi;
 mod madrid;
 mod provider_command;
 mod provisioning;

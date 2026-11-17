@@ -2309,6 +2309,7 @@ dependencies = [
  "flate2",
  "fs2",
  "keyring",
+ "libloading",
  "openssl",
  "plist",
  "reqwest",

@@ -8,7 +8,7 @@ use plist::{Dictionary, Value};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use zeroize::Zeroize;
 
-use super::super::{provider_command, provisioning::DeviceProvider};
+use super::super::{local_adi::LocalAdi, provider_command, provisioning::DeviceProvider};
 
 const MAX_HEADERS: u64 = 16 * 1024;
 const REQUIRED: &[&str] = &[
@@ -37,6 +37,7 @@ pub(in crate::apple) struct Anisette {
 enum Source {
     Helper(PathBuf),
     Device(DeviceProvider),
+    OnDevice(Box<LocalAdi>),
 }
 
 pub(in crate::apple) struct DeviceHeaders(HashMap<&'static str, String>);
@@ -56,12 +57,20 @@ impl Anisette {
         }
     }
 
+    pub(in crate::apple) fn from_local(adi: LocalAdi) -> Self {
+        Self {
+            source: Source::OnDevice(Box::new(adi)),
+            identity: None,
+        }
+    }
+
     pub(super) async fn headers(&mut self) -> Result<DeviceHeaders> {
-        let bytes = match &self.source {
+        let bytes = match &mut self.source {
             Source::Helper(helper) => {
                 provider_command::run(helper, &[], "Anisette", &[], MAX_HEADERS).await?
             }
             Source::Device(provider) => provider.call("anisette", &[], MAX_HEADERS).await?,
+            Source::OnDevice(adi) => adi.headers().await?,
         };
         let headers = DeviceHeaders::parse(&bytes)?;
         let identity = [

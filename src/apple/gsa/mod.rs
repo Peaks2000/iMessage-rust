@@ -63,7 +63,7 @@ pub(super) fn validate_login(account: &str, password: &str) -> Result<()> {
 pub(super) async fn login(
     device: &mut DeviceRegistration,
     anisette: &mut Anisette,
-    provider: Option<&super::provisioning::DeviceProvider>,
+    proofs: Option<super::provisioning::Proofs<'_>>,
     account: &str,
     password: Zeroizing<String>,
     prompts: &mut impl SmsPrompts,
@@ -75,7 +75,7 @@ pub(super) async fn login(
         client: &client,
         origin: GSA,
         push_token: device.token()?,
-        mac_provisioned: provider.is_some(),
+        mac_provisioned: proofs.is_some(),
     };
     let password_hash = Zeroizing::new(sha256(password.as_bytes()));
     drop(password);
@@ -83,13 +83,13 @@ pub(super) async fn login(
         .sign_in(anisette, account, &password_hash, prompts)
         .await?;
     let headers = anisette.headers().await?;
-    if let Some(provider) = provider {
-        device.validation_data = provider.validation().await?;
+    if let Some(proofs) = &proofs {
+        device.validation_data = proofs.qualification().await?;
         device.validate()?;
     }
     let auth = super::ids_auth::authenticate(&client, device, account, session, headers).await?;
-    if let Some(provider) = provider {
-        device.validation_data = provider.validation().await?;
+    if let Some(proofs) = proofs {
+        device.validation_data = proofs.registration().await?;
     }
     register(&client, device, auth).await
 }

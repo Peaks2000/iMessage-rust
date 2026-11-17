@@ -3,6 +3,9 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
+#import <fcntl.h>
+#import <sys/stat.h>
+#import <unistd.h>
 
 static void fail(NSString *message) {
     fprintf(stderr, "%s\n", message.UTF8String);
@@ -190,7 +193,7 @@ static NSData *dataOperation(id context, SEL operation, NSData *argument) {
     return [result isKindOfClass:[NSData class]] ? result : nil;
 }
 
-static void validation(void) {
+static NSData *validationProof(void) {
     dlopen("/System/Library/PrivateFrameworks/AppleAccount.framework/AppleAccount", RTLD_NOW);
     Class type = NSClassFromString(@"AAAbsintheContext");
     if (!type) fail(@"This macOS version lacks the native device validation context");
@@ -246,17 +249,58 @@ static void validation(void) {
         fail(@"The Mac rejected Apple's validation response");
     NSData *signature = dataOperation(context, sign, nil);
     if (!signature.length) fail(@"macOS could not produce the requested validation data");
-    emit([signature base64EncodedDataWithOptions:0]);
+    return signature;
+}
+
+static void exportLocal(NSString *output) {
+    NSString *directory = [NSHomeDirectory() stringByAppendingPathComponent:@"/Library/Application Support/LinuxMessages"];
+    NSString *key = [directory stringByAppendingPathComponent:@"activation-key.pem"];
+    NSString *chain = [directory stringByAppendingPathComponent:@"activation-chain.pem"];
+    struct stat meta;
+    if (lstat(key.fileSystemRepresentation, &meta) || !S_ISREG(meta.st_mode)
+        || meta.st_uid != getuid() || (meta.st_mode & 077) || meta.st_size > 32768) {
+        fail(@"Install an owner-only Apple activation signing key in LinuxMessages");
+    }
+    NSData *certificates = [NSData dataWithContentsOfFile:chain];
+    if (!certificates.length || certificates.length > 32768) fail(@"The Apple activation certificate chain is unavailable");
+    NSData *privateKey = run(@"/usr/bin/openssl", @[@"pkey", @"-in", key, @"-outform", @"DER"], nil);
+    NSData *qualification = validationProof();
+    NSData *registration = validationProof();
+    if ([qualification isEqualToData:registration]) fail(@"Apple returned duplicate validation proofs");
+    NSData *document = [NSPropertyListSerialization dataWithPropertyList:@{
+        @"version": @1,
+        @"computer": hardware(),
+        @"qualification-data": qualification,
+        @"registration-data": registration,
+        @"activation": @{@"key": privateKey, @"chain": certificates},
+    } format:NSPropertyListBinaryFormat_v1_0 options:0 error:NULL];
+    if (!document.length) fail(@"Could not create a local device profile");
+    int fd = open(output.fileSystemRepresentation, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) fail(@"The destination exists or could not be created");
+    @try {
+        NSFileHandle *file = [[NSFileHandle alloc] initWithFileDescriptor:fd closeOnDealloc:YES];
+        [file writeData:document];
+        [file synchronizeFile];
+        [file closeFile];
+    } @catch (NSException *exception) {
+        unlink(output.fileSystemRepresentation);
+        fail(@"Could not write the local device profile");
+    }
 }
 
 int main(int argc, char *argv[]) {
     @autoreleasepool {
-        NSString *operation = argc == 2 ? [NSString stringWithUTF8String:argv[1]] : @"";
+        NSString *operation = argc >= 2 ? [NSString stringWithUTF8String:argv[1]] : @"";
+        if (argc == 3 && [operation isEqual:@"export-local"]) {
+            exportLocal([NSString stringWithUTF8String:argv[2]]);
+            return 0;
+        }
+        if (argc != 2) fail(@"Expected describe, anisette, activation-sign, validation, or export-local FILE");
         if ([operation isEqual:@"describe"]) emitJSON(hardware());
         else if ([operation isEqual:@"anisette"]) anisette();
         else if ([operation isEqual:@"activation-sign"]) activationSign();
-        else if ([operation isEqual:@"validation"]) validation();
-        else fail(@"Expected describe, anisette, activation-sign, or validation");
+        else if ([operation isEqual:@"validation"]) emit([validationProof() base64EncodedDataWithOptions:0]);
+        else fail(@"Expected describe, anisette, activation-sign, validation, or export-local FILE");
     }
     return 0;
 }
