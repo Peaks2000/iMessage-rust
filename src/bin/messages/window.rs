@@ -20,6 +20,7 @@ use zeroize::{Zeroize, Zeroizing};
 use super::{
     attachments::{self, AttachmentId, DraftFile, LoadedFile, Preview, TranscriptMedia},
     connection::{Action, Connection, Event, Mode, Settings},
+    contacts::Contacts,
     links::MessageText,
     mac_setup::{MacSetup, Outcome as MacOutcome},
     session_import::{Outcome as ImportOutcome, SessionImport},
@@ -39,6 +40,7 @@ pub struct MessagesApp {
     settings: Option<SettingsForm>,
     session_import: Option<SessionImport>,
     mac_setup: Option<MacSetup>,
+    contacts: Contacts,
     local_unregistered: bool,
     connection: Option<Connection>,
     candidate: Option<Connection>,
@@ -106,12 +108,14 @@ impl MessagesApp {
                 None,
             )
         });
+        let contacts = Contacts::new(&root);
         Self {
             root,
             config,
             settings: None,
             session_import: None,
             mac_setup: mac_setup.then(MacSetup::new),
+            contacts,
             local_unregistered: false,
             candidate,
             connection: None,
@@ -145,6 +149,7 @@ impl MessagesApp {
     }
 
     fn process(&mut self, ctx: &egui::Context) {
+        self.contacts.poll(ctx);
         self.poll_picker(ctx);
         if let Some(event) = self
             .candidate
@@ -593,7 +598,7 @@ impl MessagesApp {
                                     ui.horizontal(|ui| {
                                         ui.add_space(9.);
                                         for chat in row {
-                                            let name = display_address(&chat.address);
+                                            let name = self.contacts.name(&chat.address);
                                             let active = self.composing.is_none()
                                                 && self.selected.as_deref() == Some(&chat.address);
                                             let response = pin_tile(
@@ -618,9 +623,12 @@ impl MessagesApp {
                             if pinned && search.is_empty() {
                                 continue;
                             }
-                            let name = display_address(&chat.address);
+                            let name = self.contacts.name(&chat.address);
                             if !search.is_empty()
                                 && !name.to_lowercase().contains(&search)
+                                && !display_address(&chat.address)
+                                    .to_lowercase()
+                                    .contains(&search)
                                 && !chat.preview.to_lowercase().contains(&search)
                             {
                                 continue;
@@ -712,7 +720,9 @@ impl MessagesApp {
             .show(ctx, |ui| {
                 if let Some(chat) = &chat {
                     self.transcript(ui, chat);
-                } else if self.composing.is_none() {
+                } else if self.composing.is_some() {
+                    self.contact_suggestions(ui);
+                } else {
                     ui.centered_and_justified(|ui| {
                         let label = if self.candidate.is_some() {
                             "Connecting…"
@@ -735,6 +745,30 @@ impl MessagesApp {
                     });
                 }
             });
+    }
+
+    fn contact_suggestions(&mut self, ui: &mut Ui) {
+        let Some(query) = &self.composing else { return };
+        let mut chosen = None;
+        Frame::new()
+            .inner_margin(Margin::symmetric(15, 7))
+            .show(ui, |ui| {
+                for recipient in self.contacts.matches(query) {
+                    let label = format!(
+                        "{}  ·  {}",
+                        recipient.name,
+                        display_address(&recipient.address)
+                    );
+                    if ui.add(egui::Button::new(label).frame(false)).clicked() {
+                        chosen = Some(recipient.address.clone());
+                    }
+                }
+            });
+        if let Some(address) = chosen {
+            self.composing = None;
+            self.compose_error = None;
+            self.select(address, true);
+        }
     }
 
     fn toolbar(&mut self, ctx: &egui::Context, chat: Option<&str>) {
@@ -772,7 +806,7 @@ impl MessagesApp {
                         TextEdit::singleline(recipient)
                             .frame(false)
                             .font(FontId::proportional(13.))
-                            .hint_text("Email or Phone Number")
+                            .hint_text("Name, Email, or Phone Number")
                             .margin(Margin::same(5))
                             .desired_width(rect.width()),
                     );
@@ -783,20 +817,27 @@ impl MessagesApp {
                     let enter = editor.lost_focus()
                         && ui.input(|input| input.key_pressed(egui::Key::Enter));
                     if enter {
-                        match address(recipient) {
+                        match address(recipient)
+                            .or_else(|error| self.contacts.resolve_name(recipient).ok_or(error))
+                        {
                             Ok(selected) => {
                                 self.composing = None;
                                 self.select(selected, true);
                             }
                             Err(error) => {
-                                self.compose_error = Some(error.to_string());
+                                self.compose_error =
+                                    Some(if self.contacts.matches(recipient).next().is_some() {
+                                        "Choose a matching contact".into()
+                                    } else {
+                                        error.to_string()
+                                    });
                                 editor.request_focus();
                             }
                         }
                     }
                 } else {
                     if let Some(chat) = chat {
-                        let name = display_address(chat);
+                        let name = self.contacts.name(chat);
                         ui.painter().with_clip_rect(body).text(
                             body.left_center() + vec2(22., 0.),
                             Align2::LEFT_CENTER,
@@ -849,8 +890,9 @@ impl MessagesApp {
                         ui.vertical_centered(|ui| {
                             ui.add_space(4.);
                             let (rect, _) = ui.allocate_exact_size(vec2(46., 46.), Sense::hover());
-                            chrome::avatar(ui, rect.center(), 46., display_address(chat), chat);
-                            ui.label(chrome::bold(display_address(chat), 13.));
+                            let name = self.contacts.name(chat);
+                            chrome::avatar(ui, rect.center(), 46., name, chat);
+                            ui.label(chrome::bold(name, 13.));
                         });
                         ui.separator();
                         if ui
@@ -1381,6 +1423,7 @@ impl MessagesApp {
         let mut apply = false;
         let mut import = false;
         let mut setup_mac = false;
+        let mut contacts = false;
         let mut cancel = false;
         let connecting = self.candidate.is_some();
         let panel = egui::Modal::new(egui::Id::new("settings"))
@@ -1459,6 +1502,8 @@ impl MessagesApp {
                         }
                     }
                 });
+                ui.add_space(6.);
+                contacts = ui.button("iCloud Contacts…").clicked();
                 if let Some(error) = &form.error {
                     ui.add_space(6.);
                     ui.label(RichText::new(error).size(11.).color(DANGER));
@@ -1485,7 +1530,9 @@ impl MessagesApp {
                         .clicked();
                 });
             });
-        if setup_mac {
+        if contacts {
+            self.contacts.open();
+        } else if setup_mac {
             form.error = None;
             self.mac_setup = Some(MacSetup::new());
         } else if import {
@@ -1523,7 +1570,11 @@ impl eframe::App for MessagesApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process(ctx);
-        if self.settings.is_none() && self.mac_setup.is_none() && !self.media.is_open() {
+        if self.settings.is_none()
+            && self.mac_setup.is_none()
+            && !self.media.is_open()
+            && !self.contacts.is_open()
+        {
             if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::N)) {
                 self.start_compose();
             }
@@ -1544,6 +1595,8 @@ impl eframe::App for MessagesApp {
             self.mac_setup_dialog(ctx);
         } else if self.session_import.is_some() {
             self.import_dialog(ctx);
+        } else if self.contacts.is_open() {
+            self.contacts.show(ctx);
         } else {
             self.settings_dialog(ctx);
         }

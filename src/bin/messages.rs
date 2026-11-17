@@ -5,10 +5,14 @@ use eframe::egui;
 
 #[path = "messages/attachments.rs"]
 mod attachments;
+#[path = "messages/carddav.rs"]
+mod carddav;
 #[path = "messages/chrome.rs"]
 mod chrome;
 #[path = "messages/connection.rs"]
 mod connection;
+#[path = "messages/contacts.rs"]
+mod contacts;
 #[path = "messages/links.rs"]
 mod links;
 #[path = "messages/mac_setup.rs"]

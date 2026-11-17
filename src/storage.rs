@@ -41,6 +41,10 @@ pub fn private_dir(path: &Path) -> Result<PathBuf> {
 }
 
 pub fn read_private(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
+    read_private_limited(path, MAX_SECRET_FILE)
+}
+
+pub fn read_private_limited(path: &Path, limit: u64) -> Result<Zeroizing<Vec<u8>>> {
     let file = File::open(path).with_context(|| format!("Could not open {}", path.display()))?;
     let meta = file.metadata()?;
     ensure!(
@@ -49,11 +53,8 @@ pub fn read_private(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
         path.display()
     );
     let mut bytes = Zeroizing::new(Vec::new());
-    file.take(MAX_SECRET_FILE + 1).read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() as u64 <= MAX_SECRET_FILE,
-        "Private input is too large"
-    );
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() as u64 <= limit, "Private input is too large");
     Ok(bytes)
 }
 

@@ -25,6 +25,12 @@ The desktop opens a registered iMessage session from Linux Secret Service and co
 
 The engine supports one-to-one text and attachments with devices that accept the legacy iMessage format. A message can contain up to eight attachments and 32 MiB of attachment data. **Sent** indicates that Apple’s courier accepted the send.
 
+## Sync iCloud Contacts
+
+Open **Settings → iCloud Contacts**. Enter your Apple Account and an [app-specific password from Apple](https://support.apple.com/en-us/102654), then click **Sync Contacts**. The Linux desktop reads iCloud CardDAV directly in both connection modes. It shows contact names in conversations and suggests matching recipients when you compose a message.
+
+The app stores the password in Linux Secret Service and keeps the contact names, email addresses, and phone numbers in its private local data directory. It refreshes at startup and every 30 minutes while open. **Sync Contacts** refreshes immediately. **Disconnect** removes the saved credential and local cache.
+
 ## Run the optional server
 
 Build just the server for a headless machine.
