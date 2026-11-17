@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
+    sync::mpsc::{Receiver, TryRecvError},
     time::{Duration, Instant},
 };
 
@@ -10,31 +11,27 @@ use eframe::egui::{
     Stroke, StrokeKind, TextEdit, Ui, UiBuilder, pos2, vec2,
 };
 use linux_imessage::{
-    Conversation, Delivery, Message, PAGE_SIZE, SendText, Status, TEXT_LIMIT, address,
-    display_address, now_ms, storage,
+    Conversation, Delivery, FILE_LIMIT, MAX_ATTACHMENTS, Message, PAGE_SIZE, SendText, Status,
+    TEXT_LIMIT, address, display_address, now_ms, storage,
 };
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
 use super::{
+    attachments::{self, AttachmentId, DraftFile, LoadedFile, Preview, TranscriptMedia},
     connection::{Action, Connection, Event, Mode, Settings},
+    links::MessageText,
     mac_setup::{MacSetup, Outcome as MacOutcome},
     session_import::{Outcome as ImportOutcome, SessionImport},
 };
 
 use super::chrome::{
-    self, BLUE, BUBBLE_GRAY, CANVAS, DANGER, HAIRLINE, INK, Icon, MUTED, SIDEBAR, TOOLBAR,
-    TOOLBAR_HEIGHT,
+    self, BLUE, BUBBLE_GRAY, CANVAS, DANGER, HAIRLINE, INK, Icon, MUTED, SIDEBAR, TOOLBAR_HEIGHT,
 };
 
 const POLL: Duration = Duration::from_secs(4);
 const MOTION: f32 = 0.30;
 const LOCAL_UNREGISTERED: &str = "Open Settings → This Computer to set up iMessage with your Mac.";
-const DEMO_PINS: &[&str] = &[
-    "mailto:maya@example.com",
-    "mailto:elliot@example.com",
-    "mailto:noor@example.com",
-];
 
 pub struct MessagesApp {
     root: PathBuf,
@@ -53,10 +50,14 @@ pub struct MessagesApp {
     thread_motion: Option<Instant>,
     thread_loaded: bool,
     info_started: Option<Instant>,
+    plus_started: Option<Instant>,
     selected: Option<String>,
     messages: Vec<Message>,
     search: String,
-    drafts: HashMap<String, String>,
+    drafts: HashMap<String, Draft>,
+    pending_draft: Option<Draft>,
+    picking: Option<(String, Receiver<anyhow::Result<Vec<LoadedFile>>>)>,
+    media: TranscriptMedia,
     composing: Option<String>,
     compose_error: Option<String>,
     focus_recipient: bool,
@@ -67,6 +68,12 @@ pub struct MessagesApp {
     loading_older: bool,
     sending: bool,
     retry: Option<SendText>,
+}
+
+#[derive(Default)]
+struct Draft {
+    text: String,
+    files: Vec<DraftFile>,
 }
 
 struct SettingsForm {
@@ -83,15 +90,12 @@ impl Drop for SettingsForm {
 }
 
 impl MessagesApp {
-    pub fn new(ctx: &egui::Context, root: PathBuf, demo: bool, mac_setup: bool) -> Self {
+    pub fn new(ctx: &egui::Context, root: PathBuf, mac_setup: bool) -> Self {
         chrome::theme(ctx);
-        let (mut config, error) = match Settings::read(&root) {
+        let (config, error) = match Settings::read(&root) {
             Ok(config) => (config, None),
             Err(error) => (Settings::default(), Some(error.to_string())),
         };
-        if demo {
-            config.mode = Mode::Demo;
-        }
         let candidate = (!mac_setup).then(|| {
             Connection::start(
                 ctx,
@@ -119,10 +123,14 @@ impl MessagesApp {
             thread_motion: None,
             thread_loaded: false,
             info_started: None,
+            plus_started: None,
             selected: None,
             messages: Vec::new(),
             search: String::new(),
             drafts: HashMap::new(),
+            pending_draft: None,
+            picking: None,
+            media: TranscriptMedia::default(),
             composing: None,
             compose_error: None,
             focus_recipient: false,
@@ -137,6 +145,7 @@ impl MessagesApp {
     }
 
     fn process(&mut self, ctx: &egui::Context) {
+        self.poll_picker(ctx);
         if let Some(event) = self
             .candidate
             .as_ref()
@@ -160,6 +169,9 @@ impl MessagesApp {
                     self.selected = None;
                     self.messages.clear();
                     self.drafts.clear();
+                    self.pending_draft = None;
+                    self.picking = None;
+                    self.media = TranscriptMedia::default();
                     self.retry = None;
                     self.error = None;
                     self.refresh_running = false;
@@ -222,6 +234,8 @@ impl MessagesApp {
                                     self.message_motion.insert(message.id.clone(), changed);
                                 }
                             }
+                        } else {
+                            self.thread_motion = Some(Instant::now());
                         }
                         self.thread_loaded = true;
                         self.merge(messages);
@@ -241,21 +255,31 @@ impl MessagesApp {
                 }
                 Event::Sent { request, result } => {
                     self.sending = false;
+                    let draft = self.pending_draft.take();
                     match result {
-                        Ok(item) => {
+                        Ok(item) if item.status != Delivery::Failed => {
                             self.retry = None;
                             if self.selected.as_deref() == Some(&item.address) {
                                 self.merge(vec![item]);
                             }
                         }
-                        Err(error) => {
-                            self.error = Some(error.to_string());
-                            self.drafts
-                                .entry(request.address.clone())
-                                .or_insert_with(|| request.body.clone());
+                        result => {
+                            self.error = Some(match result {
+                                Ok(item) => {
+                                    if self.selected.as_deref() == Some(&item.address) {
+                                        self.merge(vec![item]);
+                                    }
+                                    "The courier rejected the message. Send again to retry.".into()
+                                }
+                                Err(error) => error.to_string(),
+                            });
+                            if let Some(draft) = draft {
+                                self.drafts.insert(request.address.clone(), draft);
+                            }
                             let id = request.id.to_string();
                             if let Some(message) =
                                 self.messages.iter_mut().find(|message| message.id == id)
+                                && message.status == Delivery::Pending
                             {
                                 message.status = Delivery::Unknown;
                             }
@@ -264,6 +288,11 @@ impl MessagesApp {
                     }
                     self.refresh_at = Instant::now();
                 }
+                Event::Attachment {
+                    id,
+                    purpose,
+                    result,
+                } => self.media.received(ctx, id, purpose, result),
                 Event::Error(error) => {
                     self.refresh_running = false;
                     self.error = Some(error);
@@ -289,6 +318,45 @@ impl MessagesApp {
         self.message_motion
             .retain(|_, start| start.elapsed().as_secs_f32() < MOTION);
         ctx.request_repaint_after(POLL);
+    }
+
+    fn poll_picker(&mut self, ctx: &egui::Context) {
+        let Some((_, pending)) = &self.picking else {
+            return;
+        };
+        let result = match pending.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                Err(anyhow::anyhow!("The file picker closed unexpectedly"))
+            }
+        };
+        let (chat, _) = self.picking.take().expect("A picker returned a result");
+        match result {
+            Ok(files) if !files.is_empty() => {
+                let draft = self.drafts.entry(chat.clone()).or_default();
+                let size = draft
+                    .files
+                    .iter()
+                    .map(|file| file.upload.info.size)
+                    .chain(files.iter().map(|file| file.upload.info.size))
+                    .sum::<usize>();
+                if draft.files.len() + files.len() > MAX_ATTACHMENTS || size > FILE_LIMIT {
+                    self.error = Some(format!(
+                        "A message can contain up to {MAX_ATTACHMENTS} attachments and 32 MiB total"
+                    ));
+                    return;
+                }
+                draft.files.extend(files.into_iter().map(|file| DraftFile {
+                    upload: file.upload,
+                    preview: file.preview.map(|image| Preview::new(ctx, image)),
+                }));
+                self.error = None;
+                self.focus_composer = self.selected.as_deref() == Some(&chat);
+            }
+            Ok(_) => (),
+            Err(error) => self.error = Some(format!("{error:#}")),
+        }
     }
 
     fn select(&mut self, who: String, focus: bool) {
@@ -320,26 +388,42 @@ impl MessagesApp {
             .sort_by(|a, b| (a.timestamp_ms, &a.id).cmp(&(b.timestamp_ms, &b.id)));
     }
 
-    fn send(&mut self, chat: String, body: String) {
-        if self.sending || body.trim().is_empty() || body.len() > TEXT_LIMIT {
+    fn send(&mut self, chat: &str) {
+        let Some(draft) = self.drafts.get(chat) else {
+            return;
+        };
+        if self.sending
+            || self.picking.is_some()
+            || (draft.text.trim().is_empty() && draft.files.is_empty())
+            || draft.text.len() > TEXT_LIMIT
+        {
             return;
         }
         if let Some(connection) = &self.connection {
+            let files = draft
+                .files
+                .iter()
+                .map(|file| file.upload.clone())
+                .collect::<Vec<_>>();
             let request = self
                 .retry
                 .take()
-                .filter(|item| item.address == chat && item.body == body)
+                .filter(|item| {
+                    item.address == chat && item.body == draft.text && item.files == files
+                })
                 .unwrap_or_else(|| SendText {
                     id: Uuid::new_v4(),
-                    address: chat,
-                    body,
+                    address: chat.to_owned(),
+                    body: draft.text.clone(),
+                    files,
                 });
             self.sending = connection
                 .actions
                 .send(Action::Send(request.clone()))
                 .is_ok();
             if self.sending {
-                self.drafts.remove(&request.address);
+                self.media.seed(request.id, &draft.files);
+                self.pending_draft = self.drafts.remove(chat);
                 let id = request.id.to_string();
                 self.message_motion.insert(id.clone(), Instant::now());
                 self.merge(vec![Message {
@@ -349,6 +433,7 @@ impl MessagesApp {
                     outgoing: true,
                     timestamp_ms: now_ms(),
                     status: Delivery::Pending,
+                    attachments: request.files.iter().map(|file| file.info.clone()).collect(),
                 }]);
                 self.error = None;
                 self.focus_composer = true;
@@ -375,9 +460,7 @@ impl MessagesApp {
     }
 
     fn pins_path(&self) -> PathBuf {
-        let name = if self.is_demo() && self.config.mode != Mode::Remote {
-            "pins-demo.json".into()
-        } else if self.config.mode == Mode::Remote {
+        let name = if self.config.mode == Mode::Remote {
             let origin = linux_imessage::api::server_url(&self.config.url)
                 .map(|url| url.origin().ascii_serialization())
                 .unwrap_or_default();
@@ -398,16 +481,7 @@ impl MessagesApp {
         storage::read_private(&self.pins_path())
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_else(|| {
-                if self.is_demo() {
-                    DEMO_PINS
-                        .iter()
-                        .map(|address| (*address).to_owned())
-                        .collect()
-                } else {
-                    Vec::new()
-                }
-            })
+            .unwrap_or_default()
     }
 
     fn toggle_pin(&mut self, address: &str) {
@@ -430,7 +504,15 @@ impl MessagesApp {
             .min_width(109.)
             .max_width(372.)
             .show_separator_line(false)
-            .frame(Frame::new().fill(SIDEBAR))
+            .frame(
+                Frame::new()
+                    .fill(SIDEBAR)
+                    .corner_radius(egui::CornerRadius {
+                        nw: chrome::window_radius(ctx),
+                        sw: chrome::window_radius(ctx),
+                        ..Default::default()
+                    }),
+            )
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing = vec2(0., 0.);
                 let compact = ui.available_width() < 170.;
@@ -478,7 +560,6 @@ impl MessagesApp {
                     ui.add_space(8.);
                 }
 
-                let demo = self.is_demo();
                 let search = if compact {
                     String::new()
                 } else {
@@ -512,11 +593,11 @@ impl MessagesApp {
                                     ui.horizontal(|ui| {
                                         ui.add_space(9.);
                                         for chat in row {
-                                            let name = chat_name(&chat.address, demo);
+                                            let name = display_address(&chat.address);
                                             let active = self.composing.is_none()
                                                 && self.selected.as_deref() == Some(&chat.address);
                                             let response = pin_tile(
-                                                ui, chat, &name, active, compact, tile_width,
+                                                ui, chat, name, active, compact, tile_width,
                                             );
                                             if response.clicked() {
                                                 clicked = Some(chat.address.clone());
@@ -537,12 +618,9 @@ impl MessagesApp {
                             if pinned && search.is_empty() {
                                 continue;
                             }
-                            let name = chat_name(&chat.address, demo);
+                            let name = display_address(&chat.address);
                             if !search.is_empty()
                                 && !name.to_lowercase().contains(&search)
-                                && !display_address(&chat.address)
-                                    .to_lowercase()
-                                    .contains(&search)
                                 && !chat.preview.to_lowercase().contains(&search)
                             {
                                 continue;
@@ -550,7 +628,7 @@ impl MessagesApp {
                             let active = self.composing.is_none()
                                 && self.selected.as_deref() == Some(&chat.address);
                             found = true;
-                            let response = chat_row(ui, chat, &name, active, compact);
+                            let response = chat_row(ui, chat, name, active, compact);
                             if response.clicked() {
                                 clicked = Some(chat.address.clone());
                             }
@@ -596,7 +674,8 @@ impl MessagesApp {
     fn search_field(&mut self, ui: &mut Ui) {
         let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 27.), Sense::hover());
         let rect = row.shrink2(vec2(10., 0.));
-        ui.painter().rect_filled(rect, 6, Color32::from_gray(215));
+        ui.painter()
+            .rect_filled(rect, 6, Color32::from_black_alpha(17));
         chrome::icon(
             ui.painter(),
             rect.left_center() + vec2(12., 0.),
@@ -622,7 +701,14 @@ impl MessagesApp {
             self.composer(ctx, chat);
         }
         egui::CentralPanel::default()
-            .frame(Frame::new().fill(CANVAS))
+            .frame(Frame::new().fill(CANVAS).corner_radius(egui::CornerRadius {
+                se: if chat.is_none() {
+                    chrome::window_radius(ctx)
+                } else {
+                    0
+                },
+                ..Default::default()
+            }))
             .show(ctx, |ui| {
                 if let Some(chat) = &chat {
                     self.transcript(ui, chat);
@@ -655,7 +741,14 @@ impl MessagesApp {
         egui::TopBottomPanel::top("conversation-toolbar")
             .exact_height(TOOLBAR_HEIGHT)
             .show_separator_line(false)
-            .frame(Frame::new().fill(TOOLBAR))
+            .frame(
+                Frame::new()
+                    .fill(chrome::TITLEBAR)
+                    .corner_radius(egui::CornerRadius {
+                        ne: chrome::window_radius(ctx),
+                        ..Default::default()
+                    }),
+            )
             .show(ctx, |ui| {
                 let bar = ui.max_rect();
                 chrome::line(ui, bar, 0.);
@@ -703,7 +796,7 @@ impl MessagesApp {
                     }
                 } else {
                     if let Some(chat) = chat {
-                        let name = chat_name(chat, self.is_demo());
+                        let name = display_address(chat);
                         ui.painter().with_clip_rect(body).text(
                             body.left_center() + vec2(22., 0.),
                             Align2::LEFT_CENTER,
@@ -756,15 +849,8 @@ impl MessagesApp {
                         ui.vertical_centered(|ui| {
                             ui.add_space(4.);
                             let (rect, _) = ui.allocate_exact_size(vec2(46., 46.), Sense::hover());
-                            chrome::avatar(
-                                ui,
-                                rect.center(),
-                                46.,
-                                &chat_name(chat, self.is_demo()),
-                                chat,
-                            );
-                            ui.label(chrome::bold(chat_name(chat, self.is_demo()), 13.));
-                            ui.label(RichText::new(display_address(chat)).size(11.).color(MUTED));
+                            chrome::avatar(ui, rect.center(), 46., display_address(chat), chat);
+                            ui.label(chrome::bold(display_address(chat), 13.));
                         });
                         ui.separator();
                         if ui
@@ -791,11 +877,30 @@ impl MessagesApp {
     }
 
     fn composer(&mut self, ctx: &egui::Context, chat: &str) {
+        let can_attach = self.connection.is_some() && !self.sending && self.picking.is_none();
+        if can_attach
+            && self.settings.is_none()
+            && self.mac_setup.is_none()
+            && self.session_import.is_none()
+            && !self.media.is_open()
+        {
+            let dropped = ctx.input_mut(|input| std::mem::take(&mut input.raw.dropped_files));
+            if !dropped.is_empty() {
+                self.picking = Some((
+                    chat.to_owned(),
+                    attachments::task(ctx, move || attachments::dropped(dropped)),
+                ));
+            }
+        }
         egui::TopBottomPanel::bottom("composer")
             .show_separator_line(false)
             .frame(
                 Frame::new()
-                    .fill(CANVAS)
+                    .fill(chrome::COMPOSER)
+                    .corner_radius(egui::CornerRadius {
+                        se: chrome::window_radius(ctx),
+                        ..Default::default()
+                    })
                     .inner_margin(Margin::symmetric(10, 10)),
             )
             .show(ctx, |ui| {
@@ -811,24 +916,99 @@ impl MessagesApp {
                     ui.add_space(3.);
                 }
 
-                let enabled =
-                    self.status.as_ref().is_some_and(|status| status.connected) && !self.sending;
+                let enabled = self.status.as_ref().is_some_and(|status| status.connected)
+                    && !self.sending
+                    && self.picking.is_none();
                 let draft = self.drafts.entry(chat.to_owned()).or_default();
                 let mut send = false;
-                let mut compose = false;
-                let mut settings = false;
+                let mut picker = None;
+                if !draft.files.is_empty() {
+                    let mut remove = None;
+                    ScrollArea::horizontal()
+                        .id_salt("draft-attachments")
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.add_space(30.);
+                                for (index, file) in draft.files.iter().enumerate() {
+                                    let (rect, response) =
+                                        ui.allocate_exact_size(vec2(68., 58.), Sense::hover());
+                                    let image_rect = rect.shrink2(vec2(4., 3.));
+                                    ui.painter().rect_filled(image_rect, 8, BUBBLE_GRAY);
+                                    if let Some(preview) = &file.preview {
+                                        let size =
+                                            attachments::fit(preview.size(), image_rect.size());
+                                        preview.widget(size, 7).paint_at(
+                                            ui,
+                                            Rect::from_center_size(image_rect.center(), size),
+                                        );
+                                    } else {
+                                        chrome::icon(
+                                            ui.painter(),
+                                            image_rect.center(),
+                                            Icon::File,
+                                            MUTED,
+                                        );
+                                    }
+                                    response.on_hover_text(&file.upload.info.name);
+                                    let close = Rect::from_center_size(
+                                        rect.right_top() + vec2(-6., 8.),
+                                        vec2(16., 16.),
+                                    );
+                                    let button = ui.put(
+                                        close,
+                                        egui::Button::new("×")
+                                            .corner_radius(8)
+                                            .min_size(close.size()),
+                                    );
+                                    if button.on_hover_text("Remove attachment").clicked() {
+                                        remove = Some(index);
+                                    }
+                                }
+                            });
+                        });
+                    if let Some(index) = remove {
+                        draft.files.remove(index);
+                    }
+                    ui.add_space(3.);
+                }
                 ui.horizontal(|ui| {
-                    let extra = chrome::icon_button(ui, Icon::Plus, "Actions", Some(BUBBLE_GRAY));
-                    egui::Popup::menu(&extra).frame(chrome::sheet()).show(|ui| {
-                        if ui.button("New Message").clicked() {
-                            compose = true;
-                            ui.close();
-                        }
-                        if ui.button("Settings…").clicked() {
-                            settings = true;
-                            ui.close();
-                        }
-                    });
+                    let extra = ui
+                        .add_enabled_ui(can_attach, |ui| {
+                            chrome::icon_button(ui, Icon::Plus, "Add Attachment", Some(BUBBLE_GRAY))
+                        })
+                        .inner;
+                    if extra.clicked() {
+                        self.plus_started = Some(Instant::now());
+                    }
+                    egui::Popup::menu(&extra)
+                        .align(egui::emath::RectAlign::TOP_START)
+                        .gap(8.)
+                        .frame(chrome::popover())
+                        .show(|ui| {
+                            ui.multiply_opacity(0.45 + 0.55 * motion(ctx, self.plus_started, 0.14));
+                            if chrome::attachment_item(
+                                ui,
+                                Icon::Photo,
+                                "Photos",
+                                Color32::from_rgb(58, 134, 240),
+                            )
+                            .clicked()
+                            {
+                                picker = Some(true);
+                                ui.close();
+                            }
+                            if chrome::attachment_item(
+                                ui,
+                                Icon::File,
+                                "Files",
+                                Color32::from_rgb(109, 112, 120),
+                            )
+                            .clicked()
+                            {
+                                picker = Some(false);
+                                ui.close();
+                            }
+                        });
                     let width = (ui.available_width() - 35.).max(90.);
                     let response = Frame::new()
                         .fill(CANVAS)
@@ -849,8 +1029,9 @@ impl MessagesApp {
                                     .min_scrolled_height(0.)
                                     .auto_shrink([true, true])
                                     .show(ui, |ui| {
-                                        ui.add(
-                                            TextEdit::multiline(draft)
+                                        ui.add_enabled(
+                                            !self.sending,
+                                            TextEdit::multiline(&mut draft.text)
                                                 .id(id)
                                                 .frame(false)
                                                 .desired_rows(1)
@@ -873,7 +1054,8 @@ impl MessagesApp {
                                     edit.request_focus();
                                     self.focus_composer = false;
                                 }
-                                let visible = !draft.trim().is_empty();
+                                let visible =
+                                    !draft.text.trim().is_empty() || !draft.files.is_empty();
                                 let show_button = ctx.animate_bool_with_time(
                                     ui.id().with("send-button"),
                                     visible,
@@ -882,7 +1064,7 @@ impl MessagesApp {
                                 if show_button > 0. {
                                     let button = ui
                                         .add_enabled_ui(
-                                            enabled && visible && draft.len() <= TEXT_LIMIT,
+                                            enabled && visible && draft.text.len() <= TEXT_LIMIT,
                                             |ui| {
                                                 ui.multiply_opacity(show_button);
                                                 chrome::icon_button(
@@ -900,7 +1082,7 @@ impl MessagesApp {
                                 }
                                 send |= enabled
                                     && visible
-                                    && draft.len() <= TEXT_LIMIT
+                                    && draft.text.len() <= TEXT_LIMIT
                                     && enter
                                     && edit.has_focus();
                             });
@@ -909,7 +1091,11 @@ impl MessagesApp {
                     if response.clicked() {
                         self.focus_composer = true;
                     }
-                    let emoji = chrome::icon_button(ui, Icon::Emoji, "Emoji", None);
+                    let emoji = ui
+                        .add_enabled_ui(!self.sending, |ui| {
+                            chrome::icon_button(ui, Icon::Emoji, "Emoji", None)
+                        })
+                        .inner;
                     egui::Popup::menu(&emoji).frame(chrome::sheet()).show(|ui| {
                         ui.label(chrome::bold("Emoji", 13.));
                         for row in [
@@ -919,7 +1105,7 @@ impl MessagesApp {
                             ui.horizontal(|ui| {
                                 for icon in row {
                                     if ui.button(RichText::new(icon).size(17.)).clicked() {
-                                        draft.push_str(icon);
+                                        draft.text.push_str(icon);
                                         self.focus_composer = true;
                                         ui.close();
                                     }
@@ -928,22 +1114,23 @@ impl MessagesApp {
                         }
                     });
                 });
-                if draft.len() > TEXT_LIMIT {
+                if draft.text.len() > TEXT_LIMIT {
                     ui.label(
-                        RichText::new(format!("{} / {TEXT_LIMIT} bytes", draft.len()))
+                        RichText::new(format!("{} / {TEXT_LIMIT} bytes", draft.text.len()))
                             .color(DANGER)
                             .size(11.),
                     );
                 }
                 if send {
-                    let message = draft.clone();
-                    self.send(chat.to_owned(), message);
+                    self.send(chat);
                 }
-                if compose {
-                    self.start_compose();
-                }
-                if settings {
-                    self.open_settings();
+                if let Some(photos) = picker
+                    && self.picking.is_none()
+                {
+                    self.picking = Some((
+                        chat.to_owned(),
+                        attachments::task(ctx, move || attachments::choose(photos)),
+                    ));
                 }
             });
     }
@@ -967,34 +1154,38 @@ impl MessagesApp {
                     .messages
                     .iter()
                     .map(|message| {
-                        let color = if message.outgoing {
-                            Color32::WHITE
-                        } else {
-                            INK
-                        };
-                        let galley = ui.fonts_mut(|fonts| {
-                            fonts.layout(
-                                message.body.clone(),
-                                FontId::proportional(13.),
-                                color,
-                                max_text,
-                            )
+                        let text = (!message.body.trim().is_empty()).then(|| {
+                            MessageText::layout(ui, &message.body, message.outgoing, max_text)
                         });
                         let day = Local.timestamp_millis_opt(message.timestamp_ms).single();
-                        (galley, day)
+                        let media = Uuid::parse_str(&message.id)
+                            .ok()
+                            .map(|id| {
+                                message
+                                    .attachments
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(index, info)| {
+                                        let id = AttachmentId { message: id, index };
+                                        (id, info.clone(), self.media.size(id, info, max_text))
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        (text, day, media)
                     })
                     .collect::<Vec<_>>();
 
                 let mut last_day: Option<NaiveDate> = None;
                 let mut content_height = if can_load_older { 29. } else { 0. };
-                for (index, (galley, time)) in layout.iter().enumerate() {
+                for (index, (text, time, media)) in layout.iter().enumerate() {
                     let day = time.map(|value| value.date_naive());
                     if day != last_day {
                         content_height += 24.;
                     }
                     last_day = day;
-                    content_height += galley.size().y
-                        + 10.
+                    content_height += text.as_ref().map_or(0., |text| text.galley.size().y + 10.)
+                        + media.iter().map(|(_, _, size)| size.y + 4.).sum::<f32>()
                         + if group_end(&self.messages, index) {
                             10.
                         } else {
@@ -1034,7 +1225,7 @@ impl MessagesApp {
                     return;
                 }
                 last_day = None;
-                for (index, (galley, time)) in layout.into_iter().enumerate() {
+                for (index, (text, time, media)) in layout.into_iter().enumerate() {
                     let message = &self.messages[index];
                     let day = time.map(|value| value.date_naive());
                     if day != last_day
@@ -1064,48 +1255,44 @@ impl MessagesApp {
                         MOTION,
                     );
                     let tail = group_end(&self.messages, index);
-                    let width = galley.size().x + 19.;
-                    let height = galley.size().y + 10.;
-                    let (row, _) =
-                        ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
-                    let x = if message.outgoing {
-                        row.right() - width - 17.
-                    } else {
-                        row.left() + 18.
-                    };
                     // New messages enter from the composer and settle into their transcript slot.
-                    let slide = if message.outgoing { 15. } else { 8. };
-                    let offset = (1. - progress) * slide;
-                    let original = pos2(x, row.top());
-                    let rect = Rect::from_min_size(
-                        original + vec2(if message.outgoing { offset * 0.45 } else { 0. }, offset),
-                        vec2(width, height),
-                    );
-                    let fill = if message.outgoing { BLUE } else { BUBBLE_GRAY };
-                    let mut painter = ui.painter().clone();
-                    painter.multiply_opacity(0.25 + progress * 0.75);
-                    chrome::bubble_shape(&painter, rect, message.outgoing, tail, fill);
-                    let text_rect = rect.shrink2(vec2(9.5, 5.));
-                    let mut text_ui = ui.new_child(
-                        UiBuilder::new()
-                            .max_rect(text_rect)
-                            .layout(Layout::top_down(Align::Min)),
-                    );
-                    text_ui.set_max_width(galley.size().x + 1.);
-                    text_ui.multiply_opacity(0.25 + progress * 0.75);
-                    let text = text_ui.add(
-                        egui::Label::new(RichText::new(&message.body).size(13.).color(
-                            if message.outgoing {
-                                Color32::WHITE
-                            } else {
-                                INK
-                            },
-                        ))
-                        .wrap()
-                        .selectable(true),
-                    );
-                    if let Some(time) = time {
-                        text.on_hover_text(time.format("%A, %d %B %Y at %-I:%M %p").to_string());
+                    let slide = if message.outgoing { 19. } else { 10. };
+                    let shift =
+                        (1. - progress) * vec2(if message.outgoing { 8. } else { 0. }, slide);
+                    let alpha = 0.23 + progress.clamp(0., 1.) * 0.77;
+                    for (id, info, size) in media {
+                        let rect = transcript_slot(ui, size, message.outgoing).translate(shift);
+                        ui.scope(|ui| {
+                            ui.multiply_opacity(alpha);
+                            self.media
+                                .paint(ui, rect, id, &info, self.connection.as_ref());
+                        });
+                        ui.add_space(4.);
+                    }
+                    if let Some(text) = text {
+                        let size = text.galley.size() + vec2(19., 10.);
+                        let rect = transcript_slot(ui, size, message.outgoing).translate(shift);
+                        if ui.is_rect_visible(rect) {
+                            let fill = if message.outgoing { BLUE } else { BUBBLE_GRAY };
+                            let mut painter = ui.painter().clone();
+                            painter.multiply_opacity(alpha);
+                            chrome::bubble_shape(&painter, rect, message.outgoing, tail, fill);
+                            let mut text_ui = ui.new_child(
+                                UiBuilder::new()
+                                    .id_salt((&message.id, "body"))
+                                    .max_rect(rect.shrink2(vec2(9.5, 5.)))
+                                    .layout(Layout::top_down(Align::Min)),
+                            );
+                            text_ui.multiply_opacity(alpha);
+                            let response = text.show(&mut text_ui);
+                            if let Some(time) = time
+                                && !text.has_link_at_pointer(&text_ui, &response)
+                            {
+                                response.on_hover_text(
+                                    time.format("%A, %d %B %Y at %-I:%M %p").to_string(),
+                                );
+                            }
+                        }
                     }
                     if let Some((label, color)) = delivery_label(&self.messages, index) {
                         let (status, _) =
@@ -1121,10 +1308,6 @@ impl MessagesApp {
                     ui.add_space(if tail { 10. } else { 3. });
                 }
             });
-    }
-
-    fn is_demo(&self) -> bool {
-        self.status.as_ref().is_some_and(|status| status.demo)
     }
 
     fn import_dialog(&mut self, ctx: &egui::Context) {
@@ -1210,20 +1393,11 @@ impl MessagesApp {
                 ui.add_space(8.);
                 ui.add_enabled_ui(!connecting, |ui| {
                     ui.horizontal(|ui| {
-                        ui.selectable_value(&mut form.config.mode, Mode::Demo, "Demo");
                         ui.selectable_value(&mut form.config.mode, Mode::Local, "This Computer");
                         ui.selectable_value(&mut form.config.mode, Mode::Remote, "Server");
                     });
                     ui.add_space(9.);
                     match form.config.mode {
-                        Mode::Demo => {
-                            ui.label(
-                                RichText::new(
-                                    "Try Messages with sample conversations on this computer.",
-                                )
-                                .color(MUTED),
-                            );
-                        }
                         Mode::Local => {
                             let label = if self.local_unregistered {
                                 "Use your Mac to register iMessage on this computer."
@@ -1344,12 +1518,12 @@ impl MessagesApp {
 
 impl eframe::App for MessagesApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        CANVAS.to_normalized_gamma_f32()
+        [0., 0., 0., 0.]
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process(ctx);
-        if self.settings.is_none() && self.mac_setup.is_none() {
+        if self.settings.is_none() && self.mac_setup.is_none() && !self.media.is_open() {
             if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::N)) {
                 self.start_compose();
             }
@@ -1373,15 +1547,26 @@ impl eframe::App for MessagesApp {
         } else {
             self.settings_dialog(ctx);
         }
+        self.media.show(ctx);
         window_edge(ctx);
     }
+}
+
+fn transcript_slot(ui: &mut Ui, size: egui::Vec2, outgoing: bool) -> Rect {
+    let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), size.y), Sense::hover());
+    let left = if outgoing {
+        row.right() - size.x - 17.
+    } else {
+        row.left() + 18.
+    };
+    Rect::from_min_size(pos2(left, row.top()), size)
 }
 
 fn motion(ctx: &egui::Context, start: Option<Instant>, duration: f32) -> f32 {
     let Some(start) = start else { return 1. };
     let elapsed = (start.elapsed().as_secs_f32() / duration).clamp(0., 1.);
     if elapsed < 1. {
-        ctx.request_repaint_after(Duration::from_millis(12));
+        ctx.request_repaint();
     }
     1. - (1. - elapsed).powi(3)
 }
@@ -1403,7 +1588,7 @@ fn delivery_label(messages: &[Message], index: usize) -> Option<(&'static str, C
         Delivery::Pending => Some(("Sending…", MUTED)),
         Delivery::Failed => Some(("Not Delivered", DANGER)),
         Delivery::Unknown => Some(("Delivery Unknown", DANGER)),
-        Delivery::Accepted | Delivery::Demo if index + 1 == messages.len() => Some(("Sent", MUTED)),
+        Delivery::Accepted if index + 1 == messages.len() => Some(("Sent", MUTED)),
         _ => None,
     }
 }
@@ -1466,13 +1651,21 @@ fn pin_tile(
     );
     chrome::avatar(ui, at, size + 1.5 * hover, name, &chat.address);
     if !compact {
-        let text = ui.painter().with_clip_rect(rect.shrink2(vec2(6., 0.)));
-        text.text(
-            pos2(rect.center().x, rect.bottom() - 15.),
-            Align2::CENTER_CENTER,
+        let color = MUTED.lerp_to_gamma(Color32::WHITE, selected);
+        let label = sidebar_title(
+            ui,
             name,
             FontId::proportional(10.),
-            MUTED.lerp_to_gamma(Color32::WHITE, selected),
+            color,
+            rect.width() - 12.,
+        );
+        ui.painter().galley(
+            pos2(
+                rect.center().x - label.size().x * 0.5,
+                rect.bottom() - 15. - label.size().y * 0.5,
+            ),
+            label,
+            color,
         );
     }
     response.on_hover_text(name)
@@ -1540,15 +1733,16 @@ fn chat_row(
         .layout_no_wrap(time, FontId::proportional(10.5), muted)
         .size()
         .x;
-    let title_area = Rect::from_min_max(
-        pos2(left, rect.top()),
-        pos2(right - time_width - 7., rect.top() + 25.),
-    );
-    painter.with_clip_rect(title_area).text(
-        pos2(left, rect.top() + 14.),
-        Align2::LEFT_CENTER,
+    let title = sidebar_title(
+        ui,
         name,
         chrome::bold_font(12.),
+        text,
+        right - left - time_width - 7.,
+    );
+    painter.galley(
+        pos2(left, rect.top() + 14. - title.size().y * 0.5),
+        title,
         text,
     );
     let preview = chat.preview.replace('\n', " ");
@@ -1574,6 +1768,19 @@ fn chat_row(
     response
 }
 
+fn sidebar_title(
+    ui: &Ui,
+    name: &str,
+    font: FontId,
+    color: Color32,
+    width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut layout = egui::text::LayoutJob::simple(name.into(), font, color, width.max(4.));
+    layout.wrap.max_rows = 1;
+    layout.wrap.break_anywhere = true;
+    ui.fonts_mut(|fonts| fonts.layout_job(layout))
+}
+
 fn selected_background(ui: &Ui, rect: Rect, response: &egui::Response, active: bool, name: &str) {
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, active, name)
@@ -1584,9 +1791,7 @@ fn selected_background(ui: &Ui, rect: Rect, response: &egui::Response, active: b
     let selected = ui
         .ctx()
         .animate_bool_with_time(response.id.with("selected"), active, 0.19);
-    let color = SIDEBAR
-        .lerp_to_gamma(Color32::from_gray(217), hover)
-        .lerp_to_gamma(BLUE, selected);
+    let color = Color32::from_black_alpha((18. * hover) as u8).lerp_to_gamma(BLUE, selected);
     ui.painter().rect_filled(rect, 6, color);
     if response.has_focus() {
         ui.painter()
@@ -1609,7 +1814,7 @@ fn window_edge(ctx: &egui::Context) {
     ));
     painter.rect_stroke(
         rect,
-        0,
+        chrome::window_radius(ctx),
         Stroke::new(1.0_f32, Color32::from_gray(182)),
         StrokeKind::Inside,
     );
@@ -1654,24 +1859,4 @@ fn window_edge(ctx: &egui::Context) {
                 }
             });
     }
-}
-
-fn chat_name(address: &str, demo: bool) -> String {
-    if demo {
-        let name = match address {
-            "mailto:maya@example.com" => Some("Maya Chen"),
-            "mailto:elliot@example.com" => Some("Elliot Park"),
-            "mailto:noor@example.com" => Some("Noor Ali"),
-            "mailto:ava@example.com" => Some("Ava Patel"),
-            "mailto:leo@example.com" => Some("Leo Rivera"),
-            "mailto:hana@example.com" => Some("Hana Kim"),
-            "mailto:milo@example.com" => Some("Milo James"),
-            "mailto:ella@example.com" => Some("Ella Cooper"),
-            _ => None,
-        };
-        if let Some(name) = name {
-            return name.to_owned();
-        }
-    }
-    display_address(address).to_owned()
 }

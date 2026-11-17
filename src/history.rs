@@ -3,7 +3,8 @@ use std::path::Path;
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::{Conversation, Delivery, Message, PAGE_SIZE};
+use crate::media::MediaSource;
+use crate::{Attachment, Conversation, Delivery, Message, PAGE_SIZE};
 
 pub struct History(Connection);
 
@@ -14,6 +15,7 @@ impl History {
         db.execute_batch("
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = FULL;
+            PRAGMA foreign_keys = ON;
             CREATE TABLE IF NOT EXISTS messages (
                 id TEXT PRIMARY KEY,
                 address TEXT NOT NULL,
@@ -23,20 +25,33 @@ impl History {
                 status TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS recent_messages ON messages(address, timestamp_ms DESC, id DESC);
+            CREATE TABLE IF NOT EXISTS attachments (
+                message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                info TEXT NOT NULL,
+                bytes BLOB,
+                reference TEXT,
+                CHECK ((bytes IS NULL) != (reference IS NULL)),
+                PRIMARY KEY (message_id, position)
+            );
         ")?;
         Ok(Self(db))
     }
 
     pub fn chats(&self) -> Result<Vec<Conversation>> {
         let mut query = self.0.prepare("
-            SELECT address, body, timestamp_ms
+            SELECT address, CASE WHEN TRIM(body) = '' THEN (
+                SELECT CASE WHEN json_extract(info, '$.mime') LIKE 'image/%' THEN 'Photo' ELSE 'Attachment' END
+                FROM attachments WHERE message_id = messages.id ORDER BY position LIMIT 1
+            ) ELSE body END, timestamp_ms
             FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY address ORDER BY timestamp_ms DESC, id DESC) AS rank FROM messages)
+                AS messages
             WHERE rank = 1 ORDER BY timestamp_ms DESC, id DESC LIMIT 300
         ")?;
         let rows = query.query_map([], |row| {
             Ok(Conversation {
                 address: row.get(0)?,
-                preview: row.get(1)?,
+                preview: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
                 updated_ms: row.get(2)?,
             })
         })?;
@@ -53,18 +68,63 @@ impl History {
         let mut rows = query
             .query_map(params![address, PAGE_SIZE, offset], read_message)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        for row in &mut rows {
+            row.attachments = self.attachment_info(&row.id)?;
+        }
         rows.reverse();
         Ok(rows)
     }
 
     pub fn get(&self, id: &str) -> Result<Option<Message>> {
-        Ok(self.0.query_row("SELECT id, address, body, outgoing, timestamp_ms, status FROM messages WHERE id = ?1",
-            [id], read_message).optional()?)
+        let mut row = self.0.query_row("SELECT id, address, body, outgoing, timestamp_ms, status FROM messages WHERE id = ?1",
+            [id], read_message).optional()?;
+        if let Some(row) = &mut row {
+            row.attachments = self.attachment_info(id)?;
+        }
+        Ok(row)
     }
 
-    pub fn insert(&self, message: &Message) -> Result<()> {
+    fn attachment_info(&self, id: &str) -> Result<Vec<Attachment>> {
+        let mut query = self.0.prepare_cached(
+            "SELECT info FROM attachments WHERE message_id = ?1 ORDER BY position",
+        )?;
+        let rows = query.query_map([id], |row| row.get::<_, String>(0))?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
+    pub fn attachment(&self, id: uuid::Uuid, index: usize) -> Result<(Attachment, MediaSource)> {
+        let (metadata, bytes, reference): (String, Option<Vec<u8>>, Option<String>) =
+            self.0.query_row(
+                "SELECT info, bytes, reference FROM attachments WHERE message_id = ?1 AND position = ?2",
+                params![id.to_string(), index],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        let source = if let Some(bytes) = bytes {
+            MediaSource::Local(bytes.into())
+        } else {
+            let reference =
+                reference.ok_or_else(|| anyhow::anyhow!("Missing attachment reference"))?;
+            MediaSource::Apple(Box::new(serde_json::from_str(&reference)?))
+        };
+        Ok((serde_json::from_str(&metadata)?, source))
+    }
+
+    pub fn cache_attachment(&self, id: uuid::Uuid, index: usize, bytes: &[u8]) -> Result<()> {
         self.0.execute(
-            "INSERT INTO messages VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(id) DO NOTHING",
+            "UPDATE attachments SET bytes = ?3, reference = NULL WHERE message_id = ?1 AND position = ?2",
+            params![id.to_string(), index, bytes],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert(
+        &self,
+        message: &Message,
+        sources: impl IntoIterator<Item = MediaSource>,
+    ) -> Result<()> {
+        let transaction = self.0.unchecked_transaction()?;
+        let inserted = transaction.execute(
+            "INSERT INTO messages (id, address, body, outgoing, timestamp_ms, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(id) DO NOTHING",
             params![
                 message.id,
                 message.address,
@@ -73,7 +133,32 @@ impl History {
                 message.timestamp_ms,
                 status_value(message.status)
             ],
-        )?;
+        )? > 0;
+        if inserted {
+            let mut count = 0;
+            for (position, source) in sources.into_iter().enumerate() {
+                let info = message
+                    .attachments
+                    .get(position)
+                    .ok_or_else(|| anyhow::anyhow!("Missing attachment metadata"))?;
+                let (bytes, reference) = match source {
+                    MediaSource::Local(bytes) => (Some(bytes), None),
+                    MediaSource::Apple(reference) => {
+                        (None, Some(serde_json::to_string(&reference)?))
+                    }
+                };
+                transaction.execute(
+                    "INSERT INTO attachments (message_id, position, info, bytes, reference) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![message.id, position, serde_json::to_string(info)?, bytes.as_deref(), reference],
+                )?;
+                count += 1;
+            }
+            ensure!(
+                count == message.attachments.len(),
+                "Missing attachment contents"
+            );
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -104,7 +189,6 @@ fn status_value(status: Delivery) -> &'static str {
         Delivery::Accepted => "accepted",
         Delivery::Failed => "failed",
         Delivery::Unknown => "unknown",
-        Delivery::Demo => "demo",
     }
 }
 
@@ -120,8 +204,8 @@ fn read_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
             "pending" => Delivery::Pending,
             "accepted" => Delivery::Accepted,
             "failed" => Delivery::Failed,
-            "demo" => Delivery::Demo,
             _ => Delivery::Unknown,
         },
+        attachments: Vec::new(),
     })
 }

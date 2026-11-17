@@ -5,10 +5,11 @@ use eframe::egui::{
 
 pub(super) const INK: Color32 = Color32::from_rgb(31, 31, 31);
 pub(super) const MUTED: Color32 = Color32::from_rgb(108, 108, 108);
-pub(super) const SIDEBAR: Color32 = Color32::from_rgb(230, 229, 227);
-pub(super) const TOOLBAR: Color32 = Color32::from_rgb(246, 245, 245);
+pub(super) const SIDEBAR: Color32 = Color32::from_rgba_unmultiplied_const(232, 231, 229, 244);
+pub(super) const TITLEBAR: Color32 = Color32::from_rgba_unmultiplied_const(247, 245, 245, 248);
+pub(super) const COMPOSER: Color32 = Color32::from_rgba_unmultiplied_const(252, 252, 252, 249);
 pub(super) const HAIRLINE: Color32 = Color32::from_rgb(209, 208, 205);
-pub(super) const CANVAS: Color32 = Color32::from_rgb(253, 253, 253);
+pub(super) const CANVAS: Color32 = Color32::from_rgb(255, 255, 255);
 pub(super) const BLUE: Color32 = Color32::from_rgb(0, 122, 255);
 pub(super) const BUBBLE_GRAY: Color32 = Color32::from_rgb(231, 231, 233);
 pub(super) const DANGER: Color32 = Color32::from_rgb(193, 47, 50);
@@ -68,7 +69,7 @@ pub(super) fn bold(text: impl Into<String>, size: f32) -> RichText {
 
 pub(super) fn sheet() -> Frame {
     Frame::new()
-        .fill(TOOLBAR)
+        .fill(Color32::from_rgba_unmultiplied(248, 247, 247, 249))
         .corner_radius(13)
         .inner_margin(Margin::same(16))
         .stroke(Stroke::new(1.0_f32, HAIRLINE))
@@ -80,6 +81,44 @@ pub(super) fn sheet() -> Frame {
         })
 }
 
+pub(super) fn popover() -> Frame {
+    sheet().inner_margin(Margin::same(6)).corner_radius(11)
+}
+
+pub(super) fn window_radius(ctx: &egui::Context) -> u8 {
+    let squared = ctx.input(|input| {
+        input.viewport().maximized.unwrap_or(false) || input.viewport().fullscreen.unwrap_or(false)
+    });
+    if squared { 0 } else { 8 }
+}
+
+pub(super) fn attachment_item(ui: &mut Ui, symbol: Icon, label: &str, tint: Color32) -> Response {
+    let response = ui.add(egui::Button::new("").frame(false).min_size(vec2(146., 33.)));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    let hover = ui.ctx().animate_bool_with_time(
+        response.id,
+        response.hovered() || response.has_focus(),
+        0.12,
+    );
+    ui.painter().rect_filled(
+        response.rect,
+        6,
+        Color32::from_black_alpha((21. * hover) as u8),
+    );
+    let at = response.rect.left_center() + vec2(20., 0.);
+    ui.painter()
+        .rect_filled(Rect::from_center_size(at, Vec2::splat(25.)), 6, tint);
+    icon(ui.painter(), at, symbol, Color32::WHITE);
+    ui.painter().text(
+        response.rect.left_center() + vec2(40., 0.),
+        egui::Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(13.),
+        INK,
+    );
+    response
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum Icon {
     Compose,
@@ -89,6 +128,8 @@ pub(super) enum Icon {
     Plus,
     Emoji,
     Send,
+    Photo,
+    File,
 }
 
 pub(super) fn icon(painter: &egui::Painter, at: Pos2, which: Icon, color: Color32) {
@@ -152,6 +193,35 @@ pub(super) fn icon(painter: &egui::Painter, at: Pos2, which: Icon, color: Color3
             painter.add(Shape::line(
                 vec![p(-3.8, -1.), p(0., -4.7), p(3.8, -1.)],
                 Stroke::new(1.55_f32, color),
+            ));
+        }
+        Icon::Photo => {
+            painter.rect_stroke(
+                Rect::from_center_size(at, vec2(14., 11.)),
+                2,
+                edge,
+                StrokeKind::Middle,
+            );
+            painter.circle_filled(p(-3., -2.), 1.1, color);
+            painter.add(Shape::line(
+                vec![
+                    p(-6., 4.),
+                    p(-2.5, 0.8),
+                    p(-0.2, 3.),
+                    p(3.2, -0.6),
+                    p(6.1, 2.4),
+                ],
+                edge,
+            ));
+        }
+        Icon::File => {
+            painter.add(Shape::closed_line(
+                vec![p(-5., -7.), p(1.5, -7.), p(5., -3.6), p(5., 7.), p(-5., 7.)],
+                edge,
+            ));
+            painter.add(Shape::line(
+                vec![p(1.2, -6.8), p(1.2, -3.4), p(4.6, -3.4)],
+                edge,
             ));
         }
     }
@@ -313,14 +383,26 @@ pub(super) fn avatar(ui: &Ui, center: Pos2, size: f32, name: &str, address: &str
     let light = fill.lerp_to_gamma(Color32::WHITE, 0.29);
     let shadow = fill.lerp_to_gamma(Color32::BLACK, 0.20);
     let mut gradient = egui::Mesh::default();
-    let segments = 30;
+    let pixels_per_point = ui.ctx().pixels_per_point();
+    let segments = (std::f32::consts::PI * size * pixels_per_point / 2.5)
+        .ceil()
+        .clamp(32., 160.) as u32;
+    let antialias = 0.6 / pixels_per_point;
     gradient.colored_vertex(center, fill);
     for index in 0..segments {
         let theta = index as f32 * std::f32::consts::TAU / segments as f32;
         let offset = vec2(theta.cos(), theta.sin());
         let color = light.lerp_to_gamma(shadow, (offset.y + 1.) * 0.5);
-        gradient.colored_vertex(center + offset * (size / 2.), color);
-        gradient.add_triangle(0, index + 1, (index + 1) % segments + 1);
+        gradient.colored_vertex(center + offset * (size / 2. - antialias), color);
+        gradient.colored_vertex(
+            center + offset * (size / 2. + antialias),
+            Color32::TRANSPARENT,
+        );
+        let inner = 1 + index * 2;
+        let next = 1 + ((index + 1) % segments) * 2;
+        gradient.add_triangle(0, inner, next);
+        gradient.add_triangle(inner, inner + 1, next);
+        gradient.add_triangle(next, inner + 1, next + 1);
     }
     ui.painter().add(Shape::mesh(gradient));
     let initials = name

@@ -12,7 +12,11 @@ use tokio::{
     time::sleep,
 };
 
-use crate::{Conversation, Delivery, Message, SendText, Status, TEXT_LIMIT, address, now_ms};
+use crate::media::MediaSource;
+use crate::{
+    Conversation, Delivery, FILE_LIMIT, MAX_ATTACHMENTS, Message, SendText, Status, TEXT_LIMIT,
+    address, now_ms,
+};
 use crate::{
     apple::{Identity, Madrid},
     history::History,
@@ -21,7 +25,7 @@ use crate::{
 #[derive(Clone)]
 pub struct Engine {
     state: Arc<State>,
-    requests: Option<mpsc::Sender<Request>>,
+    requests: mpsc::Sender<Request>,
     status: watch::Receiver<Status>,
 }
 
@@ -30,17 +34,18 @@ struct State {
     _lock: File,
 }
 
-struct Request {
-    message: SendText,
-    reply: oneshot::Sender<Result<Message>>,
+enum Request {
+    Send(SendText, oneshot::Sender<Result<Message>>),
+    Download {
+        id: uuid::Uuid,
+        index: usize,
+        reply: oneshot::Sender<Result<bytes::Bytes>>,
+    },
 }
 
 impl Engine {
-    pub fn start(root: &Path, identity: Option<Identity>) -> Result<Self> {
-        let demo = identity.is_none();
-        let profile = identity
-            .as_ref()
-            .map_or_else(|| "demo".into(), Identity::profile_id);
+    pub fn start(root: &Path, identity: Identity) -> Result<Self> {
+        let profile = identity.profile_id();
         let lock = OpenOptions::new()
             .mode(0o600)
             .create(true)
@@ -55,22 +60,11 @@ impl Engine {
         });
         state.history()?.recover()?;
         let (updates, status) = watch::channel(Status {
-            demo,
-            connected: demo,
-            detail: if demo {
-                "Demo · messages stay on this device".into()
-            } else {
-                "Connecting to Apple…".into()
-            },
+            connected: false,
+            detail: "Connecting to Apple…".into(),
         });
-        let requests = if let Some(identity) = identity {
-            let (requests, receiver) = mpsc::channel(16);
-            tokio::spawn(run_apple(identity, state.clone(), receiver, updates));
-            Some(requests)
-        } else {
-            seed(&*state.history()?)?;
-            None
-        };
+        let (requests, receiver) = mpsc::channel(16);
+        tokio::spawn(run_apple(identity, state.clone(), receiver, updates));
         Ok(Self {
             state,
             requests,
@@ -93,26 +87,48 @@ impl Engine {
     pub async fn send(&self, mut request: SendText) -> Result<Message> {
         request.address = address(&request.address)?;
         ensure!(
-            !request.body.trim().is_empty()
+            (!request.body.trim().is_empty() || !request.files.is_empty())
                 && request.body.len() <= TEXT_LIMIT
                 && !request.body.contains('\0'),
-            "Enter a message between 1 and {TEXT_LIMIT} UTF-8 bytes"
+            "Enter up to {TEXT_LIMIT} UTF-8 bytes or add an attachment"
         );
-        let Some(queue) = &self.requests else {
-            let history = self.state.history()?;
-            let (item, _) = start_send(&history, &request, Delivery::Demo)?;
-            return Ok(item);
-        };
+        ensure!(
+            request.files.len() <= MAX_ATTACHMENTS,
+            "Too many attachments"
+        );
+        for file in &request.files {
+            file.validate()?;
+        }
+        ensure!(
+            request
+                .files
+                .iter()
+                .map(|file| file.info.size)
+                .sum::<usize>()
+                <= FILE_LIMIT,
+            "A message can contain up to 32 MiB of attachments"
+        );
         let (reply, answer) = oneshot::channel();
-        queue
-            .try_send(Request {
-                message: request,
-                reply,
-            })
+        self.requests
+            .try_send(Request::Send(request, reply))
             .context("The Apple engine is busy or stopped")?;
         answer
             .await
             .context("The Apple engine stopped during the request")?
+    }
+
+    pub async fn attachment(&self, id: uuid::Uuid, index: usize) -> Result<bytes::Bytes> {
+        let (_, source) = self.state.history()?.attachment(id, index)?;
+        if let MediaSource::Local(bytes) = source {
+            return Ok(bytes);
+        }
+        let (reply, answer) = oneshot::channel();
+        self.requests
+            .try_send(Request::Download { id, index, reply })
+            .context("The Apple engine is busy or stopped")?;
+        answer
+            .await
+            .context("The Apple engine stopped during the download")?
     }
 }
 
@@ -156,9 +172,16 @@ async fn run_apple(
                 _ = status.closed() => return,
                 request = requests.recv() => {
                     let Some(request) = request else { return };
-                    let result = state.history().and_then(|history| read_previous(&history, &request.message))
-                        .and_then(|previous| previous.context("Apple courier is disconnected"));
-                    let _ = request.reply.send(result);
+                    match request {
+                        Request::Send(message, reply) => {
+                            let result = state.history().and_then(|history| read_previous(&history, &message))
+                                .and_then(|previous| previous.context("Apple courier is disconnected"));
+                            let _ = reply.send(result);
+                        }
+                        Request::Download { reply, .. } => {
+                            let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
+                        }
+                    }
                 }
             }
         }
@@ -177,15 +200,21 @@ async fn online(
         tokio::select! {
             notification = madrid.next_notification() => {
                 let notification = notification?;
-                if let Some(message) = madrid.decode(identity, &notification).await? {
-                    state.history()?.insert(&message)?;
+                if let Some((message, media)) = madrid.decode(identity, &notification).await? {
+                    state.history()?.insert(&message, media)?;
                 }
                 madrid.acknowledge(notification.id).await?;
             }
             request = requests.recv() => {
                 let Some(request) = request else { return Ok(()) };
-                let value = send_on_courier(identity, state, madrid, &request.message).await;
-                let _ = request.reply.send(value);
+                match request {
+                    Request::Send(message, reply) => {
+                        let _ = reply.send(send_on_courier(identity, state, madrid, &message).await);
+                    }
+                    Request::Download { id, index, reply } => {
+                        let _ = reply.send(download(identity, state, madrid, id, index).await);
+                    }
+                }
             }
             _ = status.closed() => return Ok(()),
         }
@@ -200,7 +229,7 @@ async fn send_on_courier(
 ) -> Result<Message> {
     let (mut item, is_new) = {
         let history = state.history()?;
-        start_send(&history, request, Delivery::Pending)?
+        start_send(&history, request)?
     };
     if !is_new {
         return Ok(item);
@@ -221,15 +250,24 @@ fn read_previous(history: &History, request: &SendText) -> Result<Option<Message
         ensure!(
             existing.outgoing
                 && existing.address == request.address
-                && existing.body == request.body,
+                && existing.body == request.body
+                && existing.attachments.iter().eq(request.files.iter().map(|file| &file.info))
+                && request.files.iter().enumerate().all(|(index, file)| {
+                    matches!(history.attachment(request.id, index), Ok((_, MediaSource::Local(bytes))) if bytes == file.bytes)
+                }),
             "Message ID is already used by a different message"
         );
     }
     Ok(existing)
 }
 
-fn start_send(history: &History, request: &SendText, status: Delivery) -> Result<(Message, bool)> {
-    if let Some(existing) = read_previous(history, request)? {
+fn start_send(history: &History, request: &SendText) -> Result<(Message, bool)> {
+    if let Some(mut existing) = read_previous(history, request)? {
+        if existing.status == Delivery::Failed {
+            history.update(&existing.id, Delivery::Pending)?;
+            existing.status = Delivery::Pending;
+            return Ok((existing, true));
+        }
         return Ok((existing, false));
     }
     let item = Message {
@@ -238,117 +276,84 @@ fn start_send(history: &History, request: &SendText, status: Delivery) -> Result
         body: request.body.clone(),
         outgoing: true,
         timestamp_ms: now_ms(),
-        status,
+        status: Delivery::Pending,
+        attachments: request.files.iter().map(|file| file.info.clone()).collect(),
     };
-    history.insert(&item)?;
+    history.insert(
+        &item,
+        request
+            .files
+            .iter()
+            .map(|file| MediaSource::Local(file.bytes.clone())),
+    )?;
     Ok((item, true))
 }
 
 fn set_status(status: &watch::Sender<Status>, connected: bool, detail: &str) {
     status.send_replace(Status {
-        demo: false,
         connected,
         detail: detail.to_owned(),
     });
 }
 
-fn seed(history: &History) -> Result<()> {
-    if !history.chats()?.is_empty() {
-        return Ok(());
+async fn download(
+    identity: &Identity,
+    state: &State,
+    madrid: &mut Madrid,
+    id: uuid::Uuid,
+    index: usize,
+) -> Result<bytes::Bytes> {
+    let (info, source) = state.history()?.attachment(id, index)?;
+    match source {
+        MediaSource::Local(bytes) => Ok(bytes),
+        MediaSource::Apple(media) => {
+            let bytes = madrid.download(identity, &media, info.size).await?;
+            state.history()?.cache_attachment(id, index, &bytes)?;
+            Ok(bytes)
+        }
     }
-    let sample = [
-        (
-            1,
-            "maya",
-            false,
-            "Are we still meeting at the bookshop?",
-            16,
-        ),
-        (2, "maya", true, "Yes! I’ll get there a little early.", 14),
-        (3, "maya", false, "Perfect. I’ll bring coffee ☕", 12),
-        (4, "elliot", false, "I found the photos from Saturday.", 85),
-        (5, "noor", false, "That playlist is so good.", 240),
-        (
-            6,
-            "ava",
-            false,
-            "Can you send me the address when you get a chance?",
-            75,
-        ),
-        (
-            7,
-            "leo",
-            false,
-            "I found the one we were talking about.",
-            115,
-        ),
-        (
-            8,
-            "hana",
-            false,
-            "Thursday works for me! How about six?",
-            184,
-        ),
-        (
-            9,
-            "milo",
-            false,
-            "Sounds good. Let me know if you need anything.",
-            205,
-        ),
-        (10, "ella", false, "Hope you had a lovely weekend.", 480),
-        (11, "maya", false, "I finished that book you lent me.", 64),
-        (
-            12,
-            "maya",
-            false,
-            "The last chapter got me. Have you read anything else by her?",
-            63,
-        ),
-        (13, "maya", true, "I have! The new one is even better.", 62),
-        (
-            14,
-            "maya",
-            true,
-            "There’s a copy at the bookshop on the corner. They’re doing a reading this weekend, too.",
-            61,
-        ),
-        (
-            15,
-            "maya",
-            false,
-            "Let’s go. I haven’t been there in ages.",
-            58,
-        ),
-        (
-            16,
-            "maya",
-            true,
-            "They have a little café upstairs now.",
-            54,
-        ),
-        (17, "maya", false, "That sounds lovely.", 47),
-        (
-            18,
-            "maya",
-            true,
-            "I’ll grab a table by the window if I get there first.",
-            40,
-        ),
-    ];
-    for (id, who, outgoing, body, minutes) in sample {
-        history.insert(&Message {
-            id: format!("demo-{id}"),
-            address: format!("mailto:{who}@example.com"),
-            body: body.into(),
-            outgoing,
-            timestamp_ms: now_ms() - minutes * 60_000,
-            status: if outgoing {
-                Delivery::Demo
-            } else {
-                Delivery::Received
-            },
-        })?;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Attachment, Upload};
+
+    #[test]
+    fn an_attachment_retry_preserves_the_message_and_its_original_bytes() -> Result<()> {
+        let folder = tempfile::tempdir()?;
+        let history = History::open(folder.path(), "test")?;
+        let mut request = SendText {
+            id: uuid::Uuid::new_v4(),
+            address: "mailto:recipient@example.com".into(),
+            body: String::new(),
+            files: vec![Upload {
+                info: Attachment {
+                    name: "photo.png".into(),
+                    mime: "image/png".into(),
+                    size: 4,
+                    width: 4,
+                    height: 4,
+                },
+                bytes: bytes::Bytes::from_static(b"1234"),
+            }],
+        };
+        let (message, new) = start_send(&history, &request)?;
+        assert!(new);
+        assert_eq!(history.chats()?[0].preview, "Photo");
+        assert_eq!(
+            history.messages(&request.address, 0)?[0].attachments,
+            vec![request.files[0].info.clone()]
+        );
+        history.update(&message.id, Delivery::Failed)?;
+        let (retry, new) = start_send(&history, &request)?;
+        assert!(new);
+        assert_eq!(retry.id, message.id);
+        assert_eq!(retry.status, Delivery::Pending);
+        history.update(&message.id, Delivery::Accepted)?;
+        assert!(!start_send(&history, &request)?.1);
+        request.files[0].bytes = bytes::Bytes::from_static(b"5678");
+        assert!(start_send(&history, &request).is_err());
+        Ok(())
     }
-    Ok(())
 }

@@ -6,6 +6,9 @@ pub mod storage;
 
 use serde::{Deserialize, Serialize};
 
+mod media;
+pub use media::{Attachment, FILE_LIMIT, MAX_ATTACHMENTS, Upload};
+
 pub const TEXT_LIMIT: usize = 4096;
 pub const PAGE_SIZE: u32 = 75;
 
@@ -24,6 +27,8 @@ pub struct Message {
     pub outgoing: bool,
     pub timestamp_ms: i64,
     pub status: Delivery,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
@@ -33,13 +38,12 @@ pub enum Delivery {
     Pending,
     Accepted,
     Failed,
+    #[serde(other)]
     Unknown,
-    Demo,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Status {
-    pub demo: bool,
     pub connected: bool,
     pub detail: String,
 }
@@ -49,6 +53,8 @@ pub struct SendText {
     pub id: uuid::Uuid,
     pub address: String,
     pub body: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<Upload>,
 }
 
 pub fn address(input: &str) -> anyhow::Result<String> {

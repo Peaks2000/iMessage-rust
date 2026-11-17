@@ -13,13 +13,14 @@ use serde::Deserialize;
 use tokio::time::{Instant, timeout};
 use uuid::Uuid;
 
-use crate::{Delivery, Message, SendText, TEXT_LIMIT, address, now_ms};
+use crate::media::{MediaReference, MediaSource};
+use crate::{Delivery, Message, SendText, address, now_ms};
 
 use super::{
     Identity,
     aps::{Courier, Frame, TOPIC, push_id},
     crypto::KeyPair,
-    nonce, rsa_signature,
+    message_content, mmcs, nonce, rsa_signature,
 };
 
 const QUERY_URL: &str = "https://query.ess.apple.com/WebObjects/QueryService.woa/wa/query";
@@ -311,8 +312,9 @@ impl Madrid {
             "Apple IDS returned no compatible iMessage devices for this recipient"
         );
 
-        let text = compress(&binary(&dictionary([
-            ("t", value(&message.body)),
+        let plain = format!("{}{}", "\u{fffc}".repeat(message.files.len()), message.body);
+        let mut content = dictionary([
+            ("t", value(plain)),
             (
                 "p",
                 Value::Array(participants.iter().map(|uri| value(*uri)).collect()),
@@ -320,7 +322,21 @@ impl Madrid {
             ("pv", 0.into()),
             ("gv", value("8")),
             ("v", value("1")),
-        ]))?)?;
+        ]);
+        let text = if message.files.is_empty() {
+            compress(&binary(&content)?)?
+        } else {
+            let mut files = Vec::with_capacity(message.files.len());
+            for file in &message.files {
+                let reference = mmcs::upload(self, identity, &file.bytes).await?;
+                files.push((file.info.clone(), reference));
+            }
+            content.insert(
+                "x".into(),
+                value(message_content::encode(&message.body, files.into_iter())?),
+            );
+            binary(&content)?
+        };
         let mut batches = vec![Vec::new()];
         let mut batch_bytes = 0;
         let mut seen = HashSet::new();
@@ -353,20 +369,28 @@ impl Madrid {
             }
         }
 
+        let payloads = batches
+            .into_iter()
+            .enumerate()
+            .map(|(index, bundle)| {
+                let id = push_id()?;
+                let wire = binary(&dictionary([
+                    ("c", 100.into()),
+                    ("E", value("pair")),
+                    ("ua", value(&identity.user_agent)),
+                    ("v", 8.into()),
+                    ("i", i32::from_be_bytes(id).into()),
+                    ("U", data(message.id.as_bytes())),
+                    ("sP", value(&identity.handle)),
+                    ("fcn", (index as u32 + 1).into()),
+                    ("dtl", Value::Array(bundle)),
+                ]))?;
+                Ok((id, wire))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         let mut pushed = false;
-        for (index, bundle) in batches.into_iter().enumerate() {
-            let id = push_id()?;
-            let wire = binary(&dictionary([
-                ("c", 100.into()),
-                ("E", value("pair")),
-                ("ua", value(&identity.user_agent)),
-                ("v", 8.into()),
-                ("i", i32::from_be_bytes(id).into()),
-                ("U", data(message.id.as_bytes())),
-                ("sP", value(&identity.handle)),
-                ("fcn", (index as u32 + 1).into()),
-                ("dtl", Value::Array(bundle)),
-            ]))?;
+        for (id, wire) in payloads {
             match self.send_push(id, &wire).await {
                 Ok(true) => pushed = true,
                 Ok(false) if !pushed => return Ok(Delivery::Failed),
@@ -376,11 +400,72 @@ impl Madrid {
         Ok(Delivery::Accepted)
     }
 
+    pub(crate) async fn download(
+        &mut self,
+        identity: &Identity,
+        reference: &MediaReference,
+        size: usize,
+    ) -> Result<bytes::Bytes> {
+        mmcs::download(self, identity, reference, size).await
+    }
+
+    pub(super) async fn media_request<const N: usize>(
+        &mut self,
+        identity: &Identity,
+        command: u64,
+        fields: [(&str, Value); N],
+    ) -> Result<Dictionary> {
+        let id = push_id()?;
+        let message_id = i32::from_be_bytes(id);
+        let mut payload = dictionary(fields);
+        payload.extend(dictionary([
+            ("c", command.into()),
+            ("cV", 2.into()),
+            ("i", message_id.into()),
+            ("ua", value(&identity.user_agent)),
+        ]));
+        ensure!(
+            self.send_push(id, &binary(&payload)?).await?,
+            "Apple rejected the MMCS request"
+        );
+        let matches = |item: &Notification| {
+            item.data.get("c").and_then(Value::as_unsigned_integer) == Some(command)
+                && item
+                    .data
+                    .get("i")
+                    .and_then(Value::as_signed_integer)
+                    .is_some_and(|value| value as i32 == message_id)
+        };
+        timeout(RESPONSE_TIMEOUT, async {
+            loop {
+                let item = if let Some(index) = self.queued.iter().position(&matches) {
+                    self.queued.remove(index)
+                } else {
+                    let frame = self.courier.next().await?;
+                    self.notification(frame).await?
+                };
+                if let Some(item) = item {
+                    if matches(&item) {
+                        self.acknowledge(item.id).await?;
+                        return Ok(item.data);
+                    }
+                    ensure!(
+                        self.queued.len() < MAX_QUEUE,
+                        "Apple notification queue is full"
+                    );
+                    self.queued.push_back(item);
+                }
+            }
+        })
+        .await
+        .context("Apple MMCS authorization timed out")?
+    }
+
     pub(crate) async fn decode(
         &mut self,
         identity: &Identity,
         notice: &Notification,
-    ) -> Result<Option<Message>> {
+    ) -> Result<Option<(Message, Vec<MediaSource>)>> {
         let wire = &notice.data;
         let command = wire.get("c").and_then(Value::as_unsigned_integer);
         if command != Some(100) || field_str(wire, "E").is_some_and(|name| name != "pair") {
@@ -429,14 +514,9 @@ impl Madrid {
         let Some(device) = devices.iter().find(|entry| entry.push == token) else {
             return Ok(None);
         };
-        let decoded = (|| -> Result<Option<Message>> {
+        let decoded = (|| -> Result<Option<(Message, Vec<MediaSource>)>> {
             let plaintext = identity.message_keys.open(&device.public_key, envelope)?;
             let body: Dictionary = plist::from_bytes(&decompress(&plaintext)?)?;
-            let Some(text) =
-                field_str(&body, "t").filter(|text| !text.is_empty() && text.len() <= TEXT_LIMIT)
-            else {
-                return Ok(None);
-            };
             let Some(participants) = body
                 .get("p")
                 .and_then(Value::as_array)
@@ -458,23 +538,32 @@ impl Madrid {
                 .into_iter()
                 .find(|part| *part != identity.handle)
                 .context("Missing conversation recipient")?;
-            Ok(Some(Message {
-                id: guid.to_string(),
-                address: peer,
-                body: text.to_owned(),
-                outgoing: sender == identity.handle,
-                timestamp_ms: wire
-                    .get("e")
-                    .and_then(Value::as_unsigned_integer)
-                    .map(|ns| (ns / 1_000_000) as i64)
-                    .filter(|time| *time > 0 && *time <= now_ms() + 120_000)
-                    .unwrap_or_else(now_ms),
-                status: if sender == identity.handle {
-                    Delivery::Accepted
-                } else {
-                    Delivery::Received
+            let (text, files) = message_content::decode(&body);
+            if text.trim().is_empty() && files.is_empty() {
+                return Ok(None);
+            }
+            let (attachments, sources) = files.into_iter().unzip();
+            Ok(Some((
+                Message {
+                    id: guid.to_string(),
+                    address: peer,
+                    body: text,
+                    attachments,
+                    outgoing: sender == identity.handle,
+                    timestamp_ms: wire
+                        .get("e")
+                        .and_then(Value::as_unsigned_integer)
+                        .map(|ns| (ns / 1_000_000) as i64)
+                        .filter(|time| *time > 0 && *time <= now_ms() + 120_000)
+                        .unwrap_or_else(now_ms),
+                    status: if sender == identity.handle {
+                        Delivery::Accepted
+                    } else {
+                        Delivery::Received
+                    },
                 },
-            }))
+                sources,
+            )))
         })();
         // Invalid or unsupported payloads cannot be retried into validity.
         Ok(decoded.unwrap_or(None))
@@ -516,7 +605,7 @@ fn compress(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(encoder.finish()?)
 }
 
-fn decompress(bytes: &[u8]) -> Result<Vec<u8>> {
+pub(super) fn decompress(bytes: &[u8]) -> Result<Vec<u8>> {
     if !bytes.starts_with(&[0x1f, 0x8b]) {
         ensure!(bytes.len() <= MAX_PLIST, "Apple plist exceeds size limit");
         return Ok(bytes.to_vec());

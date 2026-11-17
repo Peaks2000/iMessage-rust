@@ -92,7 +92,12 @@ impl SessionImport {
             return Outcome::Closed;
         }
         if browse {
-            self.start(context, false, || Ok(Event::Chosen(run_file_picker()?)));
+            self.start(context, false, || {
+                Ok(Event::Chosen(run_file_picker(
+                    "Choose Registered iMessage Session",
+                    &[],
+                )?))
+            });
         }
         if save {
             let root = root.to_owned();
@@ -150,11 +155,12 @@ impl SessionImport {
     }
 }
 
-fn run_file_picker() -> Result<Option<PathBuf>> {
+pub(super) fn run_file_picker(title: &str, options: &[&str]) -> Result<Option<PathBuf>> {
     let mut child = Command::new("zenity")
         .arg("--file-selection")
         .arg("--title")
-        .arg("Choose Registered iMessage Session")
+        .arg(title)
+        .args(options)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

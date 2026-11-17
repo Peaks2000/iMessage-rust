@@ -2,7 +2,7 @@
 
 A desktop app for Linux modelled on macOS Sequoia Messages, an optional self-hosted server, and an experimental Rust engine that talks directly to Apple's APNs and Identity Service (IDS). The desktop app can run the engine on the same computer or connect to the Rust server.
 
-![Messages for Linux showing a demo conversation](docs/desktop.png)
+![Messages for Linux with pinned conversations, an inline photo, and a clickable link](docs/desktop.png)
 
 ## Try the desktop app
 
@@ -13,15 +13,17 @@ cargo build --locked --release
 ./target/release/messages
 ```
 
-Use the compose icon or **Ctrl+N** to start a conversation. Enter sends and Shift+Enter adds a line break. Open **Settings** with **Ctrl+,** or from the conversation’s details button. Right-click a conversation to pin or unpin it. Demo mode uses local sample conversations and saves messages to a separate demo database.
+Use the compose icon or **Ctrl+N** to start a conversation. Enter sends and Shift+Enter adds a line break. Open **Settings** with **Ctrl+,** or from the conversation’s details button. Right-click a conversation to pin or unpin it.
 
-The Sequoia layout includes animated conversation selection, message arrival, the composer’s send button, and settings sheets. Calling and Apple message effects remain outside this build. [Apple’s Sequoia Messages guide](https://support.apple.com/guide/messages/welcome/14.0/mac/15.0)
+Use the **+** next to the composer to choose **Photos** or **Files**, or drop a file on the conversation. The file picker uses Zenity. Photos render inline and open in a larger viewer where you can save the original. The app previews JPEG, PNG, HEIC, WebP, GIF, BMP, ICO, and TIFF images. Click a web link to open it in your default browser.
+
+The Sequoia layout includes animated conversation selection, message arrival, the composer’s send button, and settings sheets. Translucency uses the Linux compositor. [Apple’s Sequoia Messages guide](https://support.apple.com/guide/messages/welcome/14.0/mac/15.0)
 
 ## Connect to iMessage
 
-The desktop opens any registered iMessage session saved in Linux Secret Service and connects directly to Apple. First-time device activation from Linux alone is unavailable. If you already have a compatible session, you can restore it from **Settings → This Computer → Import Registered Session**. [Session format](docs/apple-session.md#import-a-registered-session)
+The desktop opens a registered iMessage session from Linux Secret Service and connects directly to Apple. For first-time registration, use **Settings → This Computer → Set Up with a Mac**. You can also restore a compatible registration using **Import Registered Session**. [Setup and session format](docs/apple-session.md)
 
-Supported message content is plain text exchanged with devices that accept the legacy format. Group chats, attachments, SMS, modern iMessage encryption formats, and iCloud history sync remain outside this version. The UI shows when Apple's courier accepted a send. Recipient delivery and read receipts require further work.
+The engine supports one-to-one text and attachments with devices that accept the legacy iMessage format. A message can contain up to eight attachments and 32 MiB of attachment data. **Sent** indicates that Apple’s courier accepted the send.
 
 ## Run the optional server
 
@@ -29,10 +31,11 @@ Build just the server for a headless machine.
 
 ```sh
 cargo build --locked --release --no-default-features --bin messages-server
-./target/release/messages-server --data-dir ./server-data serve --demo
+./target/release/messages-server --data-dir ./server-data import-session /path/to/apple-session.plist
+./target/release/messages-server --data-dir ./server-data serve
 ```
 
-In the desktop app, choose **Settings → Server** and enter `http://127.0.0.1:7848`. Leave the login fields blank for this local demo. To serve Apple messages, provision the server's data directory and start it without `--demo`. Only one process can open a given local profile. If the server owns the profile, connect the desktop through **Server** mode.
+In the desktop app, choose **Settings → Server** and enter `http://127.0.0.1:7848`. Leave the login fields blank for this loopback configuration. Only one process can open a given local profile. If the server owns the profile, connect the desktop through **Server** mode.
 
 For a network listener, supply a TLS certificate and key and require a username and password. The certificate must match the hostname and chain to a CA trusted by the Linux desktop.
 

@@ -3,10 +3,14 @@ use std::path::PathBuf;
 use clap::Parser;
 use eframe::egui;
 
+#[path = "messages/attachments.rs"]
+mod attachments;
 #[path = "messages/chrome.rs"]
 mod chrome;
 #[path = "messages/connection.rs"]
 mod connection;
+#[path = "messages/links.rs"]
+mod links;
 #[path = "messages/mac_setup.rs"]
 mod mac_setup;
 #[path = "messages/session_import.rs"]
@@ -17,11 +21,8 @@ mod window;
 #[derive(Parser)]
 #[command(about = "A Linux desktop client for the experimental iMessage engine")]
 struct Args {
-    /// Start with sample conversations for this launch
-    #[arg(long)]
-    demo: bool,
     /// Open the optional Mac-assisted setup
-    #[arg(long, conflicts_with = "demo")]
+    #[arg(long)]
     mac_setup: bool,
     /// Override the per-user data directory
     #[arg(long)]
@@ -44,6 +45,7 @@ fn main() -> anyhow::Result<()> {
             .with_app_id("io.github.Peaks2000.LinuxMessages")
             .with_inner_size([932., 700.])
             .with_decorations(false)
+            .with_transparent(true)
             .with_min_inner_size([700., 480.]),
         ..Default::default()
     };
@@ -54,7 +56,6 @@ fn main() -> anyhow::Result<()> {
             Ok(Box::new(window::MessagesApp::new(
                 &context.egui_ctx,
                 root,
-                args.demo,
                 args.mac_setup,
             )))
         }),

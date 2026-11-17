@@ -1,22 +1,29 @@
 use std::{
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, Sender},
+    },
     time::Duration,
 };
 
 use anyhow::{Context, Result, ensure};
 use eframe::egui;
-use linux_imessage::{Conversation, Message, SendText, Status, api, engine::Engine, storage};
+use linux_imessage::{
+    Conversation, FILE_LIMIT, Message, SendText, Status, api, engine::Engine, storage,
+};
 use reqwest::{Client, Method, RequestBuilder, StatusCode, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use zeroize::Zeroizing;
 
+use super::attachments::{AttachmentId, Contents, Purpose};
+
 #[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
-    Demo,
     #[default]
+    #[serde(alias = "demo")]
     Local,
     Remote,
 }
@@ -63,6 +70,7 @@ pub enum Action {
     Refresh(Option<String>),
     Older { chat: String, offset: u32 },
     Send(SendText),
+    Attachment { id: AttachmentId, purpose: Purpose },
 }
 
 pub enum Event {
@@ -81,6 +89,11 @@ pub enum Event {
     Sent {
         request: SendText,
         result: Result<Message>,
+    },
+    Attachment {
+        id: AttachmentId,
+        purpose: Purpose,
+        result: Result<Contents>,
     },
     Error(String),
 }
@@ -161,9 +174,9 @@ fn run(
         .enable_all()
         .build()?;
     let backend = runtime.block_on(async {
-        match settings.mode {
-            Mode::Demo | Mode::Local => Engine::start(root, identity).map(Backend::Local),
-            Mode::Remote => Remote::new(settings, password).map(Backend::Remote),
+        match identity {
+            Some(identity) => Engine::start(root, identity).map(Backend::Local),
+            None => Remote::new(settings, password).map(Backend::Remote),
         }
     })?;
     let status = runtime.block_on(backend.status())?;
@@ -171,7 +184,7 @@ fn run(
         persist(root, settings, &previous, &backend)?;
     }
     emit(events, context, Event::Ready(status));
-    runtime.block_on(work(actions, events, context, &backend));
+    runtime.block_on(work(actions, events, context, Arc::new(backend)));
     Ok(())
 }
 
@@ -200,11 +213,11 @@ async fn work(
     mut actions: UnboundedReceiver<Action>,
     events: &Sender<Event>,
     context: &egui::Context,
-    backend: &Backend,
+    backend: Arc<Backend>,
 ) {
     while let Some(action) = actions.recv().await {
         let event = match action {
-            Action::Refresh(chat) => refresh(backend, chat)
+            Action::Refresh(chat) => refresh(&backend, chat)
                 .await
                 .unwrap_or_else(|error| Event::Error(error.to_string())),
             Action::Older { chat, offset } => {
@@ -214,6 +227,28 @@ async fn work(
             Action::Send(request) => {
                 let result = backend.send(&request).await;
                 Event::Sent { request, result }
+            }
+            Action::Attachment { id, purpose } => {
+                let backend = backend.clone();
+                let events = events.clone();
+                let context = context.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        let bytes = backend.attachment(id).await?;
+                        tokio::task::spawn_blocking(move || Contents::load(bytes, purpose)).await?
+                    }
+                    .await;
+                    emit(
+                        &events,
+                        &context,
+                        Event::Attachment {
+                            id,
+                            purpose,
+                            result,
+                        },
+                    );
+                });
+                continue;
             }
         };
         emit(events, context, event);
@@ -290,6 +325,21 @@ impl Backend {
             }
         }
     }
+
+    async fn attachment(&self, id: AttachmentId) -> Result<bytes::Bytes> {
+        match self {
+            Self::Local(engine) => engine.attachment(id.message, id.index).await,
+            Self::Remote(remote) => Ok(remote
+                .body(
+                    remote
+                        .request(Method::GET, &id.route())
+                        .timeout(Duration::from_secs(60)),
+                    FILE_LIMIT,
+                )
+                .await?
+                .into()),
+        }
+    }
 }
 
 struct Remote {
@@ -343,6 +393,11 @@ impl Remote {
     }
 
     async fn fetch<T: DeserializeOwned>(&self, request: RequestBuilder) -> Result<T> {
+        serde_json::from_slice(&self.body(request, 4 * 1024 * 1024).await?)
+            .context("The server returned an invalid Messages API response")
+    }
+
+    async fn body(&self, request: RequestBuilder, max: usize) -> Result<Vec<u8>> {
         let mut response = request
             .send()
             .await
@@ -362,7 +417,7 @@ impl Remote {
             .map_err(|error| error.without_url())?
         {
             ensure!(
-                body.len() + chunk.len() <= 4 * 1024 * 1024,
+                body.len() + chunk.len() <= max,
                 "The server response is too large"
             );
             body.extend_from_slice(&chunk);
@@ -373,7 +428,6 @@ impl Remote {
             }
             anyhow::bail!("The server returned HTTP {}", status.as_u16());
         }
-        serde_json::from_slice(&body)
-            .context("The server returned an invalid Messages API response")
+        Ok(body)
     }
 }

@@ -4,7 +4,7 @@ use anyhow::{Context, Result, ensure};
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Query, Request, State},
+    extract::{DefaultBodyLimit, Path as RoutePath, Query, Request, State},
     http::{HeaderValue, StatusCode, header, uri::Authority},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -18,7 +18,9 @@ use tokio::sync::Semaphore;
 use url::{Host, Url};
 use zeroize::Zeroizing;
 
-use crate::{Conversation, Message, SendText, Status, engine::Engine, storage};
+use crate::{
+    Conversation, FILE_LIMIT, MAX_ATTACHMENTS, Message, SendText, Status, engine::Engine, storage,
+};
 
 #[derive(Clone)]
 pub struct AccessPolicy(Option<Arc<Credentials>>);
@@ -133,7 +135,10 @@ pub fn router(engine: Engine, access: AccessPolicy) -> Router {
         .route("/v1/status", get(status))
         .route("/v1/conversations", get(conversations))
         .route("/v1/messages", get(messages).post(send))
-        .layer(DefaultBodyLimit::max(24 * 1024))
+        .route("/v1/attachments/{id}/{index}", get(attachment))
+        .layer(DefaultBodyLimit::max(
+            FILE_LIMIT.div_ceil(3) * 4 + 48 * 1024,
+        ))
         .layer(middleware::from_fn_with_state(access, authorize))
         .layer(middleware::from_fn(no_store))
         .with_state(engine)
@@ -159,6 +164,23 @@ async fn send(
     Json(request): Json<SendText>,
 ) -> Result<Json<Message>, Failure> {
     Ok(Json(engine.send(request).await?))
+}
+
+async fn attachment(
+    State(engine): State<Engine>,
+    RoutePath((id, index)): RoutePath<(uuid::Uuid, usize)>,
+) -> Result<impl IntoResponse, Failure> {
+    if index >= MAX_ATTACHMENTS {
+        return Err(anyhow::anyhow!("Invalid attachment index").into());
+    }
+    let bytes = engine.attachment(id, index).await?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        bytes,
+    ))
 }
 
 struct Failure(anyhow::Error);

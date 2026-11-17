@@ -63,9 +63,6 @@ enum Command {
     Serve {
         #[arg(long, default_value = "127.0.0.1:7848")]
         bind: SocketAddr,
-        /// Use sample conversations and local-only text messages
-        #[arg(long)]
-        demo: bool,
         /// Use the password saved by set-password
         #[arg(long)]
         require_login: bool,
@@ -73,7 +70,7 @@ enum Command {
         tls_cert: Option<PathBuf>,
         #[arg(long, requires = "tls_cert")]
         tls_key: Option<PathBuf>,
-        #[arg(long, conflicts_with = "demo")]
+        #[arg(long)]
         vault_key_file: Option<PathBuf>,
     },
 }
@@ -146,7 +143,6 @@ fn main() -> Result<()> {
         }
         Command::Serve {
             bind,
-            demo,
             require_login,
             tls_cert,
             tls_key,
@@ -163,11 +159,7 @@ fn main() -> Result<()> {
             } else {
                 AccessPolicy::loopback()
             };
-            let identity = if demo {
-                None
-            } else {
-                Some(storage::load_session(&root, vault_key_file.as_deref())?)
-            };
+            let identity = storage::load_session(&root, vault_key_file.as_deref())?;
             install_tls_provider();
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
