@@ -22,6 +22,25 @@ const ASKPASS_SOCKET: &str = "IMESSAGE_SSH_ASKPASS_SOCKET";
 const MAX_PROMPT: u64 = 8 * 1024;
 const MAX_RESPONSE: u64 = 1023;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(180);
+const HELPER: &[u8] = include_bytes!("../../tools/macos-device-helper");
+const INSTALL_HELPER: &str = r#"
+    if [ "$(/usr/bin/uname -s)" != Darwin ]; then
+        /bin/cat >/dev/null
+        printf 'not-macos'
+        exit
+    fi
+    umask 077
+    dir="$HOME/.local/bin"
+    /bin/mkdir -p "$dir" || exit 1
+    target="$dir/imessage-mac-device"
+    if [ -d "$target" ]; then exit 1; fi
+    work=$(/usr/bin/mktemp "$dir/.imessage-device.XXXXXXXX") || exit 1
+    trap '/bin/rm -f -- "$work"' EXIT
+    /bin/cat > "$work" || exit 1
+    /bin/chmod 700 "$work" || exit 1
+    /bin/mv -f "$work" "$target" || exit 1
+    printf 'installed'
+"#;
 
 pub enum SshPrompt {
     VerifyHost { host: String, fingerprint: String },
@@ -139,6 +158,19 @@ impl MacConnection {
         })
     }
 
+    pub(super) async fn install_helper(&self) -> Result<()> {
+        let script = INSTALL_HELPER.replace('\'', "'\"'\"'");
+        let command = format!("/bin/sh -c '{script}'");
+        let result = self
+            .command(&command, "Mac helper installation", HELPER, 128)
+            .await?;
+        match result.as_slice() {
+            b"installed" => Ok(()),
+            b"not-macos" => bail!("The SSH address did not connect to a Mac"),
+            _ => bail!("The Mac did not confirm installation of the iMessage helper"),
+        }
+    }
+
     pub(super) async fn run(
         &self,
         operation: &str,
@@ -146,6 +178,18 @@ impl MacConnection {
         maximum: u64,
     ) -> Result<Zeroizing<Vec<u8>>> {
         let remote = format!("~/.local/bin/imessage-mac-device {operation}");
+        self.command(&remote, operation, input, maximum)
+            .await
+            .with_context(|| format!("The Mac could not complete the {operation} step"))
+    }
+
+    async fn command(
+        &self,
+        remote: &str,
+        description: &str,
+        input: &[u8],
+        maximum: u64,
+    ) -> Result<Zeroizing<Vec<u8>>> {
         let socket = self
             .control
             .to_str()
@@ -153,16 +197,23 @@ impl MacConnection {
         provider_command::run(
             Path::new(SSH),
             &[
-                "-T", "-S", socket, "-oControlMaster=no", "-oBatchMode=yes",
-                "-oProxyCommand=/usr/bin/false", "-oForwardAgent=no", "-oForwardX11=no",
-                "--", &self.host, &remote,
+                "-T",
+                "-S",
+                socket,
+                "-oControlMaster=no",
+                "-oBatchMode=yes",
+                "-oProxyCommand=/usr/bin/false",
+                "-oForwardAgent=no",
+                "-oForwardX11=no",
+                "--",
+                &self.host,
+                remote,
             ],
-            operation,
+            description,
             input,
             maximum,
         )
         .await
-        .with_context(|| format!("Could not run {operation} on the Mac. Check that the iMessage device helper is installed"))
     }
 }
 

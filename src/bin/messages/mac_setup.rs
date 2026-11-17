@@ -191,7 +191,7 @@ impl MacSetup {
     fn form(&mut self, ui: &mut Ui) -> (&'static str, bool) {
         ui.label(
             RichText::new(
-                "Enable Remote Login on the Mac and install the iMessage device helper there.",
+                "Enable Remote Login on your Mac. iMessage installs its setup helper over SSH.",
             )
             .color(MUTED),
         );

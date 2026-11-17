@@ -8,17 +8,13 @@ Use a private directory and give only your user access to any imported plist. Se
 
 ## Optional Mac-assisted setup
 
-Right-click the **iMessage** launcher and choose **Set Up with a Mac**, or run `imessage --mac-setup`. The form has separate fields for the Mac SSH address, Mac login password, Apple Account and Apple Account password. The Mac password is optional for SSH key users. The app uses it only for SSH authentication and keeps it in memory during setup.
+On the Mac, enable **Remote Login** for your user. In the Linux app, open **Settings → This Computer → Set Up with a Mac**. You can also right-click the **iMessage** launcher or run `imessage --mac-setup`.
 
-On the Mac, enable **Remote Login** for your user. Build the device helper with the Xcode command-line tools.
+Enter the Mac SSH address, Mac login password, Apple Account and Apple Account password. Leave the Mac password blank if you use SSH keys. The app keeps the Mac password in memory during setup and copies its bundled helper to `~/.local/bin/imessage-mac-device` after SSH sign-in. On the first SSH connection, compare the fingerprint with the matching public host key in `/etc/ssh` on the Mac.
 
-```sh
-install -d -m 700 "$HOME/.local/bin" "$HOME/Library/Application Support/LinuxMessages"
-xcrun clang -fobjc-arc -framework Foundation tools/macos-device-helper.m \
-  -o "$HOME/.local/bin/imessage-mac-device"
-```
+The helper can use the system push signers from Apple's OS X El Capitan 10.11.6 Combo Update and macOS Big Sur 11.7.10. On El Capitan, it also uses the Combo Update's validation routines. The helper checks the exact system binaries before calling those routines. On Big Sur and later, it uses the validation interface in AppleAccount.framework. If the native push signer is unavailable and there is no cached push identity, setup needs your authorised Apple-issued activation chain (`activation-chain.pem`) and matching owner-only RSA private key (`activation-key.pem`) in `~/Library/Application Support/LinuxMessages`. Apple validates the signed activation before issuing a push certificate.
 
-Place your authorised Apple-issued FairPlay activation chain (`activation-chain.pem`) and matching owner-only RSA private key (`activation-key.pem`) in `~/Library/Application Support/LinuxMessages` on the Mac. Apple validates those credentials before it issues a push certificate. The helper uses the Mac's validation framework for device proofs. On first SSH connection, compare the fingerprint with the appropriate public host key in `/etc/ssh` on the Mac.
+To rebuild the bundled universal helper from source on Linux, run `bash tools/build-macos-device-helper.sh /path/to/MacOSX10.11.sdk /path/to/MacOSX11.3.sdk` with Clang, ld64.lld and llvm-lipo installed.
 
 ## Import a registered session
 

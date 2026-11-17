@@ -66,9 +66,11 @@ impl AutomaticSetup {
         validate_login(account, &password)?;
         let use_local_adi = matches!(self.connection, DeviceConnection::OnDeviceHelper(_));
         let provider = match self.connection {
-            DeviceConnection::MacOverSsh(host) => DeviceProvider::MacOverSsh(std::sync::Arc::new(
-                MacConnection::open(root, &host, prompts).await?,
-            )),
+            DeviceConnection::MacOverSsh(host) => {
+                let mac = MacConnection::open(root, &host, prompts).await?;
+                mac.install_helper().await?;
+                DeviceProvider::MacOverSsh(std::sync::Arc::new(mac))
+            }
             connection => DeviceProvider::new(connection)?,
         };
         if let DeviceProvider::OnDevice(local) = &provider {
@@ -87,6 +89,20 @@ impl AutomaticSetup {
             let config: OpenCoreConfig = plist::from_reader(file)
                 .context("Could not read PlatformInfo → Generic from the OpenCore config")?;
             config.platform_info.generic.check(&computer)?;
+        }
+        if let DeviceProvider::MacOverSsh(connection) = &provider {
+            let status = connection.run("validation-status", &[], 128).await?;
+            match status.as_slice() {
+                b"ready" => (),
+                b"unsupported-el-capitan" => anyhow::bail!(
+                    "This El Capitan build uses a different validation binary from the supported OS X 10.11.6 Combo Update"
+                ),
+                b"no-native-validation" => anyhow::bail!(
+                    "macOS {} did not provide the native iMessage validation interface",
+                    computer.os_version
+                ),
+                _ => anyhow::bail!("The Mac returned an unknown device validation status"),
+            }
         }
         let profile = computer.profile();
         let _activation_lock = lock_profile(root, &profile)?;
@@ -220,6 +236,19 @@ impl DeviceProvider {
                 certificate_chain: STANDARD.encode(&signing.chain),
                 signature: STANDARD.encode(signer.sign_oneshot_to_vec(payload)?),
             });
+        }
+        if let Self::MacOverSsh(connection) = self {
+            let status = connection.run("activation-status", &[], 128).await?;
+            match status.as_slice() {
+                b"ready" => (),
+                b"missing-signing-key" => anyhow::bail!(
+                    "The Mac needs an Apple-issued activation signing key in ~/Library/Application Support/LinuxMessages/activation-key.pem, readable only by your Mac user"
+                ),
+                b"missing-certificate-chain" => anyhow::bail!(
+                    "The Mac needs the matching Apple activation certificate chain in ~/Library/Application Support/LinuxMessages/activation-chain.pem"
+                ),
+                _ => anyhow::bail!("The Mac returned an unknown activation status"),
+            }
         }
         let bytes = self
             .call("activation-sign", payload, MAX_HELPER_OUTPUT)

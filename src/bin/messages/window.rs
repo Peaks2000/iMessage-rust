@@ -29,8 +29,7 @@ use super::chrome::{
 
 const POLL: Duration = Duration::from_secs(4);
 const MOTION: f32 = 0.30;
-const LOCAL_UNREGISTERED: &str =
-    "First-time iMessage activation is unavailable on Linux in this build.";
+const LOCAL_UNREGISTERED: &str = "Open Settings → This Computer to set up iMessage with your Mac.";
 const DEMO_PINS: &[&str] = &[
     "mailto:maya@example.com",
     "mailto:elliot@example.com",
@@ -1150,14 +1149,16 @@ impl MessagesApp {
             MacOutcome::Open => {}
             MacOutcome::Closed => {
                 self.mac_setup = None;
-                self.candidate = Some(Connection::start(
-                    ctx,
-                    self.root.clone(),
-                    self.config.clone(),
-                    None,
-                    Zeroizing::default(),
-                    None,
-                ));
+                if self.settings.is_none() {
+                    self.candidate = Some(Connection::start(
+                        ctx,
+                        self.root.clone(),
+                        self.config.clone(),
+                        None,
+                        Zeroizing::default(),
+                        None,
+                    ));
+                }
             }
             MacOutcome::Saved => {
                 self.mac_setup = None;
@@ -1196,6 +1197,7 @@ impl MessagesApp {
         };
         let mut apply = false;
         let mut import = false;
+        let mut setup_mac = false;
         let mut cancel = false;
         let connecting = self.candidate.is_some();
         let panel = egui::Modal::new(egui::Id::new("settings"))
@@ -1224,7 +1226,7 @@ impl MessagesApp {
                         }
                         Mode::Local => {
                             let label = if self.local_unregistered {
-                                LOCAL_UNREGISTERED
+                                "Use your Mac to register iMessage on this computer."
                             } else if self.config.mode == Mode::Local {
                                 self.status.as_ref().map_or(
                                     "Connect directly to Apple using a registered session.",
@@ -1235,12 +1237,20 @@ impl MessagesApp {
                             };
                             ui.label(RichText::new(label).color(MUTED));
                             ui.add_space(3.);
-                            import = ui
-                                .add_enabled(
-                                    !self.sending,
-                                    egui::Button::new("Import Registered Session…"),
-                                )
-                                .clicked();
+                            ui.horizontal_wrapped(|ui| {
+                                setup_mac = ui
+                                    .add_enabled(
+                                        !self.sending,
+                                        egui::Button::new("Set Up with a Mac…"),
+                                    )
+                                    .clicked();
+                                import = ui
+                                    .add_enabled(
+                                        !self.sending,
+                                        egui::Button::new("Import Registered Session…"),
+                                    )
+                                    .clicked();
+                            });
                         }
                         Mode::Remote => {
                             settings_field(
@@ -1301,7 +1311,10 @@ impl MessagesApp {
                         .clicked();
                 });
             });
-        if import {
+        if setup_mac {
+            form.error = None;
+            self.mac_setup = Some(MacSetup::new());
+        } else if import {
             form.error = None;
             self.session_import = Some(SessionImport::default());
         } else if (cancel || panel.should_close()) && !connecting {
