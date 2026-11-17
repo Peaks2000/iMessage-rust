@@ -169,7 +169,10 @@ impl LocalAdi {
     }
 
     async fn provision(&self) -> Result<State> {
-        let urls = self.request(self.client.get(LOOKUP)).await?;
+        let urls = self
+            .request(self.client.get(LOOKUP))
+            .await
+            .context("Could not look up Apple's Anisette provisioning endpoints")?;
         let urls = urls
             .get("urls")
             .and_then(Value::as_dictionary)
@@ -178,8 +181,12 @@ impl LocalAdi {
         let end = endpoint(urls, "midFinishProvisioning")?;
         let started = self
             .request(self.client.post(start).body(body(Dictionary::new())?))
-            .await?;
-        let challenge = binary(response(&started)?, "spim")?;
+            .await
+            .context("Could not start local Anisette provisioning")?;
+        let challenge = binary(
+            response(&started).context("Could not start local Anisette provisioning")?,
+            "spim",
+        )?;
         let mut hardware = Zeroizing::new([0; 20]);
         rand_bytes(hardware.as_mut())?;
         let mut handle = ptr::null_mut();
@@ -211,8 +218,12 @@ impl LocalAdi {
             "cpim",
             STANDARD.encode(&request[..written]),
         )]))?;
-        let finished = self.request(self.client.post(end).body(request)).await?;
-        let finished = response(&finished)?;
+        let finished = self
+            .request(self.client.post(end).body(request))
+            .await
+            .context("Could not finish local Anisette provisioning")?;
+        let finished =
+            response(&finished).context("Could not finish local Anisette provisioning")?;
         let ptm = binary(finished, "ptm")?;
         let trust = binary(finished, "tk")?;
         let routing = string(finished, "X-Apple-I-MD-RINFO")?;
@@ -272,7 +283,8 @@ impl LocalAdi {
         let payload = read_response(reply).await?;
         if !status.is_success() {
             if let Ok(reply) = plist::from_bytes::<Dictionary>(&payload) {
-                let _ = response(&reply)?;
+                let _ = response(&reply)
+                    .with_context(|| format!("Apple returned HTTP {}", status.as_u16()))?;
             }
             anyhow::bail!(
                 "Apple rejected local Anisette provisioning (HTTP {})",
