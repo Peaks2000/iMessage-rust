@@ -8,7 +8,10 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
 use openssl::sha::sha256;
 use plist::{Dictionary, Value};
-use reqwest::{Client, Method, Response, StatusCode, header::HeaderValue};
+use reqwest::{
+    Client, Method, RequestBuilder, Response, StatusCode,
+    header::{HeaderMap, HeaderValue},
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -31,10 +34,19 @@ pub struct TrustedPhone {
     pub last_two_digits: String,
 }
 
+pub enum TrustedDeviceResponse {
+    Code(Zeroizing<String>),
+    UseSms,
+}
+
 pub trait SmsPrompts {
     /// Return the zero-based index of the trusted phone to use.
     fn choose_phone(&mut self, phones: &[TrustedPhone]) -> impl Future<Output = Result<usize>>;
     fn read_code(&mut self) -> impl Future<Output = Result<Zeroizing<String>>>;
+
+    fn read_trusted_device_code(&mut self) -> impl Future<Output = Result<TrustedDeviceResponse>> {
+        async { self.read_code().await.map(TrustedDeviceResponse::Code) }
+    }
     fn prefers_ssh_password(&self) -> bool {
         false
     }
@@ -120,11 +132,41 @@ pub(super) struct LoginSession {
 }
 
 enum PasswordStep {
-    Sms(Challenge),
+    Challenge(Challenge),
     Verified(LoginSession),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChallengeKind {
+    Sms,
+    TrustedDevice { code_already_sent: bool },
+}
+
+impl ChallengeKind {
+    fn from_status(status: &Dictionary) -> Result<Option<Self>> {
+        match status
+            .get("au")
+            .and_then(Value::as_string)
+            .filter(|value| !value.is_empty())
+        {
+            Some("secondaryAuth") => Ok(Some(Self::Sms)),
+            Some("trustedDeviceSecondaryAuth") => Ok(Some(Self::TrustedDevice {
+                code_already_sent: false,
+            })),
+            Some(_) => anyhow::bail!("Apple requires an unsupported account verification method"),
+            None if status.get("hsc").and_then(Value::as_signed_integer) == Some(409) => {
+                // Apple can deliver a trusted-device code during SRP completion.
+                Ok(Some(Self::TrustedDevice {
+                    code_already_sent: true,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
 struct Challenge {
+    kind: ChallengeKind,
     adsid: String,
     identity_token: Zeroizing<String>,
 }
@@ -252,23 +294,86 @@ impl GrandSlam<'_> {
     ) -> Result<LoginSession> {
         let challenge = match self.password_step(anisette, account, password).await? {
             PasswordStep::Verified(session) => return Ok(session),
-            PasswordStep::Sms(challenge) => challenge,
+            PasswordStep::Challenge(challenge) => challenge,
         };
-        if let Some(session) = self.complete_sms(anisette, &challenge, prompts).await? {
+        if let Some(session) = self
+            .complete_challenge(anisette, &challenge, prompts)
+            .await?
+        {
             return Ok(session);
         }
         match self.password_step(anisette, account, password).await? {
             PasswordStep::Verified(session) => {
                 ensure!(
                     session.adsid == challenge.adsid,
-                    "Apple changed the account after SMS verification"
+                    "Apple changed the account after verification"
                 );
                 Ok(session)
             }
-            PasswordStep::Sms(_) => {
-                anyhow::bail!("Apple still requires verification after accepting the SMS code")
+            PasswordStep::Challenge(_) => {
+                anyhow::bail!("Apple still requires verification after accepting the code")
             }
         }
+    }
+
+    async fn complete_challenge(
+        &self,
+        anisette: &mut Anisette,
+        challenge: &Challenge,
+        prompts: &mut impl SmsPrompts,
+    ) -> Result<Option<LoginSession>> {
+        if let ChallengeKind::TrustedDevice { code_already_sent } = challenge.kind {
+            if !code_already_sent {
+                let response = self
+                    .verification_request(
+                        anisette.headers().await?.gsa_headers(),
+                        challenge,
+                        Method::GET,
+                        "/auth/verify/trusteddevice",
+                    )?
+                    .header("accept", "text/x-xml-plist")
+                    .header("content-type", "text/x-xml-plist")
+                    .send()
+                    .await
+                    .context("Could not reach Apple's trusted-device verification service")?;
+                ensure!(
+                    response.status().is_success(),
+                    "Apple declined to send a trusted-device code (HTTP {})",
+                    response.status().as_u16()
+                );
+            }
+            if let TrustedDeviceResponse::Code(code) = prompts.read_trusted_device_code().await? {
+                return self
+                    .verify_trusted_device(&anisette.headers().await?, challenge, code.trim())
+                    .await;
+            }
+        }
+        self.complete_sms(anisette, challenge, prompts).await
+    }
+
+    async fn verify_trusted_device(
+        &self,
+        device: &DeviceHeaders,
+        challenge: &Challenge,
+        code: &str,
+    ) -> Result<Option<LoginSession>> {
+        validate_code(code)?;
+        let mut code = HeaderValue::from_str(code)?;
+        code.set_sensitive(true);
+        let response = self
+            .verification_request(
+                device.gsa_headers(),
+                challenge,
+                Method::GET,
+                "/grandslam/GsService2/validate",
+            )?
+            .header("accept", "text/x-xml-plist")
+            .header("content-type", "text/x-xml-plist")
+            .header("security-code", code)
+            .send()
+            .await
+            .context("Could not reach Apple's trusted-device verification service")?;
+        finish_verification(response, challenge, "trusted-device").await
     }
 
     async fn complete_sms(
@@ -390,26 +495,16 @@ impl GrandSlam<'_> {
             .get("Status")
             .and_then(Value::as_dictionary)
             .context("Apple omitted the sign-in status")?;
-        let authentication = status
-            .get("au")
-            .and_then(Value::as_string)
-            .filter(|value| !value.is_empty())
-            .or_else(|| {
-                (status.get("hsc").and_then(Value::as_signed_integer) == Some(409))
-                    .then_some("trustedDeviceSecondaryAuth")
-            });
-        match authentication {
-            Some("secondaryAuth" | "trustedDeviceSecondaryAuth") => {
+        match ChallengeKind::from_status(status)? {
+            Some(kind) => {
                 let token = required_text(&session, "GsIdmsToken")
                     .or_else(|_| required_text(&session, "GsIdMS"))?;
                 let raw = Zeroizing::new(format!("{adsid}:{token}"));
-                Ok(PasswordStep::Sms(Challenge {
+                Ok(PasswordStep::Challenge(Challenge {
+                    kind,
                     adsid,
                     identity_token: Zeroizing::new(STANDARD.encode(raw.as_bytes())),
                 }))
-            }
-            Some(_) => {
-                anyhow::bail!("Apple requires an account verification method other than SMS")
             }
             None => {
                 let pet = session
@@ -545,10 +640,7 @@ impl GrandSlam<'_> {
         number_id: u32,
         code: &str,
     ) -> Result<Option<LoginSession>> {
-        ensure!(
-            code.len() == 6 && code.bytes().all(|byte| byte.is_ascii_digit()),
-            "Enter the six-digit Apple SMS code"
-        );
+        validate_code(code)?;
         let request = VerifyRequest {
             phone_number: PhoneId { id: number_id },
             mode: "sms",
@@ -563,33 +655,7 @@ impl GrandSlam<'_> {
                 Some(&request),
             )
             .await?;
-        ensure!(
-            response.status() == StatusCode::OK,
-            "Apple declined SMS verification (HTTP {})",
-            response.status().as_u16()
-        );
-        let encoded = response
-            .headers()
-            .get("x-apple-pe-token")
-            .map(|header| STANDARD.decode(header.as_bytes()).map(Zeroizing::new))
-            .transpose()
-            .context("Apple returned an invalid authorization token")?;
-        let bytes = read_response(response).await?;
-        check_verification_body(&bytes)?;
-        let Some(decoded) = encoded else {
-            return Ok(None);
-        };
-        let pieces = std::str::from_utf8(&decoded)?
-            .split(':')
-            .collect::<Vec<_>>();
-        let token = pieces
-            .get(1)
-            .filter(|token| !token.is_empty())
-            .context("Apple returned an empty authorization token")?;
-        Ok(Some(LoginSession {
-            adsid: challenge.adsid.clone(),
-            pet: Zeroizing::new((*token).to_owned()),
-        }))
+        finish_verification(response, challenge, "SMS").await
     }
 
     async fn auth_request(
@@ -600,15 +666,9 @@ impl GrandSlam<'_> {
         path: &str,
         body: Option<&VerifyRequest<'_>>,
     ) -> Result<Response> {
-        let mut identity = HeaderValue::from_str(&challenge.identity_token)?;
-        identity.set_sensitive(true);
         let mut request = self
-            .client
-            .request(method, format!("{}{path}", self.origin))
-            .headers(device.sms_headers())
-            .header("connection", "close")
-            .header("accept", "application/json")
-            .header("x-apple-identity-token", identity);
+            .verification_request(device.sms_headers(), challenge, method, path)?
+            .header("accept", "application/json");
         if let Some(body) = body {
             request = request.json(body);
         }
@@ -617,9 +677,66 @@ impl GrandSlam<'_> {
             .await
             .context("Could not reach Apple's SMS verification service")
     }
+
+    fn verification_request(
+        &self,
+        headers: HeaderMap,
+        challenge: &Challenge,
+        method: Method,
+        path: &str,
+    ) -> Result<RequestBuilder> {
+        let mut identity = HeaderValue::from_str(&challenge.identity_token)?;
+        identity.set_sensitive(true);
+        Ok(self
+            .client
+            .request(method, format!("{}{path}", self.origin))
+            .headers(headers)
+            .header("connection", "close")
+            .header("x-apple-identity-token", identity))
+    }
 }
 
-fn check_verification_body(bytes: &[u8]) -> Result<()> {
+fn validate_code(code: &str) -> Result<()> {
+    ensure!(
+        code.len() == 6 && code.bytes().all(|byte| byte.is_ascii_digit()),
+        "Enter the six-digit Apple verification code"
+    );
+    Ok(())
+}
+
+async fn finish_verification(
+    response: Response,
+    challenge: &Challenge,
+    method: &str,
+) -> Result<Option<LoginSession>> {
+    ensure!(
+        response.status().is_success(),
+        "Apple declined {method} verification (HTTP {})",
+        response.status().as_u16()
+    );
+    let encoded = response
+        .headers()
+        .get("x-apple-pe-token")
+        .map(|header| STANDARD.decode(header.as_bytes()).map(Zeroizing::new))
+        .transpose()
+        .context("Apple returned an invalid authorization token")?;
+    let bytes = read_response(response).await?;
+    check_verification_body(&bytes, method)?;
+    let Some(decoded) = encoded else {
+        return Ok(None);
+    };
+    let token = std::str::from_utf8(&decoded)?
+        .split(':')
+        .nth(1)
+        .filter(|token| !token.is_empty())
+        .context("Apple returned an empty authorization token")?;
+    Ok(Some(LoginSession {
+        adsid: challenge.adsid.clone(),
+        pet: Zeroizing::new(token.to_owned()),
+    }))
+}
+
+fn check_verification_body(bytes: &[u8], method: &str) -> Result<()> {
     if let Ok(plist) = plist::from_bytes::<Dictionary>(bytes) {
         let status = plist
             .get("Status")
@@ -631,7 +748,7 @@ fn check_verification_body(bytes: &[u8]) -> Result<()> {
             .unwrap_or(0);
         ensure!(
             code == 0,
-            "Apple declined the SMS code (Apple status {code})"
+            "Apple declined the {method} code (Apple status {code})"
         );
     } else if let Ok(json) = serde_json::from_slice::<serde_json::Value>(bytes) {
         ensure!(
@@ -639,7 +756,12 @@ fn check_verification_body(bytes: &[u8]) -> Result<()> {
                 .get("serviceErrors")
                 .and_then(serde_json::Value::as_array)
                 .is_some_and(|errors| !errors.is_empty()),
-            "Apple declined the SMS code"
+            "Apple declined the {method} code"
+        );
+    } else {
+        ensure!(
+            bytes.iter().all(u8::is_ascii_whitespace),
+            "Apple returned an unreadable {method} verification response"
         );
     }
     Ok(())
@@ -761,6 +883,7 @@ mod tests {
                 mac_provisioned: false,
             };
             let challenge = Challenge {
+                kind: ChallengeKind::Sms,
                 adsid: "123".into(),
                 identity_token: Zeroizing::new("fixture-identity".into()),
             };
@@ -793,6 +916,115 @@ mod tests {
                 .err()
                 .context("The fixture rejects invalid SMS codes")?;
             assert!(error.to_string().contains("-21669"));
+            server.abort();
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn trusted_device_challenges_use_the_device_route_with_an_explicit_sms_fallback()
+    -> Result<()> {
+        struct DevicePrompts(bool);
+        impl SmsPrompts for DevicePrompts {
+            async fn choose_phone(&mut self, _: &[TrustedPhone]) -> Result<usize> {
+                panic!("The fixture has a single phone")
+            }
+
+            async fn read_code(&mut self) -> Result<Zeroizing<String>> {
+                assert!(self.0, "An SMS prompt requires the user's choice");
+                Ok(Zeroizing::new("000234".to_owned()))
+            }
+
+            async fn read_trusted_device_code(&mut self) -> Result<TrustedDeviceResponse> {
+                if self.0 {
+                    Ok(TrustedDeviceResponse::UseSms)
+                } else {
+                    Ok(TrustedDeviceResponse::Code(Zeroizing::new(
+                        "000123".to_owned(),
+                    )))
+                }
+            }
+        }
+
+        for (status, use_sms, expected) in [
+            (
+                Dictionary::from_iter([("au", Value::String("trustedDeviceSecondaryAuth".into()))]),
+                false,
+                vec!["push", "validate"],
+            ),
+            (
+                Dictionary::from_iter([("hsc", Value::Integer(409.into()))]),
+                false,
+                vec!["validate"],
+            ),
+            (
+                Dictionary::from_iter([("hsc", Value::Integer(409.into()))]),
+                true,
+                vec!["phones", "send-sms", "verify-sms"],
+            ),
+        ] {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let app = Router::new().fallback(
+                |State(requests): State<Arc<Mutex<Vec<&'static str>>>>, method: Method, uri: axum::http::Uri, headers: HeaderMap, body: Bytes| async move {
+                    assert_headers(&headers);
+                    let mut requests = requests.lock().unwrap();
+                    match (method.as_str(), uri.path()) {
+                        ("GET", "/auth/verify/trusteddevice") => {
+                            assert_eq!(headers["accept"], "text/x-xml-plist");
+                            assert!(!headers.contains_key("security-code"));
+                            requests.push("push");
+                            StatusCode::OK.into_response()
+                        }
+                        ("GET", "/grandslam/GsService2/validate") => {
+                            assert_eq!(headers["accept"], "text/x-xml-plist");
+                            assert_eq!(headers["security-code"], "000123");
+                            requests.push("validate");
+                            (StatusCode::OK, [("x-apple-pe-token", STANDARD.encode("com.apple.gs.idms.pet:trusted-pet"))], "<plist version=\"1.0\"><dict><key>ec</key><integer>0</integer></dict></plist>").into_response()
+                        }
+                        ("GET", "/auth") => {
+                            requests.push("phones");
+                            Json(json!({"trustedPhoneNumbers": [{"id": 72, "lastTwoDigits": "21"}]})).into_response()
+                        }
+                        ("PUT", "/auth/verify/phone") => {
+                            assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(), json!({"phoneNumber":{"id":72},"mode":"sms"}));
+                            requests.push("send-sms");
+                            StatusCode::OK.into_response()
+                        }
+                        ("POST", "/auth/verify/phone/securitycode") => {
+                            assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["securityCode"]["code"], "000234");
+                            requests.push("verify-sms");
+                            StatusCode::OK.into_response()
+                        }
+                        _ => panic!("Unexpected verification request"),
+                    }
+                }
+            ).with_state(requests.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let origin = format!("http://{}", listener.local_addr()?);
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let client = Client::builder().no_proxy().build()?;
+            let gsa = GrandSlam {
+                client: &client,
+                origin: &origin,
+                push_token: [0; 32],
+                mac_provisioned: true,
+            };
+            let challenge = Challenge {
+                kind: ChallengeKind::from_status(&status)?
+                    .context("Expected a verification challenge")?,
+                adsid: "123".into(),
+                identity_token: Zeroizing::new("fixture-identity".into()),
+            };
+            let folder = tempfile::tempdir()?;
+            let mut anisette = fixture_anisette(folder.path())?;
+            let session = gsa
+                .complete_challenge(&mut anisette, &challenge, &mut DevicePrompts(use_sms))
+                .await?;
+            assert_eq!(
+                session.as_ref().map(|session| session.pet.as_str()),
+                (!use_sms).then_some("trusted-pet")
+            );
+            assert_eq!(*requests.lock().unwrap(), expected);
             server.abort();
         }
         Ok(())

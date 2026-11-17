@@ -6,7 +6,10 @@ use std::{
 use anyhow::{Context, Result};
 use eframe::egui::{self, Align, Color32, Layout, Margin, RichText, TextEdit, Ui, vec2};
 use linux_imessage::{
-    apple::{AutomaticSetup, DeviceConnection, SmsPrompts, SshPrompt, TrustedPhone},
+    apple::{
+        AutomaticSetup, DeviceConnection, SmsPrompts, SshPrompt, TrustedDeviceResponse,
+        TrustedPhone,
+    },
     storage,
 };
 use tokio::sync::oneshot;
@@ -42,10 +45,15 @@ enum Step {
         selected: usize,
         answer: oneshot::Sender<usize>,
     },
-    Code(oneshot::Sender<Zeroizing<String>>),
+    Code(CodePrompt),
     Ssh(SshPrompt, oneshot::Sender<Zeroizing<String>>),
     Saving,
     RetrySave(oneshot::Sender<()>),
+}
+
+enum CodePrompt {
+    Sms(oneshot::Sender<Zeroizing<String>>),
+    TrustedDevice(oneshot::Sender<TrustedDeviceResponse>),
 }
 
 struct Worker {
@@ -56,7 +64,7 @@ struct Worker {
 
 enum Event {
     Phone(Vec<String>, oneshot::Sender<usize>),
-    Code(oneshot::Sender<Zeroizing<String>>),
+    Code(CodePrompt),
     Ssh(SshPrompt, oneshot::Sender<Zeroizing<String>>),
     Save(oneshot::Sender<()>),
     StorageError(anyhow::Error, oneshot::Sender<()>),
@@ -95,6 +103,7 @@ impl MacSetup {
         let can_cancel = !matches!(self.step, Step::Saving);
         let mut cancel = false;
         let mut submit = false;
+        let mut use_sms = false;
         let panel = egui::Modal::new(egui::Id::new("mac-apple-setup"))
             .frame(chrome::sheet())
             .show(context, |ui| {
@@ -118,8 +127,11 @@ impl MacSetup {
                         });
                         ("Send Code", true)
                     }
-                    Step::Code(_) => {
-                        ui.label("Enter the six-digit verification code Apple sent by SMS.");
+                    Step::Code(prompt) => {
+                        ui.label(match prompt {
+                            CodePrompt::Sms(_) => "Enter the six-digit verification code Apple sent by SMS.",
+                            CodePrompt::TrustedDevice(_) => "Tap Allow on your trusted Apple device, then enter the six-digit code it shows.",
+                        });
                         let response = edit(ui, "Verification code", &mut self.code, "6 digits", true);
                         if self.focus_code {
                             response.request_focus();
@@ -176,14 +188,17 @@ impl MacSetup {
                     }
                     cancel = ui.add_enabled(can_cancel, egui::Button::new("Cancel")
                         .min_size(vec2(65., 25.))).clicked();
+                    if matches!(self.step, Step::Code(CodePrompt::TrustedDevice(_))) {
+                        use_sms = ui.button("Use SMS").clicked();
+                    }
                 });
             });
 
         if can_cancel && (cancel || panel.should_close()) {
             return Outcome::Closed;
         }
-        if submit {
-            self.submit(context, root);
+        if submit || use_sms {
+            self.submit(context, root, use_sms);
         }
         Outcome::Open
     }
@@ -226,7 +241,7 @@ impl MacSetup {
         ("Connect", ready)
     }
 
-    fn submit(&mut self, context: &egui::Context, root: &Path) {
+    fn submit(&mut self, context: &egui::Context, root: &Path, use_sms: bool) {
         self.error = None;
         match std::mem::replace(&mut self.step, Step::Working("Contacting Apple…")) {
             Step::Form => {
@@ -249,9 +264,20 @@ impl MacSetup {
                 self.step = Step::Working("Requesting a verification code…");
                 let _ = answer.send(selected);
             }
-            Step::Code(answer) => {
+            Step::Code(CodePrompt::Sms(answer)) => {
                 self.step = Step::Working("Verifying the code and registering the device…");
                 let _ = answer.send(std::mem::take(&mut self.code));
+            }
+            Step::Code(CodePrompt::TrustedDevice(answer)) => {
+                let code = std::mem::take(&mut self.code);
+                let response = if use_sms {
+                    self.step = Step::Working("Requesting an SMS code…");
+                    TrustedDeviceResponse::UseSms
+                } else {
+                    self.step = Step::Working("Verifying the code and registering the device…");
+                    TrustedDeviceResponse::Code(code)
+                };
+                let _ = answer.send(response);
             }
             Step::Ssh(prompt, answer) => {
                 let value = match prompt {
@@ -420,7 +446,13 @@ impl SmsPrompts for GuiPrompts {
 
     async fn read_code(&mut self) -> Result<Zeroizing<String>> {
         let (answer, code) = oneshot::channel();
-        self.emit(Event::Code(answer))?;
+        self.emit(Event::Code(CodePrompt::Sms(answer)))?;
+        code.await.context("Apple account setup canceled")
+    }
+
+    async fn read_trusted_device_code(&mut self) -> Result<TrustedDeviceResponse> {
+        let (answer, code) = oneshot::channel();
+        self.emit(Event::Code(CodePrompt::TrustedDevice(answer)))?;
         code.await.context("Apple account setup canceled")
     }
 

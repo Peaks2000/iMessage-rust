@@ -12,7 +12,9 @@ On the Mac, enable **Remote Login** for your user. In the Linux app, open **Sett
 
 Enter the Mac SSH address, Mac login password, Apple Account and Apple Account password. Leave the Mac password blank if you use SSH keys. The app keeps the Mac password in memory during setup and copies its bundled helper to `~/.local/bin/imessage-mac-device` after SSH sign-in. On the first SSH connection, compare the fingerprint with the matching public host key in `/etc/ssh` on the Mac.
 
-The Linux app generates Anisette with its installed local ADI library and stores the provisioning state in Linux Secret Service. It also sends the activation, validation, Apple Account and SMS requests directly to Apple. The Mac supplies hardware information, signs push activation when a new push identity is needed, and computes device validation proofs during setup.
+The Linux app generates Anisette with its installed local ADI library and stores the provisioning state in Linux Secret Service. It also sends the activation, validation, Apple Account and verification requests directly to Apple. The Mac supplies hardware information, signs push activation when a new push identity is needed, and computes device validation proofs during setup.
+
+If Apple sends a sign-in alert to your iPhone or another trusted device, tap **Allow** and enter the six-digit code in iMessage. Choose **Use SMS** if you prefer a text message to a trusted phone number.
 
 For a source build, install the local Anisette library with `bash tools/build-local-adi.sh "$HOME/.local/lib/linux-imessage"`. The script uses Git, CMake, a C++20 compiler and the mbed TLS development libraries.
 
@@ -43,7 +45,7 @@ The plist is a dictionary with the following keys.
 
 The CLI validates the file shape, token size, key types, and certificate/key matches. Apple checks the credentials when the engine connects and looks up a recipient.
 
-## Sign in to an Apple Account with SMS
+## Sign in to an Apple Account with two-factor verification
 
 ```sh
 chmod 600 apple-device.plist
@@ -53,7 +55,7 @@ chmod 600 apple-device.plist
 
 Use the device fields from [legacy IDS registration](#request-a-legacy-ids-registration). Leave out `user-id`, `auth-certificate`, and `auth-private-key` because the command obtains them after Apple sign-in. Include the original APNs token and certificate/key pair, device metadata, and fresh `validation-data` from your validation device.
 
-Enter your Apple Account and password in the terminal. If Apple requests a verification code, select one of the account's trusted phone numbers when given a choice. Enter the six digits from Apple's text. If Apple has already sent a code, the command uses the existing challenge. When Apple accepts the sign-in and registration, the command saves the device session through Secret Service or the supplied `--vault-key-file`. The password, SMS code, and intermediate Apple login tokens are held in memory for the sign-in. [Apple's guide to receiving verification codes](https://support.apple.com/102606)
+Enter your Apple Account and password in the terminal. Enter the code from your trusted device if prompted, or type `sms` at that prompt to request a text message. If Apple asks for SMS verification, select a trusted phone number when given a choice. When Apple accepts the sign-in and registration, the command saves the device session through Secret Service or the supplied `--vault-key-file`. The password, verification code, and intermediate Apple login tokens are held in memory for the sign-in. [Apple's guide to receiving verification codes](https://support.apple.com/102606)
 
 ### Anisette helper contract
 

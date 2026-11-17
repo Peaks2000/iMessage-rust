@@ -12,7 +12,7 @@ mod provider_command;
 mod provisioning;
 mod registration;
 mod ssh_setup;
-pub use gsa::{SmsPrompts, TrustedPhone, login_device_sms};
+pub use gsa::{SmsPrompts, TrustedDeviceResponse, TrustedPhone, login_device_sms};
 pub use provisioning::{AutomaticSetup, DeviceConnection, default_device_helper};
 pub use registration::register_device;
 pub use ssh_setup::{SshPrompt, run_ssh_askpass};

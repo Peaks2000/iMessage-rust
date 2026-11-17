@@ -9,7 +9,7 @@ use axum_server::{Handle, tls_rustls::RustlsConfig};
 use clap::{Parser, Subcommand};
 use linux_imessage::{
     api::{self, AccessPolicy},
-    apple::{SmsPrompts, TrustedPhone, login_device_sms},
+    apple::{SmsPrompts, TrustedDeviceResponse, TrustedPhone, login_device_sms},
     engine::Engine,
     install_tls_provider, storage,
 };
@@ -43,7 +43,7 @@ enum Command {
         #[arg(long)]
         vault_key_file: Option<PathBuf>,
     },
-    /// Sign in to Apple with SMS verification and register the supplied device
+    /// Sign in to Apple with two-factor verification and register the supplied device
     Login {
         #[arg(value_name = "PRIVATE_DEVICE_PLIST")]
         device: PathBuf,
@@ -197,17 +197,34 @@ impl SmsPrompts for TerminalSms {
     }
 
     async fn read_code(&mut self) -> Result<Zeroizing<String>> {
-        loop {
-            let code = Zeroizing::new(rpassword::prompt_password(
-                "Apple SMS code (press Enter to cancel): ",
-            )?);
-            let trimmed = code.trim();
-            ensure!(!trimmed.is_empty(), "Apple sign-in canceled");
-            if trimmed.len() == 6 && trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
-                return Ok(code);
-            }
-            println!("Enter the six digits from Apple's text message");
+        enter_code("Apple SMS code (press Enter to cancel): ", false)
+    }
+
+    async fn read_trusted_device_code(&mut self) -> Result<TrustedDeviceResponse> {
+        println!("Tap Allow on your trusted Apple device to see the verification code.");
+        let code = enter_code(
+            "Trusted-device code (type sms to use text verification): ",
+            true,
+        )?;
+        if code.trim().eq_ignore_ascii_case("sms") {
+            Ok(TrustedDeviceResponse::UseSms)
+        } else {
+            Ok(TrustedDeviceResponse::Code(code))
         }
+    }
+}
+
+fn enter_code(prompt: &str, allow_sms: bool) -> Result<Zeroizing<String>> {
+    loop {
+        let code = Zeroizing::new(rpassword::prompt_password(prompt)?);
+        let trimmed = code.trim();
+        ensure!(!trimmed.is_empty(), "Apple sign-in canceled");
+        if (allow_sms && trimmed.eq_ignore_ascii_case("sms"))
+            || (trimmed.len() == 6 && trimmed.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            return Ok(code);
+        }
+        println!("Enter the six-digit verification code");
     }
 }
 
