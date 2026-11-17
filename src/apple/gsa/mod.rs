@@ -16,7 +16,7 @@ use super::{
     http::{apple_client, plist_xml, read_response},
     registration::{DeviceRegistration, register},
 };
-use anisette::Anisette;
+pub(super) use anisette::Anisette;
 pub(super) use anisette::DeviceHeaders;
 use srp::Exchange;
 
@@ -41,9 +41,14 @@ pub async fn login_device_sms(
     password: Zeroizing<String>,
     prompts: &mut impl SmsPrompts,
 ) -> Result<Zeroizing<Vec<u8>>> {
-    let device: DeviceRegistration =
+    let mut device: DeviceRegistration =
         plist::from_bytes(device_plist).context("Could not decode Apple device plist")?;
     device.validate()?;
+    let mut anisette = Anisette::new(anisette_helper)?;
+    login(&mut device, &mut anisette, None, account, password, prompts).await
+}
+
+pub(super) fn validate_login(account: &str, password: &str) -> Result<()> {
     let account = account.trim();
     ensure!(
         !account.is_empty()
@@ -52,27 +57,48 @@ pub async fn login_device_sms(
             && !password.is_empty(),
         "Enter your Apple Account email or phone and password"
     );
-    let mut anisette = Anisette::new(anisette_helper)?;
+    Ok(())
+}
+
+pub(super) async fn login(
+    device: &mut DeviceRegistration,
+    anisette: &mut Anisette,
+    provider: Option<&super::provisioning::DeviceProvider>,
+    account: &str,
+    password: Zeroizing<String>,
+    prompts: &mut impl SmsPrompts,
+) -> Result<Zeroizing<Vec<u8>>> {
+    let account = account.trim();
+    validate_login(account, &password)?;
     let client = apple_client()?;
     let gsa = GrandSlam {
         client: &client,
         origin: GSA,
         push_token: device.token()?,
+        mac_provisioned: provider.is_some(),
     };
     let password_hash = Zeroizing::new(sha256(password.as_bytes()));
     drop(password);
     let session = gsa
-        .sign_in(&mut anisette, account, &password_hash, prompts)
+        .sign_in(anisette, account, &password_hash, prompts)
         .await?;
     let headers = anisette.headers().await?;
-    let auth = super::ids_auth::authenticate(&client, &device, account, session, headers).await?;
-    register(&client, &device, auth).await
+    if let Some(provider) = provider {
+        device.validation_data = provider.validation().await?;
+        device.validate()?;
+    }
+    let auth = super::ids_auth::authenticate(&client, device, account, session, headers).await?;
+    if let Some(provider) = provider {
+        device.validation_data = provider.validation().await?;
+    }
+    register(&client, device, auth).await
 }
 
 struct GrandSlam<'a> {
     client: &'a Client,
     origin: &'a str,
     push_token: [u8; 32],
+    mac_provisioned: bool,
 }
 
 pub(super) struct LoginSession {
@@ -231,7 +257,15 @@ impl GrandSlam<'_> {
     ) -> Result<PasswordStep> {
         let srp = Exchange::start()?;
         let request_id = Uuid::new_v4().to_string().to_uppercase();
-        let cpd = device.client_data(&request_id, &self.push_token);
+        let token = if self.mac_provisioned {
+            self.push_token
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<String>()
+        } else {
+            STANDARD.encode(self.push_token)
+        };
+        let cpd = device.client_data(&request_id, &token);
         let init = self
             .srp_request(
                 device,
@@ -649,6 +683,7 @@ mod tests {
                 client: &client,
                 origin: &origin,
                 push_token: [0; 32],
+                mac_provisioned: false,
             };
             let challenge = Challenge {
                 adsid: "123".into(),

@@ -96,6 +96,22 @@ pub fn forget_secret(account: &str) -> Result<()> {
     }
 }
 
+pub(crate) fn read_activation(account: &str) -> Result<Option<Zeroizing<Vec<u8>>>> {
+    match entry(account)?.get_secret() {
+        Ok(bytes) => Ok(Some(Zeroizing::new(bytes))),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => {
+            Err(error).context("Could not read the Apple push identity from Linux Secret Service")
+        }
+    }
+}
+
+pub(crate) fn save_activation(account: &str, bytes: &[u8]) -> Result<()> {
+    entry(account)?
+        .set_secret(bytes)
+        .context("Could not save the Apple push identity to Linux Secret Service")
+}
+
 pub fn check_desktop_session_storage(root: &Path) -> Result<()> {
     ensure!(
         !root.join("apple-session.enc").exists(),

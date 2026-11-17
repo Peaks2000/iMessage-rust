@@ -1,7 +1,11 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, ensure};
-use openssl::{rand::rand_bytes, sha::sha1};
+use openssl::{
+    pkey::{PKeyRef, Private},
+    rand::rand_bytes,
+    sha::sha1,
+};
 use rustls::{
     ClientConfig, RootCertStore,
     pki_types::{CertificateDer, ServerName},
@@ -93,61 +97,12 @@ impl Drop for Courier {
 
 impl Courier {
     pub(super) async fn connect(identity: &Identity) -> Result<Self> {
-        timeout(Duration::from_secs(12), Self::handshake(identity))
-            .await
-            .context("Apple courier connection timed out")?
-    }
-
-    async fn handshake(identity: &Identity) -> Result<Self> {
-        let mut roots = RootCertStore::empty();
-        for certificate in CERTIFICATES {
-            roots.add(CertificateDer::from(*certificate))?;
-        }
-        let mut config = ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        config.alpn_protocols = vec![b"apns-security-v3".to_vec()];
-        let tcp = TcpStream::connect((COURIER_NAME, 5223))
-            .await
-            .context("Could not reach Apple courier on TCP port 5223")?;
-        tcp.set_nodelay(true)?;
-        let mut stream = TlsConnector::from(Arc::new(config))
-            .connect(ServerName::try_from(COURIER_NAME)?, tcp)
-            .await
-            .context("Apple courier TLS handshake failed")?;
-        ensure!(
-            stream
-                .get_ref()
-                .1
-                .alpn_protocol()
-                .is_none_or(|protocol| protocol == b"apns-security-v3"),
-            "Apple courier did not select the supported APNs protocol"
-        );
-        let nonce = nonce(0)?;
-        let signature = rsa_signature(&identity.push_key, &nonce)?;
-        write_frame(
-            &mut stream,
-            0x07,
-            &[
-                (1, &identity.token),
-                (2, &[1]),
-                (5, &0x41u32.to_be_bytes()),
-                (12, &identity.push_cert),
-                (13, &nonce),
-                (14, &signature),
-                (16, &9u16.to_be_bytes()),
-            ],
+        let (mut stream, token) = connect_push(
+            &identity.push_cert,
+            &identity.push_key,
+            Some(identity.token),
         )
         .await?;
-        let reply = Frame::read(&mut stream).await?;
-        ensure!(
-            reply.code == 0x08 && reply.field(1) == Some(&[0]),
-            "Apple rejected the provisioned APNs session"
-        );
-        let token = match reply.field(3) {
-            Some(token) => <[u8; 32]>::try_from(token).context("Invalid Apple push token")?,
-            None => identity.token,
-        };
         ensure!(
             token == identity.token,
             "Apple issued a different push token. Provision a matching IDS session"
@@ -223,6 +178,86 @@ impl Courier {
     }
 }
 
+pub(super) async fn enroll_push_token(
+    certificate: &[u8],
+    key: &PKeyRef<Private>,
+    remembered: Option<[u8; 32]>,
+) -> Result<[u8; 32]> {
+    let (_, token) = connect_push(certificate, key, remembered).await?;
+    Ok(token)
+}
+
+async fn connect_push(
+    certificate: &[u8],
+    key: &PKeyRef<Private>,
+    remembered: Option<[u8; 32]>,
+) -> Result<(TlsStream<TcpStream>, [u8; 32])> {
+    timeout(Duration::from_secs(12), async {
+        let mut roots = RootCertStore::empty();
+        for certificate in CERTIFICATES {
+            roots.add(CertificateDer::from(*certificate))?;
+        }
+        let mut config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"apns-security-v3".to_vec()];
+        let tcp = TcpStream::connect((COURIER_NAME, 5223))
+            .await
+            .context("Could not reach Apple courier on TCP port 5223")?;
+        tcp.set_nodelay(true)?;
+        let mut stream = TlsConnector::from(Arc::new(config))
+            .connect(ServerName::try_from(COURIER_NAME)?, tcp)
+            .await
+            .context("Apple courier TLS handshake failed")?;
+        ensure!(
+            stream
+                .get_ref()
+                .1
+                .alpn_protocol()
+                .is_none_or(|protocol| protocol == b"apns-security-v3"),
+            "Apple courier did not select the supported APNs protocol"
+        );
+        let token = send_connect(&mut stream, certificate, key, remembered).await?;
+        Ok((stream, token))
+    })
+    .await
+    .context("Apple courier connection timed out")?
+}
+
+async fn send_connect(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    certificate: &[u8],
+    key: &PKeyRef<Private>,
+    remembered: Option<[u8; 32]>,
+) -> Result<[u8; 32]> {
+    let nonce = nonce(0)?;
+    let signature = rsa_signature(key, &nonce)?;
+    let flags = 0x41u32.to_be_bytes();
+    let protocol = 9u16.to_be_bytes();
+    let mut fields: Vec<(u8, &[u8])> = Vec::new();
+    if let Some(token) = &remembered {
+        fields.push((1, token));
+    }
+    fields.extend([
+        (2, &[1][..]),
+        (5, &flags),
+        (12, certificate),
+        (13, &nonce),
+        (14, &signature),
+        (16, &protocol),
+    ]);
+    write_frame(stream, 0x07, &fields).await?;
+    let reply = Frame::read(stream).await?;
+    ensure!(
+        reply.code == 0x08 && reply.field(1) == Some(&[0]),
+        "Apple rejected the APNs connection"
+    );
+    match reply.field(3) {
+        Some(token) => <[u8; 32]>::try_from(token).context("Invalid Apple push token"),
+        None => remembered.context("Apple did not issue an APNs token"),
+    }
+}
+
 pub(super) fn push_id() -> Result<[u8; 4]> {
     let mut id = [0; 4];
     rand_bytes(&mut id)?;
@@ -232,6 +267,34 @@ pub(super) fn push_id() -> Result<[u8; 4]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fresh_apns_enrollment_accepts_an_issued_token() -> Result<()> {
+        use openssl::{hash::MessageDigest, pkey::PKey, rsa::Rsa, sign::Verifier};
+
+        let key = PKey::from_rsa(Rsa::generate(1024)?)?;
+        let (mut device, mut apple) = tokio::io::duplex(4096);
+        let issued = [9u8; 32];
+        let server = async {
+            let request = Frame::read(&mut apple).await?;
+            assert_eq!(request.code, 7);
+            assert!(request.field(1).is_none());
+            assert_eq!(request.field(12), Some(b"certificate".as_slice()));
+            let signature = request.field(14).context("Missing activation signature")?;
+            assert_eq!(&signature[..2], &[1, 1]);
+            assert!(
+                Verifier::new(MessageDigest::sha1(), &key)?
+                    .verify_oneshot(&signature[2..], request.field(13).context("Missing nonce")?,)?
+            );
+            write_frame(&mut apple, 8, &[(1, &[0]), (3, &issued)]).await
+        };
+        let (token, ()) = tokio::try_join!(
+            send_connect(&mut device, b"certificate", &key, None),
+            server
+        )?;
+        assert_eq!(token, issued);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn frame_interoperable_layout_and_truncation() -> Result<()> {

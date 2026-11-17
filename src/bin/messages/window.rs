@@ -1176,7 +1176,7 @@ impl MessagesApp {
                                     )
                                     .clicked()
                                 {
-                                    setup = Some(SetupMethod::SignIn);
+                                    setup = Some(SetupMethod::Automatic);
                                 }
                                 if ui
                                     .add_enabled(
@@ -1250,7 +1250,7 @@ impl MessagesApp {
             });
         if let Some(method) = setup {
             form.error = None;
-            self.apple_setup = Some(AppleSetup::new(method));
+            self.apple_setup = Some(AppleSetup::new(method, &self.root));
         } else if (cancel || panel.should_close()) && !connecting {
             self.settings = None;
         } else if apply {

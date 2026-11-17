@@ -19,9 +19,9 @@ The Sequoia layout includes animated conversation selection, message arrival, th
 
 ## Connect to iMessage
 
-The engine implements Apple Account sign-in with SMS verification, the Apple courier connection, IDS address lookup and legacy registration, and the legacy encrypted text format for one-to-one conversations. Sign-in uses fresh Anisette headers, an existing APNs identity, and device validation material. Live SMS delivery, Apple registration, and iMessage delivery have yet to be verified with an Apple Account.
+The engine implements Apple Account sign-in with SMS verification, the Apple courier connection, IDS address lookup and legacy registration, and the legacy encrypted text format for one-to-one conversations. The desktop can request a new APNs identity and obtain fresh device validation and Anisette from a configured Mac or Hackintosh helper. Live Apple activation, SMS delivery, registration, and iMessage delivery have yet to be verified with an Apple Account.
 
-Open **Settings → This Computer → Set Up Apple Account** to select a device plist and an Anisette helper, sign in, and enter Apple’s SMS code. If you already have a registered session plist, choose **Import Session**. The desktop saves the resulting session in Linux Secret Service and then connects directly from Linux. The [Apple provisioning guide](docs/apple-session.md) lists the inputs and file formats.
+Open **Settings → This Computer → Set Up Apple Account** and enter the SSH address of a configured Mac or Hackintosh. Sign in and enter Apple’s SMS code if prompted. The helper uses activation signing material supplied by its operator. The Linux app keeps the resulting session in Secret Service and handles iMessage itself. An existing device or registered session plist can still be imported. [Apple provisioning guide](docs/apple-session.md#automatic-device-setup)
 
 Supported message content is plain text exchanged with devices that accept the legacy format. Group chats, attachments, SMS, modern iMessage encryption formats, and iCloud history sync remain outside this version. The UI shows when Apple's courier accepted a send. Recipient delivery and read receipts require further work.
 

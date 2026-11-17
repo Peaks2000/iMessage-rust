@@ -8,7 +8,10 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use eframe::egui::{self, Align, Color32, Layout, Margin, RichText, TextEdit, Ui, vec2};
 use linux_imessage::{
-    apple::{SmsPrompts, TrustedPhone, login_device_sms},
+    apple::{
+        AutomaticSetup, DeviceConnection, SmsPrompts, TrustedPhone, default_device_helper,
+        login_device_sms,
+    },
     storage,
 };
 use tokio::sync::oneshot;
@@ -20,6 +23,7 @@ const GUIDE: &str = "https://github.com/Peaks2000/linux-imessage/blob/main/docs/
 
 #[derive(Clone, Copy)]
 pub(super) enum Method {
+    Automatic,
     SignIn,
     Import,
 }
@@ -34,7 +38,9 @@ pub(super) struct AppleSetup {
     method: Method,
     file: String,
     helper: String,
+    mac_host: String,
     account: String,
+    address: String,
     password: Zeroizing<String>,
     code: Zeroizing<String>,
     step: Step,
@@ -49,6 +55,8 @@ enum FileField {
     Device,
     Session,
     Anisette,
+    Provider,
+    OpenCore,
 }
 
 impl FileField {
@@ -57,6 +65,8 @@ impl FileField {
             Self::Device => "Apple device plist",
             Self::Session => "Registered session plist",
             Self::Anisette => "Anisette helper",
+            Self::Provider => "Mac device helper",
+            Self::OpenCore => "OpenCore config.plist",
         }
     }
 }
@@ -89,6 +99,11 @@ enum Event {
 }
 
 enum Request {
+    Automatic {
+        setup: AutomaticSetup,
+        account: String,
+        password: Zeroizing<String>,
+    },
     SignIn {
         device: PathBuf,
         helper: PathBuf,
@@ -99,12 +114,20 @@ enum Request {
 }
 
 impl AppleSetup {
-    pub(super) fn new(method: Method) -> Self {
+    pub(super) fn new(method: Method, root: &Path) -> Self {
+        let helper = match method {
+            Method::Automatic => default_device_helper(root)
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
         Self {
             method,
             file: String::new(),
-            helper: String::new(),
+            helper,
+            mac_host: std::env::var("IMESSAGE_MAC_HOST").unwrap_or_default(),
             account: String::new(),
+            address: String::new(),
             password: Zeroizing::new(String::new()),
             code: Zeroizing::new(String::new()),
             step: Step::Form,
@@ -124,8 +147,10 @@ impl AppleSetup {
         let mut cancel = false;
         let mut browse = None;
         let mut submit = false;
+        let mut manual = false;
         let dialog = match self.method {
-            Method::SignIn => "apple-account-setup",
+            Method::Automatic => "automatic-apple-setup",
+            Method::SignIn => "manual-apple-setup",
             Method::Import => "apple-session-import",
         };
         let panel = egui::Modal::new(egui::Id::new(dialog))
@@ -134,7 +159,8 @@ impl AppleSetup {
                 ui.set_width(404.);
                 ui.label(chrome::bold(
                     match self.method {
-                        Method::SignIn => "Set Up Apple Account",
+                        Method::Automatic => "Set Up Apple Account",
+                        Method::SignIn => "Use an Apple Device File",
                         Method::Import => "Import Apple Session",
                     },
                     19.,
@@ -142,7 +168,10 @@ impl AppleSetup {
                 ui.add_space(7.);
                 let (label, enabled) = match &mut self.step {
                     Step::Form => {
-                        let (action, ready) = self.form(ui, &mut browse);
+                        let height = (context.content_rect().height() - 120.).max(100.);
+                        let (action, ready) = egui::ScrollArea::vertical()
+                            .auto_shrink([false, true]).max_height(height)
+                            .show(ui, |ui| self.form(ui, &mut browse, &mut manual)).inner;
                         (action, ready && self.picker.is_none())
                     }
                     Step::Phone {
@@ -199,6 +228,12 @@ impl AppleSetup {
         if can_cancel && (cancel || panel.should_close()) {
             return Outcome::Closed;
         }
+        if manual {
+            self.method = Method::SignIn;
+            self.file.clear();
+            self.helper.clear();
+            self.error = None;
+        }
         if let Some(field) = browse {
             self.picker = Some(pick_file(context, field));
         }
@@ -208,8 +243,30 @@ impl AppleSetup {
         Outcome::Open
     }
 
-    fn form(&mut self, ui: &mut Ui, browse: &mut Option<FileField>) -> (&'static str, bool) {
+    fn form(
+        &mut self,
+        ui: &mut Ui,
+        browse: &mut Option<FileField>,
+        manual: &mut bool,
+    ) -> (&'static str, bool) {
         ui.add_enabled_ui(self.picker.is_none(), |ui| match self.method {
+            Method::Automatic => {
+                ui.label(RichText::new("Use a trusted Mac or Hackintosh to validate this device. iMessage will request its push credentials and register after sign-in.").color(MUTED));
+                ui.hyperlink_to("Configure a Mac device helper", format!("{GUIDE}#automatic-device-setup"));
+                ui.add_enabled_ui(self.helper.trim().is_empty(), |ui| {
+                    edit(ui, "Mac SSH address", &mut self.mac_host, "user@mac.local", false);
+                });
+                edit(ui, "Apple Account", &mut self.account, "Email or phone number", false);
+                edit(ui, "Password", &mut self.password, "", true);
+                ui.collapsing("Device Options", |ui| {
+                    file_input(ui, FileField::Provider, &mut self.helper, browse);
+                    file_input(ui, FileField::OpenCore, &mut self.file, browse);
+                    edit(ui, "iMessage address", &mut self.address, "Optional · defaults to your Apple Account", false);
+                });
+                *manual = ui.small_button("Use a device plist instead…").clicked();
+                ("Sign In", (!self.helper.trim().is_empty() || !self.mac_host.trim().is_empty())
+                    && !self.account.trim().is_empty() && !self.password.is_empty())
+            }
             Method::SignIn => {
                 ui.label(RichText::new("Use an Apple device provisioning file and a trusted Anisette helper to sign in with SMS.").color(MUTED));
                 ui.hyperlink_to("Apple device setup guide", GUIDE);
@@ -236,6 +293,19 @@ impl AppleSetup {
             Step::Form => {
                 let file = PathBuf::from(self.file.trim());
                 let request = match self.method {
+                    Method::Automatic => Request::Automatic {
+                        setup: AutomaticSetup {
+                            connection: if self.helper.trim().is_empty() {
+                                DeviceConnection::MacOverSsh(self.mac_host.clone())
+                            } else {
+                                DeviceConnection::LocalHelper(PathBuf::from(self.helper.trim()))
+                            },
+                            opencore_config: (!self.file.trim().is_empty()).then_some(file),
+                            address: self.address.trim().to_owned(),
+                        },
+                        account: self.account.trim().to_owned(),
+                        password: std::mem::take(&mut self.password),
+                    },
                     Method::SignIn => Request::SignIn {
                         device: file,
                         helper: PathBuf::from(self.helper.trim()),
@@ -245,6 +315,7 @@ impl AppleSetup {
                     Method::Import => Request::Import(file),
                 };
                 self.step = Step::Working(match self.method {
+                    Method::Automatic => "Provisioning the device and signing in to Apple…",
                     Method::SignIn => "Signing in to Apple…",
                     Method::Import => "Validating the Apple session…",
                 });
@@ -276,8 +347,10 @@ impl AppleSetup {
                     match result {
                         Ok(Some(path)) => {
                             let target = match field {
-                                FileField::Device | FileField::Session => &mut self.file,
-                                FileField::Anisette => &mut self.helper,
+                                FileField::Device | FileField::Session | FileField::OpenCore => {
+                                    &mut self.file
+                                }
+                                FileField::Anisette | FileField::Provider => &mut self.helper,
                             };
                             *target = path.to_string_lossy().into_owned();
                             self.error = None;
@@ -390,6 +463,17 @@ async fn get_session(
     root: &Path,
 ) -> Result<Zeroizing<Vec<u8>>> {
     match request {
+        Request::Automatic {
+            setup,
+            account,
+            password,
+        } => {
+            storage::check_desktop_session_storage(root)?;
+            setup
+                .sign_in(root, &account, password, &mut prompts.clone())
+                .await
+        }
+
         Request::Import(file) => {
             let bytes = storage::read_private(&file)?;
             linux_imessage::apple::Identity::parse(&bytes).context("Invalid Apple session")?;
@@ -551,7 +635,7 @@ mod tests {
             context: egui::Context::default(),
         };
         let (_cancel, _canceled) = oneshot::channel();
-        let mut setup = AppleSetup::new(Method::SignIn);
+        let mut setup = AppleSetup::new(Method::SignIn, Path::new("."));
         setup.worker = Some(Worker { events, _cancel });
         let receive_code = prompts.read_code();
         tokio::pin!(receive_code);
@@ -579,7 +663,7 @@ mod tests {
             context: egui::Context::default(),
         };
         let (cancel, _) = oneshot::channel();
-        let mut setup = AppleSetup::new(Method::SignIn);
+        let mut setup = AppleSetup::new(Method::SignIn, Path::new("."));
         setup.worker = Some(Worker {
             events,
             _cancel: cancel,

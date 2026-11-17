@@ -4,15 +4,18 @@ mod gsa;
 mod http;
 mod ids_auth;
 mod madrid;
+mod provider_command;
+mod provisioning;
 mod registration;
 pub use gsa::{SmsPrompts, TrustedPhone, login_device_sms};
+pub use provisioning::{AutomaticSetup, DeviceConnection, default_device_helper};
 pub use registration::register_device;
 
 use anyhow::{Context, Result, ensure};
 pub(crate) use madrid::Madrid;
 use openssl::{
     hash::MessageDigest,
-    pkey::{Id, PKey, Private},
+    pkey::{Id, PKey, PKeyRef, Private},
     rand::rand_bytes,
     rsa::Padding,
     sha::sha256,
@@ -145,7 +148,7 @@ fn nonce(kind: u8) -> Result<[u8; 17]> {
     Ok(nonce)
 }
 
-fn rsa_signature(key: &PKey<Private>, data: &[u8]) -> Result<Vec<u8>> {
+fn rsa_signature(key: &PKeyRef<Private>, data: &[u8]) -> Result<Vec<u8>> {
     let mut signer = Signer::new(MessageDigest::sha1(), key)?;
     signer.set_rsa_padding(Padding::PKCS1)?;
     let mut signature = vec![1, 1];

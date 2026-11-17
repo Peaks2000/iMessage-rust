@@ -1,16 +1,14 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    process::Stdio,
-    time::Duration,
 };
 
-use anyhow::{Context, Result, ensure};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use anyhow::{Result, ensure};
 use plist::{Dictionary, Value};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use tokio::{io::AsyncReadExt, process::Command, time::timeout};
 use zeroize::Zeroize;
+
+use super::super::{provider_command, provisioning::DeviceProvider};
 
 const MAX_HEADERS: u64 = 16 * 1024;
 const REQUIRED: &[&str] = &[
@@ -31,32 +29,40 @@ const OPTIONAL: &[&str] = &[
     "X-Apple-I-MLB",
 ];
 
-pub(super) struct Anisette {
-    helper: PathBuf,
+pub(in crate::apple) struct Anisette {
+    source: Source,
     identity: Option<[String; 4]>,
+}
+
+enum Source {
+    Helper(PathBuf),
+    Device(DeviceProvider),
 }
 
 pub(in crate::apple) struct DeviceHeaders(HashMap<&'static str, String>);
 
 impl Anisette {
     pub(super) fn new(helper: &Path) -> Result<Self> {
-        let helper = helper
-            .canonicalize()
-            .context("Could not find the Anisette helper")?;
-        ensure!(
-            helper.is_file(),
-            "The Anisette helper must be an executable file"
-        );
         Ok(Self {
-            helper,
+            source: Source::Helper(provider_command::executable(helper)?),
             identity: None,
         })
     }
 
+    pub(in crate::apple) fn from_provider(provider: DeviceProvider) -> Self {
+        Self {
+            source: Source::Device(provider),
+            identity: None,
+        }
+    }
+
     pub(super) async fn headers(&mut self) -> Result<DeviceHeaders> {
-        let bytes = timeout(Duration::from_secs(20), self.run_helper())
-            .await
-            .context("The Anisette helper timed out")??;
+        let bytes = match &self.source {
+            Source::Helper(helper) => {
+                provider_command::run(helper, &[], "Anisette", &[], MAX_HEADERS).await?
+            }
+            Source::Device(provider) => provider.call("anisette", &[], MAX_HEADERS).await?,
+        };
         let headers = DeviceHeaders::parse(&bytes)?;
         let identity = [
             "X-Apple-I-MD-M",
@@ -74,33 +80,6 @@ impl Anisette {
             self.identity = Some(identity);
         }
         Ok(headers)
-    }
-
-    async fn run_helper(&self) -> Result<zeroize::Zeroizing<Vec<u8>>> {
-        let mut child = Command::new(&self.helper)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .context("Could not run the Anisette helper")?;
-        let mut bytes = zeroize::Zeroizing::new(Vec::new());
-        child
-            .stdout
-            .take()
-            .context("Anisette helper stdout is unavailable")?
-            .take(MAX_HEADERS + 1)
-            .read_to_end(&mut bytes)
-            .await?;
-        ensure!(
-            bytes.len() as u64 <= MAX_HEADERS,
-            "The Anisette helper response is too large"
-        );
-        ensure!(
-            child.wait().await?.success(),
-            "The Anisette helper exited unsuccessfully"
-        );
-        Ok(bytes)
     }
 }
 
@@ -177,7 +156,7 @@ impl DeviceHeaders {
         headers
     }
 
-    pub(super) fn client_data(&self, request_id: &str, push_token: &[u8; 32]) -> Dictionary {
+    pub(super) fn client_data(&self, request_id: &str, push_token: &str) -> Dictionary {
         let mut data = self.plist_headers();
         data.extend(
             [
@@ -192,7 +171,7 @@ impl DeviceHeaders {
                 ("cbid", "com.apple.MobileSMS".into()),
                 ("loc", "en_US".into()),
                 ("svct", "imessage".into()),
-                ("ptkn", STANDARD.encode(push_token).into()),
+                ("ptkn", push_token.into()),
                 ("X-Apple-Offer-Security-Upgrade", Value::Boolean(true)),
                 ("bootstrap", Value::Boolean(true)),
                 ("ckgen", Value::Boolean(true)),

@@ -41,18 +41,18 @@ struct Registration {
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(super) struct DeviceRegistration {
-    version: u32,
-    handle: String,
-    push_token: Data,
-    push_certificate: Data,
-    push_private_key: Data,
+    pub(super) version: u32,
+    pub(super) handle: String,
+    pub(super) push_token: Data,
+    pub(super) push_certificate: Data,
+    pub(super) push_private_key: Data,
     pub(super) protocol_version: u32,
     pub(super) user_agent: String,
-    device_name: String,
-    hardware_version: String,
-    os_version: String,
-    software_version: String,
-    private_device_data: Dictionary,
+    pub(super) device_name: String,
+    pub(super) hardware_version: String,
+    pub(super) os_version: String,
+    pub(super) software_version: String,
+    pub(super) private_device_data: Dictionary,
     pub(super) validation_data: Data,
 }
 
