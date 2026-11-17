@@ -24,6 +24,9 @@ struct Args {
 }
 
 fn main() -> anyhow::Result<()> {
+    if linux_imessage::apple::run_ssh_askpass()? {
+        return Ok(());
+    }
     let args = Args::parse();
     let root = linux_imessage::storage::private_dir(
         &args

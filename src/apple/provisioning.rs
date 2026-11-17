@@ -27,6 +27,7 @@ use super::{
     local_adi::LocalAdi,
     provider_command,
     registration::DeviceRegistration,
+    ssh_setup::MacConnection,
 };
 use crate::{address, now_ms, storage};
 
@@ -45,6 +46,7 @@ pub enum DeviceConnection {
     MacOverSsh(String),
     LocalHelper(PathBuf),
     OnDevice(PathBuf),
+    OnDeviceHelper(PathBuf),
 }
 
 impl AutomaticSetup {
@@ -62,7 +64,13 @@ impl AutomaticSetup {
         })
         .context("Enter a registered iMessage email address or international phone number")?;
         validate_login(account, &password)?;
-        let provider = DeviceProvider::new(self.connection)?;
+        let use_local_adi = matches!(self.connection, DeviceConnection::OnDeviceHelper(_));
+        let provider = match self.connection {
+            DeviceConnection::MacOverSsh(host) => DeviceProvider::MacOverSsh(std::sync::Arc::new(
+                MacConnection::open(root, &host, prompts).await?,
+            )),
+            connection => DeviceProvider::new(connection)?,
+        };
         if let DeviceProvider::OnDevice(local) = &provider {
             return local
                 .sign_in(root, handle, account, password, prompts)
@@ -82,9 +90,16 @@ impl AutomaticSetup {
         }
         let profile = computer.profile();
         let _activation_lock = lock_profile(root, &profile)?;
+        let mut anisette = if use_local_adi {
+            Anisette::from_local(LocalAdi::new(
+                format!("adi:{}:{profile}", root.display()),
+                &computer,
+            )?)
+        } else {
+            Anisette::from_provider(provider.clone())
+        };
         let (push, token) = provision_push(root, &profile, &computer, &provider, None).await?;
         let mut device = computer.registration(handle, token, &push);
-        let mut anisette = Anisette::from_provider(provider.clone());
         login(
             &mut device,
             &mut anisette,
@@ -111,7 +126,7 @@ pub fn default_device_helper(root: &Path) -> Option<PathBuf> {
 #[derive(Clone)]
 pub(super) enum DeviceProvider {
     LocalHelper(PathBuf),
-    MacOverSsh(String),
+    MacOverSsh(std::sync::Arc<MacConnection>),
     OnDevice(std::sync::Arc<LocalDevice>),
 }
 
@@ -142,20 +157,11 @@ impl Proofs<'_> {
 impl DeviceProvider {
     fn new(connection: DeviceConnection) -> Result<Self> {
         Ok(match connection {
-            DeviceConnection::LocalHelper(path) => {
+            DeviceConnection::LocalHelper(path) | DeviceConnection::OnDeviceHelper(path) => {
                 Self::LocalHelper(provider_command::executable(&path)?)
             }
-            DeviceConnection::MacOverSsh(host) => {
-                let host = host.trim();
-                ensure!(
-                    (1..=320).contains(&host.len())
-                        && !host.starts_with('-')
-                        && host
-                            .bytes()
-                            .all(|byte| byte.is_ascii_alphanumeric() || b"._@:-[]".contains(&byte)),
-                    "Enter an SSH host or alias such as user@mac.local"
-                );
-                Self::MacOverSsh(host.to_owned())
+            DeviceConnection::MacOverSsh(_) => {
+                anyhow::bail!("Mac setup needs an open SSH connection")
             }
             DeviceConnection::OnDevice(path) => {
                 Self::OnDevice(std::sync::Arc::new(LocalDevice::load(&path)?))
@@ -173,15 +179,7 @@ impl DeviceProvider {
             Self::LocalHelper(path) => {
                 provider_command::run(path, &[operation], operation, input, maximum).await
             }
-            Self::MacOverSsh(host) => {
-                let remote = format!("~/.local/bin/imessage-mac-device {operation}");
-                provider_command::run(Path::new("/usr/bin/ssh"), &[
-                    "-T", "-oBatchMode=yes", "-oStrictHostKeyChecking=yes", "-oConnectTimeout=8",
-                    "--", host, &remote,
-                ], operation, input, maximum).await.with_context(|| format!(
-                    "The Mac helper could not complete {operation}. Check SSH access and the Mac helper installation"
-                ))
-            }
+            Self::MacOverSsh(connection) => connection.run(operation, input, maximum).await,
             Self::OnDevice(_) => anyhow::bail!("This operation needs an external device helper"),
         }
     }

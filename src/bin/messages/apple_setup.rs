@@ -9,8 +9,8 @@ use anyhow::{Context, Result, ensure};
 use eframe::egui::{self, Align, Color32, Layout, Margin, RichText, TextEdit, Ui, vec2};
 use linux_imessage::{
     apple::{
-        AutomaticSetup, DeviceConnection, SmsPrompts, TrustedPhone, default_device_helper,
-        login_device_sms,
+        AutomaticSetup, DeviceConnection, SmsPrompts, SshPrompt, TrustedPhone,
+        default_device_helper, login_device_sms,
     },
     storage,
 };
@@ -44,11 +44,13 @@ pub(super) struct AppleSetup {
     address: String,
     password: Zeroizing<String>,
     code: Zeroizing<String>,
+    ssh_answer: Zeroizing<String>,
     step: Step,
     error: Option<String>,
     worker: Option<Worker>,
     picker: Option<Receiver<(FileField, Result<Option<PathBuf>>)>>,
     focus_code: bool,
+    focus_ssh: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -68,7 +70,7 @@ impl FileField {
             Self::Device => "Apple device plist",
             Self::Session => "Registered session plist",
             Self::Anisette => "Anisette helper",
-            Self::Provider => "Mac device helper",
+            Self::Provider => "Local validation helper",
             Self::OpenCore => "OpenCore config.plist",
         }
     }
@@ -83,6 +85,7 @@ enum Step {
         answer: oneshot::Sender<usize>,
     },
     Code(oneshot::Sender<Zeroizing<String>>),
+    Ssh(SshPrompt, oneshot::Sender<Zeroizing<String>>),
     Saving,
     RetrySave(oneshot::Sender<()>),
 }
@@ -96,6 +99,7 @@ struct Worker {
 enum Event {
     Phone(Vec<String>, oneshot::Sender<usize>),
     Code(oneshot::Sender<Zeroizing<String>>),
+    Ssh(SshPrompt, oneshot::Sender<Zeroizing<String>>),
     Save(oneshot::Sender<()>),
     StorageError(anyhow::Error, oneshot::Sender<()>),
     Finished(Result<()>),
@@ -119,7 +123,7 @@ enum Request {
 impl AppleSetup {
     pub(super) fn new(method: Method, root: &Path) -> Self {
         let helper = match method {
-            Method::Automatic => default_device_helper(root)
+            Method::OnDevice => default_device_helper(root)
                 .map(|path| path.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             _ => String::new(),
@@ -141,11 +145,13 @@ impl AppleSetup {
             address: String::new(),
             password: Zeroizing::new(String::new()),
             code: Zeroizing::new(String::new()),
+            ssh_answer: Zeroizing::new(String::new()),
             step: Step::Form,
             error: None,
             worker: None,
             picker: None,
             focus_code: false,
+            focus_ssh: false,
         }
     }
 
@@ -209,6 +215,27 @@ impl AppleSetup {
                             && ui.input(|input| input.key_pressed(egui::Key::Enter));
                         ("Verify", valid)
                     }
+                    Step::Ssh(SshPrompt::VerifyHost { host, fingerprint }, _) => {
+                        ui.label(format!("Verify this Mac's SSH fingerprint for {host}."));
+                        ui.label(RichText::new(fingerprint.as_str()).monospace().size(12.));
+                        ui.label(RichText::new("On the Mac, use ssh-keygen -lf with the matching public host key in /etc/ssh.").color(MUTED));
+                        ("Trust Mac", true)
+                    }
+                    Step::Ssh(SshPrompt::Login { host, message }, _) => {
+                        ui.label(format!("SSH sign-in for {host}"));
+                        if !message.trim().is_empty() {
+                            ui.label(RichText::new(message.as_str()).size(11.).color(MUTED));
+                        }
+                        let response = edit(ui, "Mac login password or SSH passphrase", &mut self.ssh_answer, "", true);
+                        if self.focus_ssh {
+                            response.request_focus();
+                            self.focus_ssh = false;
+                        }
+                        let valid = (1..=1023).contains(&self.ssh_answer.len());
+                        submit = valid && response.lost_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                        ("Sign In to Mac", valid)
+                    }
                     Step::Working(message) => {
                         progress(ui, message);
                         ("Continue", false)
@@ -244,7 +271,7 @@ impl AppleSetup {
             self.method = method;
             self.file.clear();
             self.helper = default_device_helper(root)
-                .filter(|_| matches!(method, Method::Automatic))
+                .filter(|_| matches!(method, Method::OnDevice))
                 .map(|path| path.to_string_lossy().into_owned())
                 .unwrap_or_default();
             self.error = None;
@@ -266,39 +293,43 @@ impl AppleSetup {
     ) -> (&'static str, bool) {
         ui.add_enabled_ui(self.picker.is_none(), |ui| match self.method {
             Method::OnDevice => {
-                ui.label(RichText::new("Sign in from this computer using a prepared Apple device profile with fresh validation proofs and push credentials.").color(MUTED));
-                file_input(ui, FileField::LocalDevice, &mut self.file, browse);
+                ui.label(RichText::new("iMessage creates the device profile using your local validation helper.").color(MUTED));
+                if self.helper.trim().is_empty() && self.file.trim().is_empty() {
+                    ui.label(RichText::new("Set up with a Mac or choose a local validation helper to obtain Apple device proofs.").color(MUTED));
+                }
                 edit(ui, "Apple Account", &mut self.account, "Email or phone number", false);
-                edit(ui, "Password", &mut self.password, "", true);
+                edit(ui, "Apple Account password", &mut self.password, "", true);
+                if ui.small_button("Set Up with a Mac…").clicked() {
+                    *alternate = Some(Method::Automatic);
+                }
                 ui.collapsing("Device Options", |ui| {
-                    edit(ui, "iMessage address", &mut self.address, "Optional · defaults to your Apple Account", false);
-                    if ui.small_button("Use a Mac helper…").clicked() {
-                        *alternate = Some(Method::Automatic);
+                    file_input(ui, FileField::Provider, &mut self.helper, browse);
+                    if self.helper.trim().is_empty() {
+                        file_input(ui, FileField::LocalDevice, &mut self.file, browse);
                     }
+                    edit(ui, "iMessage address", &mut self.address, "Optional", false);
                     if ui.small_button("Use a legacy device plist…").clicked() {
                         *alternate = Some(Method::SignIn);
                     }
                 });
-                ("Sign In", !self.file.trim().is_empty() && !self.account.trim().is_empty() && !self.password.is_empty())
+                ("Sign In", (!self.helper.trim().is_empty() || !self.file.trim().is_empty())
+                    && !self.account.trim().is_empty() && !self.password.is_empty())
             }
             Method::Automatic => {
-                ui.label(RichText::new("Use a trusted Mac or Hackintosh to validate this device. iMessage will request its push credentials and register after sign-in.").color(MUTED));
+                ui.label(RichText::new("Use a Mac or Hackintosh to validate this device. You’ll get a separate Mac login prompt if SSH needs your password.").color(MUTED));
                 ui.hyperlink_to("Configure a Mac device helper", format!("{GUIDE}#automatic-device-setup"));
-                ui.add_enabled_ui(self.helper.trim().is_empty(), |ui| {
-                    edit(ui, "Mac SSH address", &mut self.mac_host, "user@mac.local", false);
-                });
+                edit(ui, "Mac SSH address", &mut self.mac_host, "user@mac.local", false);
                 edit(ui, "Apple Account", &mut self.account, "Email or phone number", false);
-                edit(ui, "Password", &mut self.password, "", true);
+                edit(ui, "Apple Account password", &mut self.password, "", true);
                 ui.collapsing("Device Options", |ui| {
-                    file_input(ui, FileField::Provider, &mut self.helper, browse);
                     file_input(ui, FileField::OpenCore, &mut self.file, browse);
                     edit(ui, "iMessage address", &mut self.address, "Optional · defaults to your Apple Account", false);
                 });
-                if ui.small_button("Use a device plist instead…").clicked() {
-                    *alternate = Some(Method::SignIn);
+                if ui.small_button("Set Up on This Computer…").clicked() {
+                    *alternate = Some(Method::OnDevice);
                 }
-                ("Sign In", (!self.helper.trim().is_empty() || !self.mac_host.trim().is_empty())
-                    && !self.account.trim().is_empty() && !self.password.is_empty())
+                ("Sign In", !self.mac_host.trim().is_empty() && !self.account.trim().is_empty()
+                    && !self.password.is_empty())
             }
             Method::SignIn => {
                 ui.label(RichText::new("Use an Apple device provisioning file and a trusted Anisette helper to sign in with SMS.").color(MUTED));
@@ -328,7 +359,11 @@ impl AppleSetup {
                 let request = match self.method {
                     Method::OnDevice => Request::Automatic {
                         setup: AutomaticSetup {
-                            connection: DeviceConnection::OnDevice(file),
+                            connection: if self.helper.trim().is_empty() {
+                                DeviceConnection::OnDevice(file)
+                            } else {
+                                DeviceConnection::OnDeviceHelper(PathBuf::from(self.helper.trim()))
+                            },
                             opencore_config: None,
                             address: self.address.trim().to_owned(),
                         },
@@ -337,11 +372,7 @@ impl AppleSetup {
                     },
                     Method::Automatic => Request::Automatic {
                         setup: AutomaticSetup {
-                            connection: if self.helper.trim().is_empty() {
-                                DeviceConnection::MacOverSsh(self.mac_host.clone())
-                            } else {
-                                DeviceConnection::LocalHelper(PathBuf::from(self.helper.trim()))
-                            },
+                            connection: DeviceConnection::MacOverSsh(self.mac_host.clone()),
                             opencore_config: (!self.file.trim().is_empty()).then_some(file),
                             address: self.address.trim().to_owned(),
                         },
@@ -374,6 +405,14 @@ impl AppleSetup {
             Step::Code(answer) => {
                 self.step = Step::Working("Verifying the code and registering the device…");
                 let _ = answer.send(std::mem::take(&mut self.code));
+            }
+            Step::Ssh(prompt, answer) => {
+                let value = match prompt {
+                    SshPrompt::VerifyHost { .. } => Zeroizing::new("yes".to_owned()),
+                    SshPrompt::Login { .. } => std::mem::take(&mut self.ssh_answer),
+                };
+                self.step = Step::Working("Connecting to the Mac…");
+                let _ = answer.send(value);
             }
             Step::RetrySave(answer) => {
                 self.step = Step::Saving;
@@ -423,6 +462,11 @@ impl AppleSetup {
                 self.focus_code = true;
                 self.step = Step::Code(answer);
             }
+            Ok(Event::Ssh(prompt, answer)) => {
+                self.ssh_answer = Zeroizing::default();
+                self.focus_ssh = true;
+                self.step = Step::Ssh(prompt, answer);
+            }
             Ok(Event::Save(ready)) => {
                 self.step = Step::Saving;
                 let _ = ready.send(());
@@ -443,6 +487,7 @@ impl AppleSetup {
 
     fn fail(&mut self, error: String) {
         self.worker = None;
+        self.ssh_answer = Zeroizing::default();
         self.step = Step::Form;
         self.error = Some(error);
     }
@@ -576,6 +621,12 @@ impl SmsPrompts for GuiPrompts {
         let (answer, code) = oneshot::channel();
         self.emit(Event::Code(answer))?;
         code.await.context("Apple account setup canceled")
+    }
+
+    async fn ssh_prompt(&mut self, prompt: SshPrompt) -> Result<Zeroizing<String>> {
+        let (answer, response) = oneshot::channel();
+        self.emit(Event::Ssh(prompt, answer))?;
+        response.await.context("Mac sign-in canceled")
     }
 }
 

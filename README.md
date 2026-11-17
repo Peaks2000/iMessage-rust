@@ -21,7 +21,7 @@ The Sequoia layout includes animated conversation selection, message arrival, th
 
 The engine implements Apple Account sign-in with SMS verification, the Apple courier connection, IDS address lookup and legacy registration, and the legacy encrypted text format for one-to-one conversations. The desktop can request a new APNs identity and obtain fresh device validation and Anisette from a configured Mac or Hackintosh helper. Live Apple activation, SMS delivery, registration, and iMessage delivery have yet to be verified with an Apple Account.
 
-Open **Settings → This Computer → Set Up Apple Account** and choose a prepared Apple device profile. The on-device path generates fresh Anisette headers on Linux, uses the profile’s Apple validation proofs, and handles sign-in and SMS directly. The Linux app keeps the resulting session in Secret Service. A Mac helper or a previously registered session can also be used. [Apple provisioning guide](docs/apple-session.md#on-device-setup)
+Open **Settings → This Computer → Set Up Apple Account**. With a configured local validation helper, Linux prepares the profile and generates fresh Anisette headers during sign-in. **Set Up with a Mac** uses a Mac helper and prompts for the Mac login password when SSH requires it. The Linux app keeps the resulting session in Secret Service. You can also import a previously registered session. [Apple provisioning guide](docs/apple-session.md#on-device-setup)
 
 Supported message content is plain text exchanged with devices that accept the legacy format. Group chats, attachments, SMS, modern iMessage encryption formats, and iCloud history sync remain outside this version. The UI shows when Apple's courier accepted a send. Recipient delivery and read receipts require further work.
 

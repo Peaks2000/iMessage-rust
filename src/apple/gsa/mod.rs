@@ -32,6 +32,12 @@ pub trait SmsPrompts {
     /// Return the zero-based index of the trusted phone to use.
     fn choose_phone(&mut self, phones: &[TrustedPhone]) -> impl Future<Output = Result<usize>>;
     fn read_code(&mut self) -> impl Future<Output = Result<Zeroizing<String>>>;
+    fn ssh_prompt(
+        &mut self,
+        _prompt: super::SshPrompt,
+    ) -> impl Future<Output = Result<Zeroizing<String>>> {
+        async { anyhow::bail!("Mac sign-in needs an interactive SSH prompt") }
+    }
 }
 
 pub async fn login_device_sms(
