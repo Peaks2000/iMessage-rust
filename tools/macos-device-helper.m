@@ -314,6 +314,34 @@ static NSData *validationSession(NSData *challenge) {
     return session;
 }
 
+typedef NSData *(*ValidationExchange)(NSData *);
+
+static const NSUInteger maxValidationFrame = 256 * 1024;
+
+static NSData *readValidationFrame(void) {
+    uint32_t length;
+    if (fread(&length, 1, sizeof(length), stdin) != sizeof(length))
+        fail(@"Incomplete validation frame");
+    length = NSSwapBigIntToHost(length);
+    if (!length || length > maxValidationFrame) fail(@"Invalid validation frame size");
+    NSMutableData *data = [NSMutableData dataWithLength:length];
+    if (fread(data.mutableBytes, 1, length, stdin) != length)
+        fail(@"Incomplete validation frame");
+    return data;
+}
+
+static void writeValidationFrame(NSData *data) {
+    if (!data.length || data.length > maxValidationFrame) fail(@"Invalid validation frame size");
+    uint32_t length = NSSwapHostIntToBig((uint32_t)data.length);
+    emit([NSData dataWithBytes:&length length:sizeof(length)]);
+    emit(data);
+}
+
+static NSData *exchangeValidationSession(NSData *challenge) {
+    writeValidationFrame(challenge);
+    return readValidationFrame();
+}
+
 #if defined(__x86_64__)
 static const char *legacyIDSPath =
     "/System/Library/PrivateFrameworks/IDS.framework/identityservicesd.app/Contents/MacOS/identityservicesd";
@@ -327,7 +355,7 @@ static BOOL hasLegacyIDS(void) {
     return matchesSystemBinary(legacyIDSPath, 5039040, expected);
 }
 
-static NSData *legacyValidation(NSData *certificate) {
+static NSData *legacyValidation(NSData *certificate, ValidationExchange exchange) {
     if (!hasLegacyIDS()) fail(@"This El Capitan identityservicesd build is unsupported");
 
     void *handle = dlopen(legacyIDSPath, RTLD_LAZY | RTLD_LOCAL | RTLD_FIRST);
@@ -352,7 +380,7 @@ static NSData *legacyValidation(NSData *certificate) {
     NSData *challenge = [NSData dataWithBytes:bytes length:(NSUInteger)length];
     releaseBytes(bytes);
 
-    NSData *session = validationSession(challenge);
+    NSData *session = exchange(challenge);
     if (establish(context, session.bytes, (int)session.length) != 0)
         fail(@"El Capitan rejected Apple's validation response");
     bytes = NULL;
@@ -378,11 +406,9 @@ static NSString *validationStatus(void) {
     return nativeValidationClass() ? @"ready" : @"no-native-validation";
 }
 
-static NSData *validationProof(void) {
-    NSData *certificate = appleRequest(@"https://static.ess.apple.com/identity/validation/cert-1.0.plist", nil)[@"cert"];
-    if (![certificate isKindOfClass:[NSData class]] || !certificate.length) fail(@"Apple omitted the device validation certificate");
+static NSData *validationProofWith(NSData *certificate, ValidationExchange exchange) {
 #if defined(__x86_64__)
-    if (isElCapitan()) return legacyValidation(certificate);
+    if (isElCapitan()) return legacyValidation(certificate, exchange);
 #endif
     Class type = nativeValidationClass();
     if (!type) fail(@"This macOS version lacks the native device validation context");
@@ -423,13 +449,19 @@ static NSData *validationProof(void) {
         }
     }
     if (!sign) fail(@"The Mac could not create an Apple validation challenge");
-    NSData *session = validationSession(requestBytes);
+    NSData *session = exchange(requestBytes);
     NSError *error = nil;
     if (!((BOOL (*)(id, SEL, id, NSError *__autoreleasing *))objc_msgSend)(context, establish, session, &error))
         fail(@"The Mac rejected Apple's validation response");
     NSData *signature = dataOperation(context, sign, nil);
     if (!signature.length) fail(@"macOS could not produce the requested validation data");
     return signature;
+}
+
+static NSData *validationProof(void) {
+    NSData *certificate = appleRequest(@"https://static.ess.apple.com/identity/validation/cert-1.0.plist", nil)[@"cert"];
+    if (![certificate isKindOfClass:[NSData class]] || !certificate.length) fail(@"Apple omitted the device validation certificate");
+    return validationProofWith(certificate, validationSession);
 }
 
 static void exportLocal(NSString *output) {
@@ -477,6 +509,8 @@ int main(int argc, char *argv[]) {
         else if ([operation isEqual:@"activation-sign"]) activationSign();
         else if ([operation isEqual:@"validation-status"])
             emit([validationStatus() dataUsingEncoding:NSUTF8StringEncoding]);
+        else if ([operation isEqual:@"validation-exchange"])
+            writeValidationFrame(validationProofWith(readValidationFrame(), exchangeValidationSession));
         else if ([operation isEqual:@"validation"]) emit([validationProof() base64EncodedDataWithOptions:0]);
         else fail(@"Expected describe, anisette, activation-sign, validation, or export-local FILE");
     }

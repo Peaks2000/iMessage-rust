@@ -23,7 +23,7 @@ use super::{
     aps::enroll_push_token,
     certified_rsa,
     gsa::{Anisette, SmsPrompts, login, validate_login},
-    http::{client_builder, plist_xml, read_response},
+    http::{apple_client, client_builder, plist_xml, read_response},
     local_adi::LocalAdi,
     provider_command,
     registration::DeviceRegistration,
@@ -32,6 +32,10 @@ use super::{
 use crate::{address, now_ms, storage};
 
 const ACTIVATE: &str = "https://albert.apple.com/deviceservices/deviceActivation?device=MacOS";
+const VALIDATION_CERTIFICATE: &str =
+    "https://static.ess.apple.com/identity/validation/cert-1.0.plist";
+const VALIDATION_SESSION: &str =
+    "https://identity.ess.apple.com/WebObjects/TDIdentityService.woa/wa/initializeValidation";
 const MAX_HELPER_OUTPUT: u64 = 96 * 1024;
 const MAC_IDS_PROTOCOL: u32 = 1660;
 
@@ -64,7 +68,10 @@ impl AutomaticSetup {
         })
         .context("Enter a registered iMessage email address or international phone number")?;
         validate_login(account, &password)?;
-        let use_local_adi = matches!(self.connection, DeviceConnection::OnDeviceHelper(_));
+        let use_local_adi = matches!(
+            self.connection,
+            DeviceConnection::MacOverSsh(_) | DeviceConnection::OnDeviceHelper(_)
+        );
         let provider = match self.connection {
             DeviceConnection::MacOverSsh(host) => {
                 let mac = MacConnection::open(root, &host, prompts).await?;
@@ -209,6 +216,36 @@ impl DeviceProvider {
     }
 
     pub(super) async fn validation(&self) -> Result<Data> {
+        if let Self::MacOverSsh(connection) = self {
+            let client = apple_client()?;
+            let reply = validation_reply(client.get(VALIDATION_CERTIFICATE)).await?;
+            let certificate = validation_field(&reply, "cert")?;
+            let proof = connection
+                .validation_exchange(certificate, async |challenge| {
+                    let request = plist_xml(&Dictionary::from_iter([(
+                        "session-info-request",
+                        Value::Data(challenge.to_vec()),
+                    )]))?;
+                    let reply = validation_reply(
+                        client
+                            .post(VALIDATION_SESSION)
+                            .header("content-type", "application/x-apple-plist")
+                            .body(request.to_vec()),
+                    )
+                    .await?;
+                    ensure!(
+                        reply.get("status").is_none_or(|status| {
+                            status.as_signed_integer() == Some(0) || status.as_string() == Some("0")
+                        }),
+                        "Apple rejected the Mac validation challenge"
+                    );
+                    Ok(Zeroizing::new(
+                        validation_field(&reply, "session-info")?.to_vec(),
+                    ))
+                })
+                .await?;
+            return Ok(Data::new(proof.to_vec()));
+        }
         let bytes = self.call("validation", &[], MAX_HELPER_OUTPUT).await?;
         let proof = Zeroizing::new(
             STANDARD
@@ -263,6 +300,28 @@ impl DeviceProvider {
             .context("The device helper returned an invalid activation signature")?;
         Ok(signed)
     }
+}
+
+async fn validation_reply(request: reqwest::RequestBuilder) -> Result<Dictionary> {
+    let response = request
+        .send()
+        .await
+        .context("Could not reach Apple's device validation service from Linux")?;
+    ensure!(
+        response.status().is_success(),
+        "Apple's device validation service returned HTTP {}",
+        response.status().as_u16()
+    );
+    let reply = read_response(response).await?;
+    plist::from_bytes(&reply).context("Apple returned an invalid device validation response")
+}
+
+fn validation_field<'a>(reply: &'a Dictionary, field: &str) -> Result<&'a [u8]> {
+    reply
+        .get(field)
+        .and_then(Value::as_data)
+        .filter(|bytes| !bytes.is_empty())
+        .with_context(|| format!("Apple omitted {field} from its device validation response"))
 }
 
 #[derive(Deserialize)]

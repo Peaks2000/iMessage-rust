@@ -21,6 +21,7 @@ const SSH: &str = "/usr/bin/ssh";
 const ASKPASS_SOCKET: &str = "IMESSAGE_SSH_ASKPASS_SOCKET";
 const MAX_PROMPT: u64 = 8 * 1024;
 const MAX_RESPONSE: u64 = 1023;
+const MAX_VALIDATION_FRAME: usize = 256 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(180);
 const HELPER: &[u8] = include_bytes!("../../tools/macos-device-helper");
 const INSTALL_HELPER: &str = r#"
@@ -183,6 +184,44 @@ impl MacConnection {
             .with_context(|| format!("The Mac could not complete the {operation} step"))
     }
 
+    pub(super) async fn validation_exchange(
+        &self,
+        certificate: &[u8],
+        reply: impl AsyncFnOnce(&[u8]) -> Result<Zeroizing<Vec<u8>>>,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        timeout(Duration::from_secs(50), async {
+            let mut helper = Command::new(SSH)
+                .args(self.arguments("~/.local/bin/imessage-mac-device validation-exchange")?)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .context("Could not start the Mac validation helper")?;
+            let mut input = helper
+                .stdin
+                .take()
+                .context("Mac validation input is unavailable")?;
+            let mut output = helper
+                .stdout
+                .take()
+                .context("Mac validation output is unavailable")?;
+
+            let proof =
+                exchange_validation_frames(&mut input, &mut output, certificate, reply).await?;
+            drop(input);
+
+            let mut trailing = [0];
+            ensure!(
+                output.read(&mut trailing).await? == 0 && helper.wait().await?.success(),
+                "The Mac validation helper failed after producing its reply"
+            );
+            Ok(proof)
+        })
+        .await
+        .context("Mac device validation timed out")?
+    }
+
     async fn command(
         &self,
         remote: &str,
@@ -190,31 +229,79 @@ impl MacConnection {
         input: &[u8],
         maximum: u64,
     ) -> Result<Zeroizing<Vec<u8>>> {
-        let socket = self
-            .control
-            .to_str()
-            .context("Invalid SSH control socket path")?;
         provider_command::run(
             Path::new(SSH),
-            &[
-                "-T",
-                "-S",
-                socket,
-                "-oControlMaster=no",
-                "-oBatchMode=yes",
-                "-oProxyCommand=/usr/bin/false",
-                "-oForwardAgent=no",
-                "-oForwardX11=no",
-                "--",
-                &self.host,
-                remote,
-            ],
+            &self.arguments(remote)?,
             description,
             input,
             maximum,
         )
         .await
     }
+
+    fn arguments<'a>(&'a self, remote: &'a str) -> Result<[&'a str; 11]> {
+        let socket = self
+            .control
+            .to_str()
+            .context("Invalid SSH control socket path")?;
+        Ok([
+            "-T",
+            "-S",
+            socket,
+            "-oControlMaster=no",
+            "-oBatchMode=yes",
+            "-oProxyCommand=/usr/bin/false",
+            "-oForwardAgent=no",
+            "-oForwardX11=no",
+            "--",
+            &self.host,
+            remote,
+        ])
+    }
+}
+
+async fn exchange_validation_frames(
+    input: &mut (impl tokio::io::AsyncWrite + Unpin),
+    output: &mut (impl tokio::io::AsyncRead + Unpin),
+    certificate: &[u8],
+    reply: impl AsyncFnOnce(&[u8]) -> Result<Zeroizing<Vec<u8>>>,
+) -> Result<Zeroizing<Vec<u8>>> {
+    write_validation_frame(input, certificate).await?;
+    let challenge = read_validation_frame(output)
+        .await
+        .context("The Mac could not create a device validation challenge")?;
+    let session = reply(&challenge).await?;
+    write_validation_frame(input, &session).await?;
+    input.shutdown().await?;
+    read_validation_frame(output)
+        .await
+        .context("The Mac could not produce a device validation proof")
+}
+
+async fn write_validation_frame(
+    output: &mut (impl tokio::io::AsyncWrite + Unpin),
+    data: &[u8],
+) -> Result<()> {
+    ensure!(
+        (1..=MAX_VALIDATION_FRAME).contains(&data.len()),
+        "Invalid Mac validation request length"
+    );
+    output.write_u32(data.len() as u32).await?;
+    output.write_all(data).await?;
+    Ok(())
+}
+
+async fn read_validation_frame(
+    input: &mut (impl tokio::io::AsyncRead + Unpin),
+) -> Result<Zeroizing<Vec<u8>>> {
+    let length = input.read_u32().await? as usize;
+    ensure!(
+        (1..=MAX_VALIDATION_FRAME).contains(&length),
+        "Invalid Mac validation response length"
+    );
+    let mut data = Zeroizing::new(vec![0; length]);
+    input.read_exact(&mut data).await?;
+    Ok(data)
 }
 
 fn checked_host(host: &str) -> Result<&str> {
@@ -301,4 +388,50 @@ pub fn run_ssh_askpass() -> Result<bool> {
     output.write_all(answer.as_bytes())?;
     output.write_all(b"\n")?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{duplex, split};
+
+    #[tokio::test]
+    async fn validation_waits_for_the_linux_session_reply_and_bounds_frames() -> Result<()> {
+        let (linux, mut mac) = duplex(5);
+        let (mut output, mut input) = split(linux);
+        let exchange = exchange_validation_frames(
+            &mut input,
+            &mut output,
+            b"Apple certificate",
+            async |challenge| {
+                assert_eq!(challenge, b"Mac challenge");
+                Ok(Zeroizing::new(b"Apple session".to_vec()))
+            },
+        );
+        let native_helper = async {
+            assert_eq!(
+                read_validation_frame(&mut mac).await?.as_slice(),
+                b"Apple certificate"
+            );
+            write_validation_frame(&mut mac, b"Mac challenge").await?;
+            assert_eq!(
+                read_validation_frame(&mut mac).await?.as_slice(),
+                b"Apple session"
+            );
+            write_validation_frame(&mut mac, b"Mac proof").await
+        };
+        let (proof, ()) = timeout(Duration::from_secs(2), async {
+            tokio::try_join!(exchange, native_helper)
+        })
+        .await??;
+        assert_eq!(proof.as_slice(), b"Mac proof");
+
+        let oversized = (MAX_VALIDATION_FRAME as u32 + 1).to_be_bytes();
+        assert!(
+            read_validation_frame(&mut oversized.as_slice())
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
 }

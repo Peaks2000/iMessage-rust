@@ -295,7 +295,7 @@ impl Api {
         };
         let path = path
             .canonicalize()
-            .context("The local Anisette library is missing. See the on-device setup guide")?;
+            .context("The local Anisette library is missing. See docs/apple-session.md")?;
         let metadata = path.metadata()?;
         use std::os::unix::fs::PermissionsExt as _;
         ensure!(
@@ -396,7 +396,7 @@ mod tests {
             client: apple_client()?,
             keyring: String::new(),
             client_info:
-                "<MacBookPro18,3> <macOS;15.7;24G222> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+                "<MacBookPro11,1> <macOS;10.11.6;15G22010> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
                     .into(),
             device_id: uuid::Uuid::new_v4().to_string().to_uppercase(),
             serial: String::new(),
