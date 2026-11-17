@@ -7,6 +7,8 @@ use eframe::egui;
 mod chrome;
 #[path = "messages/connection.rs"]
 mod connection;
+#[path = "messages/mac_setup.rs"]
+mod mac_setup;
 #[path = "messages/session_import.rs"]
 mod session_import;
 #[path = "messages/window.rs"]
@@ -18,12 +20,18 @@ struct Args {
     /// Start with sample conversations for this launch
     #[arg(long)]
     demo: bool,
+    /// Open the optional Mac-assisted setup
+    #[arg(long, conflicts_with = "demo")]
+    mac_setup: bool,
     /// Override the per-user data directory
     #[arg(long)]
     data_dir: Option<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
+    if linux_imessage::apple::run_ssh_askpass()? {
+        return Ok(());
+    }
     let args = Args::parse();
     let root = linux_imessage::storage::private_dir(
         &args
@@ -47,6 +55,7 @@ fn main() -> anyhow::Result<()> {
                 &context.egui_ctx,
                 root,
                 args.demo,
+                args.mac_setup,
             )))
         }),
     )

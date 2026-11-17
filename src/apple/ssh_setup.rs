@@ -62,7 +62,11 @@ impl MacConnection {
         let control = directory.path().join("control");
         let socket = directory.path().join("askpass");
         let listener = UnixListener::bind(&socket)?;
-        let mut master = Command::new(SSH)
+        let mut command = Command::new(SSH);
+        if prompts.prefers_ssh_password() {
+            command.arg("-oPreferredAuthentications=password,keyboard-interactive,publickey");
+        }
+        let mut master = command
             .args(["-N", "-T", "-M", "-S"])
             .arg(&control)
             .arg("-o")

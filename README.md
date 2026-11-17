@@ -19,7 +19,7 @@ The Sequoia layout includes animated conversation selection, message arrival, th
 
 ## Connect to iMessage
 
-The desktop opens any registered iMessage session saved in Linux Secret Service and connects directly to Apple. First-time device activation from the Linux desktop is unavailable. If you already have a compatible session, you can restore it from **Settings → This Computer → Import Registered Session**. [Session format](docs/apple-session.md#import-a-registered-session)
+The desktop opens any registered iMessage session saved in Linux Secret Service and connects directly to Apple. First-time device activation from Linux alone is unavailable. If you already have a compatible session, you can restore it from **Settings → This Computer → Import Registered Session**. [Session format](docs/apple-session.md#import-a-registered-session)
 
 Supported message content is plain text exchanged with devices that accept the legacy format. Group chats, attachments, SMS, modern iMessage encryption formats, and iCloud history sync remain outside this version. The UI shows when Apple's courier accepted a send. Recipient delivery and read receipts require further work.
 

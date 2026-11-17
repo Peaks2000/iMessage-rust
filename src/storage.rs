@@ -112,6 +112,22 @@ pub(crate) fn save_activation(account: &str, bytes: &[u8]) -> Result<()> {
         .context("Could not save the Apple push identity to Linux Secret Service")
 }
 
+pub fn check_desktop_session_storage(root: &Path) -> Result<()> {
+    ensure!(
+        !root.join("apple-session.enc").exists(),
+        "This data directory uses an encrypted server vault. Connect in Server mode to use it"
+    );
+    match entry(&format!("apple:{}", root.display()))?.get_secret() {
+        Ok(secret) => drop(Zeroizing::new(secret)),
+        Err(keyring::Error::NoEntry) => {}
+        Err(error) => {
+            return Err(error)
+                .context("Could not access Linux Secret Service for Apple session storage");
+        }
+    }
+    Ok(())
+}
+
 pub fn import_session(root: &Path, source: &Path, key_file: Option<&Path>) -> Result<()> {
     let bytes = read_private(source)?;
     save_session(root, &bytes, key_file)

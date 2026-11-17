@@ -1,10 +1,24 @@
 # Apple iMessage sessions
 
-The Linux desktop opens a saved iMessage registration from Linux Secret Service and connects directly to Apple. First-time device registration from the desktop is unavailable. Apple Account authentication and SMS verification alone do not provide the push identity and device validation needed by Apple's iMessage registration service.
+The Linux desktop opens a saved iMessage registration from Linux Secret Service and connects directly to Apple. First-time device registration using Linux alone is unavailable. Apple Account authentication and SMS verification alone do not provide the push identity and device validation needed by Apple's iMessage registration service.
 
 Open **Settings → This Computer → Import Registered Session** if you already have a compatible registered session. Linux Secret Service stores the session for future launches. The command-line tools below are available for already provisioned devices.
 
 Use a private directory and give only your user access to any imported plist. Setup accepts binary and XML property lists. Use plist `data` values for certificates and private keys.
+
+## Optional Mac-assisted setup
+
+Right-click the **iMessage** launcher and choose **Set Up with a Mac**, or run `imessage --mac-setup`. The form has separate fields for the Mac SSH address, Mac login password, Apple Account and Apple Account password. The Mac password is optional for SSH key users. The app uses it only for SSH authentication and keeps it in memory during setup.
+
+On the Mac, enable **Remote Login** for your user. Build the device helper with the Xcode command-line tools.
+
+```sh
+install -d -m 700 "$HOME/.local/bin" "$HOME/Library/Application Support/LinuxMessages"
+xcrun clang -fobjc-arc -framework Foundation tools/macos-device-helper.m \
+  -o "$HOME/.local/bin/imessage-mac-device"
+```
+
+Place your authorised Apple-issued FairPlay activation chain (`activation-chain.pem`) and matching owner-only RSA private key (`activation-key.pem`) in `~/Library/Application Support/LinuxMessages` on the Mac. Apple validates those credentials before it issues a push certificate. The helper uses the Mac's validation framework for device proofs. On first SSH connection, compare the fingerprint with the appropriate public host key in `/etc/ssh` on the Mac.
 
 ## Import a registered session
 

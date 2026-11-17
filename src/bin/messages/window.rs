@@ -18,6 +18,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use super::{
     connection::{Action, Connection, Event, Mode, Settings},
+    mac_setup::{MacSetup, Outcome as MacOutcome},
     session_import::{Outcome as ImportOutcome, SessionImport},
 };
 
@@ -41,6 +42,7 @@ pub struct MessagesApp {
     config: Settings,
     settings: Option<SettingsForm>,
     session_import: Option<SessionImport>,
+    mac_setup: Option<MacSetup>,
     local_unregistered: bool,
     connection: Option<Connection>,
     candidate: Option<Connection>,
@@ -82,7 +84,7 @@ impl Drop for SettingsForm {
 }
 
 impl MessagesApp {
-    pub fn new(ctx: &egui::Context, root: PathBuf, demo: bool) -> Self {
+    pub fn new(ctx: &egui::Context, root: PathBuf, demo: bool, mac_setup: bool) -> Self {
         chrome::theme(ctx);
         let (mut config, error) = match Settings::read(&root) {
             Ok(config) => (config, None),
@@ -91,21 +93,24 @@ impl MessagesApp {
         if demo {
             config.mode = Mode::Demo;
         }
-        let candidate = Connection::start(
-            ctx,
-            root.clone(),
-            config.clone(),
-            None,
-            Zeroizing::new(String::new()),
-            None,
-        );
+        let candidate = (!mac_setup).then(|| {
+            Connection::start(
+                ctx,
+                root.clone(),
+                config.clone(),
+                None,
+                Zeroizing::default(),
+                None,
+            )
+        });
         Self {
             root,
             config,
             settings: None,
             session_import: None,
+            mac_setup: mac_setup.then(MacSetup::new),
             local_unregistered: false,
-            candidate: Some(candidate),
+            candidate,
             connection: None,
             status: None,
             error,
@@ -1132,27 +1137,57 @@ impl MessagesApp {
             ImportOutcome::Closed => self.session_import = None,
             ImportOutcome::Saved => {
                 self.session_import = None;
-                self.local_unregistered = false;
-                if let Some(form) = &mut self.settings {
-                    form.config.mode = Mode::Local;
-                    form.error = None;
-                    let old = if self.config.mode == Mode::Local {
-                        self.status = None;
-                        self.connection.take()
-                    } else {
-                        None
-                    };
-                    self.candidate = Some(Connection::start(
-                        ctx,
-                        self.root.clone(),
-                        form.config.clone(),
-                        Some(self.config.clone()),
-                        Zeroizing::new(String::new()),
-                        old,
-                    ));
-                }
+                self.open_saved_session(ctx);
             }
         }
+    }
+
+    fn mac_setup_dialog(&mut self, ctx: &egui::Context) {
+        let Some(setup) = &mut self.mac_setup else {
+            return;
+        };
+        match setup.show(ctx, &self.root) {
+            MacOutcome::Open => {}
+            MacOutcome::Closed => {
+                self.mac_setup = None;
+                self.candidate = Some(Connection::start(
+                    ctx,
+                    self.root.clone(),
+                    self.config.clone(),
+                    None,
+                    Zeroizing::default(),
+                    None,
+                ));
+            }
+            MacOutcome::Saved => {
+                self.mac_setup = None;
+                self.open_saved_session(ctx);
+            }
+        }
+    }
+
+    fn open_saved_session(&mut self, ctx: &egui::Context) {
+        self.local_unregistered = false;
+        if self.settings.is_none() {
+            self.open_settings();
+        }
+        let form = self.settings.as_mut().expect("Settings initialized");
+        form.config.mode = Mode::Local;
+        form.error = None;
+        let old = if self.config.mode == Mode::Local {
+            self.status = None;
+            self.connection.take()
+        } else {
+            None
+        };
+        self.candidate = Some(Connection::start(
+            ctx,
+            self.root.clone(),
+            form.config.clone(),
+            Some(self.config.clone()),
+            Zeroizing::default(),
+            old,
+        ));
     }
 
     fn settings_dialog(&mut self, ctx: &egui::Context) {
@@ -1301,7 +1336,7 @@ impl eframe::App for MessagesApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process(ctx);
-        if self.settings.is_none() {
+        if self.settings.is_none() && self.mac_setup.is_none() {
             if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::N)) {
                 self.start_compose();
             }
@@ -1318,7 +1353,9 @@ impl eframe::App for MessagesApp {
         }
         self.sidebar(ctx);
         self.right_panel(ctx);
-        if self.session_import.is_some() {
+        if self.mac_setup.is_some() {
+            self.mac_setup_dialog(ctx);
+        } else if self.session_import.is_some() {
             self.import_dialog(ctx);
         } else {
             self.settings_dialog(ctx);
