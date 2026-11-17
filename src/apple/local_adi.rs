@@ -21,6 +21,8 @@ use super::{
 use crate::storage;
 
 const LOOKUP: &str = "https://gsa.apple.com/grandslam/GsService2/lookup";
+// GrandSlam recognizes the AuthKit user agent with its CFNetwork product token.
+const AUTHKIT_USER_AGENT: &str = "akd/1.0 CFNetwork/808.1.4";
 const BUFFER: usize = 4096;
 type Begin = unsafe extern "C" fn(
     *const u8,
@@ -156,7 +158,7 @@ impl LocalAdi {
             ("X-Apple-I-SRL-NO", self.serial.clone()),
             ("X-Apple-I-TimeZone", "UTC".to_owned()),
             ("X-Apple-Locale", "en_US".to_owned()),
-            ("User-Agent", "akd/1.0".to_owned()),
+            ("User-Agent", AUTHKIT_USER_AGENT.to_owned()),
         ];
         let mut bytes = Zeroizing::new(Vec::new());
         serde_json::to_writer(
@@ -417,6 +419,7 @@ mod tests {
         adi.state = Some(adi.provision().await?);
         let headers = adi.headers().await?;
         let document: serde_json::Value = serde_json::from_slice(&headers)?;
+        assert_eq!(document["User-Agent"], "akd/1.0 CFNetwork/808.1.4");
         assert_eq!(binary_length(&document, "X-Apple-I-MD")?, 28);
         assert_eq!(binary_length(&document, "X-Apple-I-MD-M")?, 60);
         Ok(())
