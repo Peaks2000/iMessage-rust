@@ -3,12 +3,12 @@ use std::path::PathBuf;
 use clap::Parser;
 use eframe::egui;
 
-#[path = "messages/apple_setup.rs"]
-mod apple_setup;
 #[path = "messages/chrome.rs"]
 mod chrome;
 #[path = "messages/connection.rs"]
 mod connection;
+#[path = "messages/session_import.rs"]
+mod session_import;
 #[path = "messages/window.rs"]
 mod window;
 
@@ -24,9 +24,6 @@ struct Args {
 }
 
 fn main() -> anyhow::Result<()> {
-    if linux_imessage::apple::run_ssh_askpass()? {
-        return Ok(());
-    }
     let args = Args::parse();
     let root = linux_imessage::storage::private_dir(
         &args

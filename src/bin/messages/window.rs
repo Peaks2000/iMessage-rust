@@ -17,8 +17,8 @@ use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
 use super::{
-    apple_setup::{AppleSetup, Method as SetupMethod, Outcome as SetupOutcome},
     connection::{Action, Connection, Event, Mode, Settings},
+    session_import::{Outcome as ImportOutcome, SessionImport},
 };
 
 use super::chrome::{
@@ -28,6 +28,8 @@ use super::chrome::{
 
 const POLL: Duration = Duration::from_secs(4);
 const MOTION: f32 = 0.30;
+const LOCAL_UNREGISTERED: &str =
+    "First-time iMessage activation is unavailable on Linux in this build.";
 const DEMO_PINS: &[&str] = &[
     "mailto:maya@example.com",
     "mailto:elliot@example.com",
@@ -38,7 +40,8 @@ pub struct MessagesApp {
     root: PathBuf,
     config: Settings,
     settings: Option<SettingsForm>,
-    apple_setup: Option<AppleSetup>,
+    session_import: Option<SessionImport>,
+    local_unregistered: bool,
     connection: Option<Connection>,
     candidate: Option<Connection>,
     status: Option<Status>,
@@ -100,7 +103,8 @@ impl MessagesApp {
             root,
             config,
             settings: None,
-            apple_setup: None,
+            session_import: None,
+            local_unregistered: false,
             candidate: Some(candidate),
             connection: None,
             status: None,
@@ -140,6 +144,9 @@ impl MessagesApp {
                     if let Some(form) = self.settings.take() {
                         self.config = form.config.clone();
                     }
+                    if self.config.mode == Mode::Local {
+                        self.local_unregistered = false;
+                    }
                     self.status = Some(status);
                     self.pins = self.read_pins();
                     self.chats.clear();
@@ -155,6 +162,10 @@ impl MessagesApp {
                     self.loading_older = false;
                     self.sending = false;
                     self.refresh_at = Instant::now();
+                }
+                Event::LocalUnregistered => {
+                    self.candidate = None;
+                    self.local_unregistered = true;
                 }
                 Event::ConnectionError(error) => {
                     self.candidate = None;
@@ -258,7 +269,7 @@ impl MessagesApp {
                     self.status = None;
                     self.error = Some(error);
                 }
-                Event::Ready(_) => {}
+                Event::Ready(_) | Event::LocalUnregistered => {}
             }
         }
         if Instant::now() >= self.refresh_at
@@ -351,6 +362,9 @@ impl MessagesApp {
     }
 
     fn start_compose(&mut self) {
+        if self.config.mode == Mode::Local && self.local_unregistered {
+            return;
+        }
         self.composing = Some(String::new());
         self.compose_error = None;
         self.focus_recipient = true;
@@ -612,6 +626,18 @@ impl MessagesApp {
                     ui.centered_and_justified(|ui| {
                         let label = if self.candidate.is_some() {
                             "Connecting…"
+                        } else if self.config.mode == Mode::Local && self.local_unregistered {
+                            LOCAL_UNREGISTERED
+                        } else if self.config.mode == Mode::Local {
+                            self.error
+                                .as_deref()
+                                .or_else(|| {
+                                    self.status
+                                        .as_ref()
+                                        .filter(|status| !status.connected)
+                                        .map(|status| status.detail.as_str())
+                                })
+                                .unwrap_or("No Conversation Selected")
                         } else {
                             self.error.as_deref().unwrap_or("No Conversation Selected")
                         };
@@ -1097,15 +1123,16 @@ impl MessagesApp {
         self.status.as_ref().is_some_and(|status| status.demo)
     }
 
-    fn setup_dialog(&mut self, ctx: &egui::Context) {
-        let Some(setup) = &mut self.apple_setup else {
+    fn import_dialog(&mut self, ctx: &egui::Context) {
+        let Some(import) = &mut self.session_import else {
             return;
         };
-        match setup.show(ctx, &self.root) {
-            SetupOutcome::Open => {}
-            SetupOutcome::Closed => self.apple_setup = None,
-            SetupOutcome::Saved => {
-                self.apple_setup = None;
+        match import.show(ctx, &self.root) {
+            ImportOutcome::Open => {}
+            ImportOutcome::Closed => self.session_import = None,
+            ImportOutcome::Saved => {
+                self.session_import = None;
+                self.local_unregistered = false;
                 if let Some(form) = &mut self.settings {
                     form.config.mode = Mode::Local;
                     form.error = None;
@@ -1133,7 +1160,7 @@ impl MessagesApp {
             return;
         };
         let mut apply = false;
-        let mut setup = None;
+        let mut import = false;
         let mut cancel = false;
         let connecting = self.candidate.is_some();
         let panel = egui::Modal::new(egui::Id::new("settings"))
@@ -1161,33 +1188,24 @@ impl MessagesApp {
                             );
                         }
                         Mode::Local => {
-                            ui.label(
-                                RichText::new(
-                                    "Use an Apple device session to run iMessage on this computer.",
+                            let label = if self.local_unregistered {
+                                LOCAL_UNREGISTERED
+                            } else if self.config.mode == Mode::Local {
+                                self.status.as_ref().map_or(
+                                    "Connect directly to Apple using a registered session.",
+                                    |status| status.detail.as_str(),
                                 )
-                                .color(MUTED),
-                            );
+                            } else {
+                                "Connect directly to Apple using a registered session."
+                            };
+                            ui.label(RichText::new(label).color(MUTED));
                             ui.add_space(3.);
-                            ui.horizontal(|ui| {
-                                if ui
-                                    .add_enabled(
-                                        !self.sending,
-                                        egui::Button::new("Set Up Apple Account…"),
-                                    )
-                                    .clicked()
-                                {
-                                    setup = Some(SetupMethod::OnDevice);
-                                }
-                                if ui
-                                    .add_enabled(
-                                        !self.sending,
-                                        egui::Button::new("Import Session…"),
-                                    )
-                                    .clicked()
-                                {
-                                    setup = Some(SetupMethod::Import);
-                                }
-                            });
+                            import = ui
+                                .add_enabled(
+                                    !self.sending,
+                                    egui::Button::new("Import Registered Session…"),
+                                )
+                                .clicked();
                         }
                         Mode::Remote => {
                             settings_field(
@@ -1248,15 +1266,16 @@ impl MessagesApp {
                         .clicked();
                 });
             });
-        if let Some(method) = setup {
+        if import {
             form.error = None;
-            self.apple_setup = Some(AppleSetup::new(method, &self.root));
+            self.session_import = Some(SessionImport::default());
         } else if (cancel || panel.should_close()) && !connecting {
             self.settings = None;
         } else if apply {
             if form.config.mode != Mode::Remote
                 && form.config == self.config
-                && self.connection.is_some()
+                && (self.connection.is_some()
+                    || (self.config.mode == Mode::Local && self.local_unregistered))
             {
                 self.settings = None;
                 return;
@@ -1299,8 +1318,8 @@ impl eframe::App for MessagesApp {
         }
         self.sidebar(ctx);
         self.right_panel(ctx);
-        if self.apple_setup.is_some() {
-            self.setup_dialog(ctx);
+        if self.session_import.is_some() {
+            self.import_dialog(ctx);
         } else {
             self.settings_dialog(ctx);
         }

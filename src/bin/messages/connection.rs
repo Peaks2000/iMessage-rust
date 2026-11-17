@@ -15,8 +15,8 @@ use zeroize::Zeroizing;
 #[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
-    #[default]
     Demo,
+    #[default]
     Local,
     Remote,
 }
@@ -33,7 +33,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            mode: Mode::Demo,
+            mode: Mode::Local,
             url: "http://127.0.0.1:7848".into(),
             username: String::new(),
             remember: false,
@@ -67,6 +67,7 @@ pub enum Action {
 
 pub enum Event {
     Ready(Status),
+    LocalUnregistered,
     ConnectionError(String),
     Refresh {
         status: Status,
@@ -136,9 +137,11 @@ fn run(
     mut password: Zeroizing<String>,
 ) -> Result<()> {
     let identity = if settings.mode == Mode::Local {
-        Some(storage::load_session(root, None).context(
-            "Could not open the Apple device session. Use Apple Account Setup or Import Session in Settings",
-        )?)
+        let Some(identity) = storage::load_local_session(root)? else {
+            emit(events, context, Event::LocalUnregistered);
+            return Ok(());
+        };
+        Some(identity)
     } else {
         None
     };

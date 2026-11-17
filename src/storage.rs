@@ -112,22 +112,6 @@ pub(crate) fn save_activation(account: &str, bytes: &[u8]) -> Result<()> {
         .context("Could not save the Apple push identity to Linux Secret Service")
 }
 
-pub fn check_desktop_session_storage(root: &Path) -> Result<()> {
-    ensure!(
-        !root.join("apple-session.enc").exists(),
-        "This data directory uses an encrypted server vault. Connect in Server mode to use it"
-    );
-    match entry(&format!("apple:{}", root.display()))?.get_secret() {
-        Ok(secret) => drop(Zeroizing::new(secret)),
-        Err(keyring::Error::NoEntry) => {}
-        Err(error) => {
-            return Err(error)
-                .context("Could not access Linux Secret Service for Apple session storage");
-        }
-    }
-    Ok(())
-}
-
 pub fn import_session(root: &Path, source: &Path, key_file: Option<&Path>) -> Result<()> {
     let bytes = read_private(source)?;
     save_session(root, &bytes, key_file)
@@ -166,37 +150,46 @@ pub fn save_session(root: &Path, bytes: &[u8], key_file: Option<&Path>) -> Resul
     }
 }
 
+/// Load a registered desktop session. A clean installation has no keyring entry.
+pub fn load_local_session(root: &Path) -> Result<Option<crate::apple::Identity>> {
+    ensure!(
+        !root.join("apple-session.enc").exists(),
+        "Supply the vault key file for this data directory"
+    );
+    match entry(&format!("apple:{}", root.display()))?.get_secret() {
+        Ok(secret) => Ok(Some(crate::apple::Identity::parse(&Zeroizing::new(
+            secret,
+        ))?)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => {
+            Err(error).context("Could not read the Apple session from Linux Secret Service")
+        }
+    }
+}
+
 pub fn load_session(root: &Path, key_file: Option<&Path>) -> Result<crate::apple::Identity> {
-    let vault = root.join("apple-session.enc");
-    let secret = match key_file {
-        Some(path) => {
-            let key = read_private(path)?;
-            ensure!(key.len() == 32, "The vault key must be 32 raw bytes");
-            let blob = read_private(&vault)?;
-            ensure!(
-                blob.len() > 32 && blob.starts_with(b"LIM1"),
-                "Unrecognized vault format"
-            );
-            Zeroizing::new(
-                decrypt_aead(
-                    Cipher::aes_256_gcm(),
-                    &key,
-                    Some(&blob[4..16]),
-                    VAULT_CONTEXT,
-                    &blob[32..],
-                    &blob[16..32],
-                )
-                .context("Could not authenticate the encrypted Apple session")?,
-            )
-        }
-        None => {
-            ensure!(
-                !vault.exists(),
-                "Supply the vault key file for this data directory"
-            );
-            Zeroizing::new(entry(&format!("apple:{}", root.display()))?.get_secret()
-                .context("No Apple session could be read. Run messages-server import-session or use the demo")?)
-        }
+    let Some(path) = key_file else {
+        return load_local_session(root)?
+            .context("There is no registered iMessage session on this computer");
     };
+    let vault = root.join("apple-session.enc");
+    let key = read_private(path)?;
+    ensure!(key.len() == 32, "The vault key must be 32 raw bytes");
+    let blob = read_private(&vault)?;
+    ensure!(
+        blob.len() > 32 && blob.starts_with(b"LIM1"),
+        "Unrecognized vault format"
+    );
+    let secret = Zeroizing::new(
+        decrypt_aead(
+            Cipher::aes_256_gcm(),
+            &key,
+            Some(&blob[4..16]),
+            VAULT_CONTEXT,
+            &blob[32..],
+            &blob[16..32],
+        )
+        .context("Could not authenticate the encrypted Apple session")?,
+    );
     crate::apple::Identity::parse(&secret)
 }

@@ -1,100 +1,10 @@
-# Apple device provisioning
+# Apple iMessage sessions
 
-The Linux engine can sign in to an Apple Account with SMS verification and register a legacy iMessage device. You can also import a previously registered session or register a device using an existing Apple authentication certificate. The on-device desktop flow provisions Anisette and requests APNs activation from Linux. A configured local helper can supply the validation proofs and activation signature as sign-in needs them. An existing device profile can also be imported.
+The Linux desktop opens a saved iMessage registration from Linux Secret Service and connects directly to Apple. First-time device registration from the desktop is unavailable. Apple Account authentication and SMS verification alone do not provide the push identity and device validation needed by Apple's iMessage registration service.
 
-Use a private directory and give only your user access to the input plist. On Linux, you can set this in your file manager under **Properties → Permissions** or use mode `0600`. Setup accepts binary and XML property lists. Use plist `data` values for bytes, including certificates and private keys encoded in DER. In an XML plist, a `data` value holds base64.
+Open **Settings → This Computer → Import Registered Session** if you already have a compatible registered session. Linux Secret Service stores the session for future launches. The command-line tools below are available for already provisioned devices.
 
-## Set up in the desktop app
-
-Open **Settings** with **Ctrl+,** or from the conversation details button. Under **This Computer**, choose one of these options.
-
-- **Set Up Apple Account** opens [on-device setup](#on-device-setup). Select **Set Up with a Mac** for [the Mac helper](#automatic-device-setup) or use **Device Options** to select another device source.
-- **Import Session** opens an existing registered session plist. The session format is described below.
-
-Both options save the session in Linux Secret Service and switch the app to **This Computer**. Browse uses Zenity on Linux when it is available. You can enter file paths directly. The desktop keeps the password and SMS code in memory during sign-in.
-
-## On-device setup
-
-Linux generates Anisette headers locally, handles the Apple Account password and SMS code, and performs Apple push activation and iMessage registration. This path uses native ADI cryptographic code from [apple-auth](https://github.com/apple-auth/apple-auth/tree/98c862f7bebc8283a9b87f1578e703f0765dc81d). Apple still requires fresh validation proofs and push or activation credentials for the device identity.
-
-Install your local validation helper as `device-helper` in the Linux app’s private data directory, set `IMESSAGE_DEVICE_HELPER`, or select the executable under **Device Options**. The app automatically assembles the profile, generates a push key and requests its certificate. It calls the helper for each fresh validation proof during sign-in. You can leave the **Apple device profile** field blank. See the [helper contract](#use-a-local-helper).
-
-### Build the local Anisette library
-
-Install CMake, a C++20 compiler and the development headers for Mbed TLS. Then run the build script on Linux.
-
-```sh
-tools/build-local-adi.sh "$HOME/.local/lib/linux-imessage"
-```
-
-The Rust app looks for the library at that path. An installation with a different library path can set `IMESSAGE_ANISETTE_LIBRARY`.
-
-### Import a previously prepared profile
-
-If you have access to an authorised Mac, configure the activation material and build the [macOS helper](#set-up-the-helper-on-macos). Run this command locally on that Mac.
-
-```sh
-"$HOME/.local/bin/imessage-mac-device" export-local "$HOME/local-device.plist"
-```
-
-Transfer the profile privately and open **Settings → This Computer → Set Up Apple Account** on Linux. Choose the profile, enter your Apple Account and password, then select **Sign In**. To prefill the path, put the file in the Linux app's data directory as `local-device.plist` or set `IMESSAGE_LOCAL_DEVICE`. The file needs mode `0600`. It contains private activation credentials, so keep it private and remove the transferred copy after sign-in. Your registered session and ADI identity are saved in Linux Secret Service.
-
-A profile from another authorised provider can use this format.
-
-| Key | Value |
-| --- | --- |
-| `version` | Integer `1` |
-| `computer` | The same six values returned by `describe` below, including the UUID as a string |
-| `qualification-data` | Fresh Apple device validation proof as plist data for account authorization |
-| `registration-data` | A separate fresh Apple device validation proof as plist data for iMessage registration |
-| `activation` | Dictionary with the PEM certificate `chain` and matching DER RSA signing `key`, both plist data |
-| `push` | Alternative to `activation`. Dictionary with matching DER push `certificate` and RSA `key` as plist data, and an optional 32-byte push `token` |
-
-## Automatic device setup
-
-Use a Mac or a booted Hackintosh you control. The helper uses its actual macOS hardware identity and private system frameworks to get fresh validation data. A Mac with OpenCore uses the identity supplied by its boot configuration. The helper also needs an Apple-issued FairPlay activation certificate chain and its matching private RSA key that you are authorised to use. The supplied helper expects an unencrypted PEM key in an owner-only file, since it runs over SSH without a terminal. Apple checks the signature and decides whether to issue a push certificate.
-
-### Set up the helper on macOS
-
-With the Xcode command-line tools installed, build the helper from this repository on the Mac.
-
-```sh
-install -d -m 700 "$HOME/.local/bin" "$HOME/Library/Application Support/LinuxMessages"
-xcrun clang -fobjc-arc -framework Foundation tools/macos-device-helper.m \
-  -o "$HOME/.local/bin/imessage-mac-device"
-```
-
-Put your activation chain and signing key in the paths below.
-
-| File | Contents |
-| --- | --- |
-| `~/Library/Application Support/LinuxMessages/activation-chain.pem` | Apple FairPlay activation certificate chain in PEM format |
-| `~/Library/Application Support/LinuxMessages/activation-key.pem` | Matching RSA signing key in PEM format, accessible only to your user |
-
-Enable **Remote Login** on the Mac for the macOS user who can access the helper and signing key. The app uses your SSH configuration and recognises keys in your standard known-hosts file. It saves new approvals in its private data directory. On the first connection, compare the fingerprint shown by iMessage against the matching public host key in the Mac’s `/etc/ssh` directory using `ssh-keygen -lf`. If SSH requests a password, use the Mac login password in the separate prompt. SSH keys are optional.
-
-### Sign in from Linux
-
-1. Open **Settings → This Computer → Set Up Apple Account → Set Up with a Mac** and enter the Mac's SSH address or your SSH alias.
-2. Enter your Apple Account and password. If your iMessage address differs from the account name, enter it under **Device Options**.
-3. Select **Sign In**. Choose a trusted phone number and enter Apple's SMS code if prompted.
-
-Linux generates its own push private key, requests a signed push certificate, obtains an APNs token, and saves the push identity to Secret Service for retries. The helper supplies fresh Anisette and hardware validation while Linux completes Apple sign-in and legacy iMessage registration. Apple Account credentials and SMS codes go directly to Apple. The Mac helper handles device validation and activation signing. The Linux app handles messages.
-
-Under **Device Options**, you can select an OpenCore `config.plist` to check that its model, serial number, and UUID match the Mac helper. Use the config for the Hackintosh you are actually running.
-
-### Use a local helper
-
-Under **Device Options**, select a trusted local executable, or configure it with `IMESSAGE_DEVICE_HELPER`. The app also discovers an executable named `device-helper` in its data directory. The executable accepts one operation argument and writes the result to stdout. On-device setup supplies its own Anisette headers.
-
-| Operation | Input and result |
-| --- | --- |
-| `describe` | JSON strings named `model`, `serial`, `uuid`, `os-version`, `build-version`, and `device-name` |
-| `activation-sign` | Reads the Apple activation plist on stdin. Returns JSON strings `certificate-chain` and `signature`, each base64 encoded |
-| `anisette` | Returns fresh provider headers as a JSON object of strings, using the [header contract below](#anisette-helper-contract) |
-| `validation` | Returns base64-encoded validation data from a fresh Apple validation request |
-
-The Linux activation and APNs protocol paths have offline tests. The native helper and full Apple enrollment still need a live end-to-end test on a compatible Mac with authorised signing material.
+Use a private directory and give only your user access to any imported plist. Setup accepts binary and XML property lists. Use plist `data` values for certificates and private keys.
 
 ## Import a registered session
 

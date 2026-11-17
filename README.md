@@ -10,7 +10,7 @@ Build on Linux with Rust 1.88 or newer, a C compiler, pkg-config, and the OpenSS
 
 ```sh
 cargo build --locked --release
-./target/release/messages --demo
+./target/release/messages
 ```
 
 Use the compose icon or **Ctrl+N** to start a conversation. Enter sends and Shift+Enter adds a line break. Open **Settings** with **Ctrl+,** or from the conversation’s details button. Right-click a conversation to pin or unpin it. Demo mode uses local sample conversations and saves messages to a separate demo database.
@@ -19,9 +19,7 @@ The Sequoia layout includes animated conversation selection, message arrival, th
 
 ## Connect to iMessage
 
-The engine implements Apple Account sign-in with SMS verification, the Apple courier connection, IDS address lookup and legacy registration, and the legacy encrypted text format for one-to-one conversations. The desktop can request a new APNs identity and obtain fresh device validation and Anisette from a configured Mac or Hackintosh helper. Live Apple activation, SMS delivery, registration, and iMessage delivery have yet to be verified with an Apple Account.
-
-Open **Settings → This Computer → Set Up Apple Account**. With a configured local validation helper, Linux prepares the profile and generates fresh Anisette headers during sign-in. **Set Up with a Mac** uses a Mac helper and prompts for the Mac login password when SSH requires it. The Linux app keeps the resulting session in Secret Service. You can also import a previously registered session. [Apple provisioning guide](docs/apple-session.md#on-device-setup)
+The desktop opens any registered iMessage session saved in Linux Secret Service and connects directly to Apple. First-time device activation from the Linux desktop is unavailable. If you already have a compatible session, you can restore it from **Settings → This Computer → Import Registered Session**. [Session format](docs/apple-session.md#import-a-registered-session)
 
 Supported message content is plain text exchanged with devices that accept the legacy format. Group chats, attachments, SMS, modern iMessage encryption formats, and iCloud history sync remain outside this version. The UI shows when Apple's courier accepted a send. Recipient delivery and read receipts require further work.
 
