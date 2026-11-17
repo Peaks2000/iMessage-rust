@@ -183,7 +183,7 @@ fn main() -> Result<()> {
 struct TerminalSms;
 
 impl SmsPrompts for TerminalSms {
-    fn choose_phone(&mut self, phones: &[TrustedPhone]) -> Result<usize> {
+    async fn choose_phone(&mut self, phones: &[TrustedPhone]) -> Result<usize> {
         for (index, phone) in phones.iter().enumerate() {
             println!("{}  ••••{}", index + 1, phone.last_two_digits);
         }
@@ -204,7 +204,7 @@ impl SmsPrompts for TerminalSms {
         }
     }
 
-    fn read_code(&mut self) -> Result<Zeroizing<String>> {
+    async fn read_code(&mut self) -> Result<Zeroizing<String>> {
         loop {
             let code = Zeroizing::new(rpassword::prompt_password(
                 "Apple SMS code (press Enter to cancel): ",

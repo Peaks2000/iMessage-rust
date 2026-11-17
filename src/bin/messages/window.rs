@@ -16,7 +16,10 @@ use linux_imessage::{
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
-use super::connection::{Action, Connection, Event, Mode, Settings};
+use super::{
+    apple_setup::{AppleSetup, Method as SetupMethod, Outcome as SetupOutcome},
+    connection::{Action, Connection, Event, Mode, Settings},
+};
 
 use super::chrome::{
     self, BLUE, BUBBLE_GRAY, CANVAS, DANGER, HAIRLINE, INK, Icon, MUTED, SIDEBAR, TOOLBAR,
@@ -35,6 +38,7 @@ pub struct MessagesApp {
     root: PathBuf,
     config: Settings,
     settings: Option<SettingsForm>,
+    apple_setup: Option<AppleSetup>,
     connection: Option<Connection>,
     candidate: Option<Connection>,
     status: Option<Status>,
@@ -90,11 +94,13 @@ impl MessagesApp {
             config.clone(),
             None,
             Zeroizing::new(String::new()),
+            None,
         );
         Self {
             root,
             config,
             settings: None,
+            apple_setup: None,
             candidate: Some(candidate),
             connection: None,
             status: None,
@@ -1091,11 +1097,43 @@ impl MessagesApp {
         self.status.as_ref().is_some_and(|status| status.demo)
     }
 
+    fn setup_dialog(&mut self, ctx: &egui::Context) {
+        let Some(setup) = &mut self.apple_setup else {
+            return;
+        };
+        match setup.show(ctx, &self.root) {
+            SetupOutcome::Open => {}
+            SetupOutcome::Closed => self.apple_setup = None,
+            SetupOutcome::Saved => {
+                self.apple_setup = None;
+                if let Some(form) = &mut self.settings {
+                    form.config.mode = Mode::Local;
+                    form.error = None;
+                    let old = if self.config.mode == Mode::Local {
+                        self.status = None;
+                        self.connection.take()
+                    } else {
+                        None
+                    };
+                    self.candidate = Some(Connection::start(
+                        ctx,
+                        self.root.clone(),
+                        form.config.clone(),
+                        Some(self.config.clone()),
+                        Zeroizing::new(String::new()),
+                        old,
+                    ));
+                }
+            }
+        }
+    }
+
     fn settings_dialog(&mut self, ctx: &egui::Context) {
         let Some(form) = &mut self.settings else {
             return;
         };
         let mut apply = false;
+        let mut setup = None;
         let mut cancel = false;
         let connecting = self.candidate.is_some();
         let panel = egui::Modal::new(egui::Id::new("settings"))
@@ -1115,17 +1153,72 @@ impl MessagesApp {
                     ui.add_space(9.);
                     match form.config.mode {
                         Mode::Demo => {
-                            ui.label(RichText::new("Try Messages with sample conversations on this computer.").color(MUTED));
+                            ui.label(
+                                RichText::new(
+                                    "Try Messages with sample conversations on this computer.",
+                                )
+                                .color(MUTED),
+                            );
                         }
                         Mode::Local => {
-                            ui.label(RichText::new("Run the iMessage engine on this computer. Set up an Apple device session with messages-server login or import-session.").color(MUTED));
-                            ui.hyperlink_to("Apple Account setup", "https://github.com/Peaks2000/linux-imessage/blob/main/docs/apple-session.md");
+                            ui.label(
+                                RichText::new(
+                                    "Use an Apple device session to run iMessage on this computer.",
+                                )
+                                .color(MUTED),
+                            );
+                            ui.add_space(3.);
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add_enabled(
+                                        !self.sending,
+                                        egui::Button::new("Set Up Apple Account…"),
+                                    )
+                                    .clicked()
+                                {
+                                    setup = Some(SetupMethod::SignIn);
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !self.sending,
+                                        egui::Button::new("Import Session…"),
+                                    )
+                                    .clicked()
+                                {
+                                    setup = Some(SetupMethod::Import);
+                                }
+                            });
                         }
                         Mode::Remote => {
-                            settings_field(ui, "Server URL", &mut form.config.url, "https://messages.example.com", false);
-                            settings_field(ui, "Username", &mut form.config.username, "Optional", false);
-                            settings_field(ui, "Password", &mut form.password, if form.config.remember { "Use saved password" } else { "Optional" }, true);
-                            ui.checkbox(&mut form.config.remember, "Remember password in Linux Secret Service");
+                            settings_field(
+                                ui,
+                                "Server URL",
+                                &mut form.config.url,
+                                "https://messages.example.com",
+                                false,
+                            );
+                            settings_field(
+                                ui,
+                                "Username",
+                                &mut form.config.username,
+                                "Optional",
+                                false,
+                            );
+                            settings_field(
+                                ui,
+                                "Password",
+                                &mut form.password,
+                                if form.config.remember {
+                                    "Use saved password"
+                                } else {
+                                    "Optional"
+                                },
+                                true,
+                            );
+                            ui.checkbox(
+                                &mut form.config.remember,
+                                "Remember password in Linux Secret Service",
+                            );
                         }
                     }
                 });
@@ -1135,13 +1228,30 @@ impl MessagesApp {
                 }
                 ui.add_space(9.);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    apply = ui.add_enabled(!connecting && !self.sending, egui::Button::new(
-                        RichText::new(if connecting { "Connecting…" } else { "Done" }).color(Color32::WHITE),
-                    ).fill(BLUE).corner_radius(5).min_size(vec2(70., 25.))).clicked();
-                    cancel = ui.add_enabled(!connecting, egui::Button::new("Cancel").min_size(vec2(65., 25.))).clicked();
+                    apply = ui
+                        .add_enabled(
+                            !connecting && !self.sending,
+                            egui::Button::new(
+                                RichText::new(if connecting { "Connecting…" } else { "Done" })
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(BLUE)
+                            .corner_radius(5)
+                            .min_size(vec2(70., 25.)),
+                        )
+                        .clicked();
+                    cancel = ui
+                        .add_enabled(
+                            !connecting,
+                            egui::Button::new("Cancel").min_size(vec2(65., 25.)),
+                        )
+                        .clicked();
                 });
             });
-        if (cancel || panel.should_close()) && !connecting {
+        if let Some(method) = setup {
+            form.error = None;
+            self.apple_setup = Some(AppleSetup::new(method));
+        } else if (cancel || panel.should_close()) && !connecting {
             self.settings = None;
         } else if apply {
             if form.config.mode != Mode::Remote
@@ -1159,6 +1269,7 @@ impl MessagesApp {
                 form.config.clone(),
                 Some(self.config.clone()),
                 password,
+                None,
             ));
         }
     }
@@ -1188,7 +1299,11 @@ impl eframe::App for MessagesApp {
         }
         self.sidebar(ctx);
         self.right_panel(ctx);
-        self.settings_dialog(ctx);
+        if self.apple_setup.is_some() {
+            self.setup_dialog(ctx);
+        } else {
+            self.settings_dialog(ctx);
+        }
         window_edge(ctx);
     }
 }

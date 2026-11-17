@@ -87,6 +87,7 @@ pub enum Event {
 pub struct Connection {
     pub actions: UnboundedSender<Action>,
     pub events: Receiver<Event>,
+    worker: std::thread::JoinHandle<()>,
 }
 
 impl Connection {
@@ -96,11 +97,19 @@ impl Connection {
         settings: Settings,
         previous: Option<Settings>,
         password: Zeroizing<String>,
+        stop_first: Option<Self>,
     ) -> Self {
         let (actions, receive) = tokio::sync::mpsc::unbounded_channel();
         let (send, events) = mpsc::channel();
         let context = context.clone();
-        std::thread::spawn(move || {
+        let worker = std::thread::spawn(move || {
+            if let Some(old) = stop_first {
+                let Self {
+                    actions, worker, ..
+                } = old;
+                drop(actions);
+                let _ = worker.join();
+            }
             let result = run(
                 receive, &send, &context, &root, &settings, previous, password,
             );
@@ -109,7 +118,11 @@ impl Connection {
                 context.request_repaint();
             }
         });
-        Self { actions, events }
+        Self {
+            actions,
+            events,
+            worker,
+        }
     }
 }
 
@@ -123,7 +136,9 @@ fn run(
     mut password: Zeroizing<String>,
 ) -> Result<()> {
     let identity = if settings.mode == Mode::Local {
-        Some(storage::load_session(root, None)?)
+        Some(storage::load_session(root, None).context(
+            "Could not open the Apple device session. Use Apple Account Setup or Import Session in Settings",
+        )?)
     } else {
         None
     };

@@ -30,8 +30,8 @@ pub struct TrustedPhone {
 
 pub trait SmsPrompts {
     /// Return the zero-based index of the trusted phone to use.
-    fn choose_phone(&mut self, phones: &[TrustedPhone]) -> Result<usize>;
-    fn read_code(&mut self) -> Result<Zeroizing<String>>;
+    fn choose_phone(&mut self, phones: &[TrustedPhone]) -> impl Future<Output = Result<usize>>;
+    fn read_code(&mut self) -> impl Future<Output = Result<Zeroizing<String>>>;
 }
 
 pub async fn login_device_sms(
@@ -208,7 +208,7 @@ impl GrandSlam<'_> {
             let index = if options.phones.len() == 1 {
                 0
             } else {
-                prompts.choose_phone(&options.phones)?
+                prompts.choose_phone(&options.phones).await?
             };
             let phone = options
                 .phones
@@ -218,7 +218,7 @@ impl GrandSlam<'_> {
                 .await?;
             phone.id
         };
-        let code = prompts.read_code()?;
+        let code = prompts.read_code().await?;
         self.verify_code(&anisette.headers().await?, challenge, id, code.trim())
             .await
     }
@@ -581,14 +581,14 @@ mod tests {
     }
 
     impl SmsPrompts for Prompts {
-        fn choose_phone(&mut self, phones: &[TrustedPhone]) -> Result<usize> {
+        async fn choose_phone(&mut self, phones: &[TrustedPhone]) -> Result<usize> {
             self.choices += 1;
             assert_eq!(phones[0].last_two_digits, "47");
             assert_eq!(phones[1].last_two_digits, "21");
             Ok(1)
         }
 
-        fn read_code(&mut self) -> Result<Zeroizing<String>> {
+        async fn read_code(&mut self) -> Result<Zeroizing<String>> {
             Ok(Zeroizing::new(self.code.to_owned()))
         }
     }

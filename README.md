@@ -21,7 +21,7 @@ The Sequoia layout includes animated conversation selection, message arrival, th
 
 The engine implements Apple Account sign-in with SMS verification, the Apple courier connection, IDS address lookup and legacy registration, and the legacy encrypted text format for one-to-one conversations. Sign-in uses fresh Anisette headers, an existing APNs identity, and device validation material. Live SMS delivery, Apple registration, and iMessage delivery have yet to be verified with an Apple Account.
 
-The [Apple provisioning guide](docs/apple-session.md) lists the materials and import formats. Once a session is stored in Secret Service, open **Settings → This computer**. The app will connect directly from Linux. This mode uses the engine inside the desktop app.
+Open **Settings → This Computer → Set Up Apple Account** to select a device plist and an Anisette helper, sign in, and enter Apple’s SMS code. If you already have a registered session plist, choose **Import Session**. The desktop saves the resulting session in Linux Secret Service and then connects directly from Linux. The [Apple provisioning guide](docs/apple-session.md) lists the inputs and file formats.
 
 Supported message content is plain text exchanged with devices that accept the legacy format. Group chats, attachments, SMS, modern iMessage encryption formats, and iCloud history sync remain outside this version. The UI shows when Apple's courier accepted a send. Recipient delivery and read receipts require further work.
 

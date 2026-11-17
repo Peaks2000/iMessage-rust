@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use clap::Parser;
 use eframe::egui;
 
+#[path = "messages/apple_setup.rs"]
+mod apple_setup;
 #[path = "messages/chrome.rs"]
 mod chrome;
 #[path = "messages/connection.rs"]

@@ -2,7 +2,16 @@
 
 The Linux engine can sign in to an Apple Account with SMS verification and register a legacy iMessage device. You can also import a previously registered session or register a device using an existing Apple authentication certificate. Initial APNs activation and Apple hardware validation are separate provisioning steps.
 
-Use a private directory and set the input plist to mode `0600`. Both commands accept binary or XML property lists. Use plist `data` values for bytes, including certificates and private keys encoded in DER. In an XML plist, a `data` value holds base64.
+Use a private directory and give only your user access to the input plist. On Linux, you can set this in your file manager under **Properties → Permissions** or use mode `0600`. Setup accepts binary and XML property lists. Use plist `data` values for bytes, including certificates and private keys encoded in DER. In an XML plist, a `data` value holds base64.
+
+## Set up in the desktop app
+
+Open **Settings** with **Ctrl+,** or from the conversation details button. Under **This Computer**, choose one of these options.
+
+- **Set Up Apple Account** asks for the device plist and trusted Anisette helper described below. Enter your Apple Account and password, choose a trusted phone number if prompted, then enter Apple's SMS code.
+- **Import Session** opens an existing registered session plist. The session format is described below.
+
+Both options save the session in Linux Secret Service and switch the app to **This Computer**. Browse uses Zenity on Linux when it is available. You can enter file paths directly in either form. The desktop keeps the password and SMS code in memory during the sign-in.
 
 ## Import a registered session
 
