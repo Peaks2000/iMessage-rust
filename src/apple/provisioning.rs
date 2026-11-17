@@ -241,6 +241,12 @@ impl DeviceProvider {
             let status = connection.run("activation-status", &[], 128).await?;
             match status.as_slice() {
                 b"ready" => (),
+                b"unknown-system-signer" => anyhow::bail!(
+                    "This El Capitan build uses an Apple push signer that iMessage does not recognize"
+                ),
+                b"unavailable-system-signer" => {
+                    anyhow::bail!("El Capitan could not load its Apple push signer")
+                }
                 b"missing-signing-key" => anyhow::bail!(
                     "The Mac needs an Apple-issued activation signing key in ~/Library/Application Support/LinuxMessages/activation-key.pem, readable only by your Mac user"
                 ),

@@ -134,7 +134,7 @@ static BOOL matchesSystemBinary(const char *path, NSUInteger size, const unsigne
 
 typedef int (*ActivationSigner)(const void *, int, void *, unsigned int *, void *, unsigned int *);
 
-static ActivationSigner pushSigner(void) {
+static ActivationSigner pushSigner(NSString **error) {
     const char *path = "/System/Library/PrivateFrameworks/ApplePushService.framework/apsd";
     const unsigned char bigSur[CC_SHA256_DIGEST_LENGTH] = {
         0x0f, 0x22, 0xcb, 0xbd, 0x17, 0xc0, 0xa5, 0x5b, 0x2d, 0xc5, 0xff, 0xd0, 0xed, 0xa4, 0x84, 0x79,
@@ -146,15 +146,28 @@ static ActivationSigner pushSigner(void) {
         0xaf, 0xe1, 0x44, 0x52, 0x44, 0x2c, 0xca, 0xb6, 0x59, 0x85, 0xe0, 0xc8, 0x85, 0x79, 0xda, 0x1c,
         0x4a, 0xfd, 0x10, 0xe5, 0xa7, 0x1c, 0xa9, 0x89, 0xe2, 0x2b, 0xc5, 0x57, 0x29, 0x6e, 0x30, 0x83,
     };
-    if (matchesSystemBinary(path, 1032992, elCapitan)) offset = 0x5cb90;
+    // The 2018-004 security update ships a differently signed apsd with the same signer entry point.
+    const unsigned char elCapitanSecurityUpdate[CC_SHA256_DIGEST_LENGTH] = {
+        0xc7, 0xec, 0x00, 0xd9, 0xcd, 0x68, 0x9e, 0x54, 0xe3, 0xac, 0x4b, 0x43, 0x4d, 0xb8, 0x2c, 0xcc,
+        0xa3, 0x83, 0x71, 0x1b, 0xda, 0x2d, 0xc4, 0xad, 0xfb, 0xca, 0xd3, 0xe9, 0x2b, 0x5d, 0x29, 0xfd,
+    };
+    if (matchesSystemBinary(path, 1032992, elCapitan)
+        || matchesSystemBinary(path, 1032992, elCapitanSecurityUpdate)) offset = 0x5cb90;
     if (matchesSystemBinary(path, 2900624, bigSur)) offset = 0x9cec0;
 #elif defined(__arm64__)
     if (matchesSystemBinary(path, 2900624, bigSur)) offset = 0xa8308;
 #endif
-    if (!offset) return NULL;
+    if (!offset) {
+        if (error) *error = @"unknown-system-signer";
+        return NULL;
+    }
     void *handle = dlopen(path, RTLD_LAZY | RTLD_LOCAL | RTLD_FIRST);
     const void *header = handle ? dlsym(handle, "_mh_execute_header") : NULL;
-    return header ? (ActivationSigner)((uintptr_t)header + offset) : NULL;
+    if (!header) {
+        if (error) *error = @"unavailable-system-signer";
+        return NULL;
+    }
+    return (ActivationSigner)((uintptr_t)header + offset);
 }
 
 static void systemActivationSign(ActivationSigner sign, NSData *payload) {
@@ -198,7 +211,12 @@ static NSString *activationCredentials(NSString **keyPath, NSData **certificateC
 
 static NSString *activationStatus(void) {
     NSString *error = activationCredentials(NULL, NULL);
-    return !error || pushSigner() ? @"ready" : error;
+    NSString *systemError = nil;
+    if (!error || pushSigner(&systemError)) return @"ready";
+#if defined(__x86_64__)
+    if (isElCapitan()) return systemError;
+#endif
+    return error;
 }
 
 static void activationSign(void) {
@@ -228,7 +246,7 @@ static void activationSign(void) {
     NSData *certificates = nil;
     NSString *error = activationCredentials(&key, &certificates);
     if (error) {
-        ActivationSigner signer = pushSigner();
+        ActivationSigner signer = pushSigner(NULL);
         if (!signer) fail(error);
         systemActivationSign(signer, payload);
         return;
