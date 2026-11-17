@@ -1361,6 +1361,7 @@ impl MessagesApp {
             ImportOutcome::Closed => self.session_import = None,
             ImportOutcome::Saved => {
                 self.session_import = None;
+                self.contacts.refresh_now(ctx);
                 self.open_saved_session(ctx);
             }
         }
@@ -1370,11 +1371,14 @@ impl MessagesApp {
         let Some(setup) = &mut self.mac_setup else {
             return;
         };
+        if let Some(apple) = self.contacts.apple_account() {
+            setup.seed_account(&apple.account, apple.password_saved);
+        }
         match setup.show(ctx, &self.root) {
             MacOutcome::Open => {}
             MacOutcome::Closed => {
                 self.mac_setup = None;
-                if self.settings.is_none() {
+                if self.settings.is_none() && !self.contacts.is_open() {
                     self.candidate = Some(Connection::start(
                         ctx,
                         self.root.clone(),
@@ -1387,7 +1391,12 @@ impl MessagesApp {
             }
             MacOutcome::Saved => {
                 self.mac_setup = None;
+                self.contacts.refresh_now(ctx);
                 self.open_saved_session(ctx);
+            }
+            MacOutcome::ContactsAuthorized => {
+                self.mac_setup = None;
+                self.contacts.refresh_now(ctx);
             }
         }
     }
@@ -1596,7 +1605,11 @@ impl eframe::App for MessagesApp {
         } else if self.session_import.is_some() {
             self.import_dialog(ctx);
         } else if self.contacts.is_open() {
-            self.contacts.show(ctx);
+            if self.contacts.show(ctx)
+                && let Some(apple) = self.contacts.apple_account()
+            {
+                self.mac_setup = Some(MacSetup::for_contacts(&apple.account, apple.password_saved));
+            }
         } else {
             self.settings_dialog(ctx);
         }

@@ -47,6 +47,14 @@ pub(super) fn theme(ctx: &egui::Context) {
     light.widgets.hovered.bg_fill = Color32::from_gray(233);
     light.widgets.hovered.weak_bg_fill = Color32::from_gray(233);
     light.widgets.active.bg_fill = Color32::from_gray(223);
+    for widgets in [
+        &mut light.widgets.inactive,
+        &mut light.widgets.hovered,
+        &mut light.widgets.active,
+        &mut light.widgets.open,
+    ] {
+        widgets.corner_radius = CornerRadius::ZERO;
+    }
     light.selection.bg_fill = Color32::from_rgb(198, 223, 254);
     light.selection.stroke = Stroke::new(1.0_f32, BLUE);
     ctx.set_visuals(light);

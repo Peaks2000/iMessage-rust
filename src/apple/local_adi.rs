@@ -48,11 +48,16 @@ type Generate = unsafe extern "C" fn(*const u8, usize, *const u8, i64, *mut u8, 
 pub(super) struct LocalAdi {
     api: Api,
     client: Client,
+    device: LocalAdiDevice,
+    state: Option<State>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub(super) struct LocalAdiDevice {
     keyring: String,
     client_info: String,
     device_id: String,
     serial: String,
-    state: Option<State>,
 }
 
 struct Api {
@@ -93,7 +98,19 @@ impl Drop for State {
 
 impl LocalAdi {
     pub(super) fn new(keyring: String, computer: &Computer) -> Result<Self> {
-        let state = storage::read_activation(&keyring)?
+        Self::open(LocalAdiDevice {
+            keyring,
+            client_info: format!(
+                "<{}> <macOS;{};{}> <com.apple.AuthKit/1 (com.apple.akd/1.0)>",
+                computer.model, computer.os_version, computer.build_version
+            ),
+            device_id: computer.uuid.to_string().to_uppercase(),
+            serial: computer.serial.clone(),
+        })
+    }
+
+    pub(super) fn open(device: LocalAdiDevice) -> Result<Self> {
+        let state = storage::read_activation(&device.keyring)?
             .map(|bytes| {
                 plist::from_bytes(&bytes)
                     .context("Could not read the saved local Apple device identity")
@@ -102,15 +119,13 @@ impl LocalAdi {
         Ok(Self {
             api: Api::load()?,
             client: apple_client()?,
-            keyring,
-            client_info: format!(
-                "<{}> <macOS;{};{}> <com.apple.AuthKit/1 (com.apple.akd/1.0)>",
-                computer.model, computer.os_version, computer.build_version
-            ),
-            device_id: computer.uuid.to_string().to_uppercase(),
-            serial: computer.serial.clone(),
+            device,
             state,
         })
+    }
+
+    pub(super) fn device(&self) -> &LocalAdiDevice {
+        &self.device
     }
 
     pub(in crate::apple) async fn headers(&mut self) -> Result<Zeroizing<Vec<u8>>> {
@@ -118,7 +133,7 @@ impl LocalAdi {
             let state = self.provision().await?;
             let mut encoded = Zeroizing::new(Vec::new());
             plist::to_writer_binary(&mut *encoded, &state)?;
-            storage::save_activation(&self.keyring, &encoded)?;
+            storage::save_activation(&self.device.keyring, &encoded)?;
             self.state = Some(state);
         }
         let state = self
@@ -144,29 +159,28 @@ impl LocalAdi {
             status == 0,
             "Could not generate local Apple device authentication headers"
         );
-        let document = [
+        let mut document: std::collections::BTreeMap<_, _> = [
             ("X-Apple-I-MD", STANDARD.encode(&otp[..])),
             ("X-Apple-I-MD-M", STANDARD.encode(&machine[..])),
             ("X-Apple-I-MD-RINFO", state.routing.clone()),
             (
                 "X-Apple-I-MD-LU",
-                STANDARD.encode(self.device_id.as_bytes()),
+                STANDARD.encode(self.device.device_id.as_bytes()),
             ),
-            ("X-Mme-Device-Id", self.device_id.clone()),
+            ("X-Mme-Device-Id", self.device.device_id.clone()),
             ("X-Apple-I-Client-Time", client_time()),
-            ("X-Mme-Client-Info", self.client_info.clone()),
-            ("X-Apple-I-SRL-NO", self.serial.clone()),
+            ("X-Mme-Client-Info", self.device.client_info.clone()),
             ("X-Apple-I-TimeZone", "UTC".to_owned()),
             ("X-Apple-Locale", "en_US".to_owned()),
             ("User-Agent", AUTHKIT_USER_AGENT.to_owned()),
-        ];
+        ]
+        .into_iter()
+        .collect();
+        if !self.device.serial.is_empty() {
+            document.insert("X-Apple-I-SRL-NO", self.device.serial.clone());
+        }
         let mut bytes = Zeroizing::new(Vec::new());
-        serde_json::to_writer(
-            &mut *bytes,
-            &document
-                .into_iter()
-                .collect::<std::collections::BTreeMap<_, _>>(),
-        )?;
+        serde_json::to_writer(&mut *bytes, &document)?;
         Ok(bytes)
     }
 
@@ -264,18 +278,18 @@ impl LocalAdi {
             .header("Accept-Encoding", "gzip")
             .header("User-Agent", "akd/1.0")
             .header("Content-Type", "application/x-www-form-urlencoded")
-            .header("X-Mme-Device-Id", &self.device_id)
+            .header("X-Mme-Device-Id", &self.device.device_id)
             .header(
                 "X-Apple-I-MD-LU",
-                STANDARD.encode(self.device_id.as_bytes()),
+                STANDARD.encode(self.device.device_id.as_bytes()),
             )
-            .header("X-Mme-Client-Info", &self.client_info)
+            .header("X-Mme-Client-Info", &self.device.client_info)
             .header("X-Apple-Client-App-Name", "akd")
             .header("X-Apple-I-Client-Time", client_time())
             .header("X-Apple-I-TimeZone", "UTC")
             .header("X-Apple-Locale", "en_US");
-        if !self.serial.is_empty() {
-            request = request.header("X-Apple-I-SRL-NO", &self.serial);
+        if !self.device.serial.is_empty() {
+            request = request.header("X-Apple-I-SRL-NO", &self.device.serial);
         }
         let reply = request
             .send()
@@ -408,12 +422,14 @@ mod tests {
         let mut adi = LocalAdi {
             api: Api::load()?,
             client: apple_client()?,
-            keyring: String::new(),
-            client_info:
-                "<MacBookPro11,1> <macOS;10.11.6;15G22010> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
-                    .into(),
-            device_id: uuid::Uuid::new_v4().to_string().to_uppercase(),
-            serial: String::new(),
+            device: LocalAdiDevice {
+                keyring: String::new(),
+                client_info:
+                    "<MacBookPro11,1> <macOS;10.11.6;15G22010> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+                        .into(),
+                device_id: uuid::Uuid::new_v4().to_string().to_uppercase(),
+                serial: String::new(),
+            },
             state: None,
         };
         adi.state = Some(adi.provision().await?);

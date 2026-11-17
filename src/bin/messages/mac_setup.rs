@@ -7,8 +7,8 @@ use anyhow::{Context, Result};
 use eframe::egui::{self, Align, Color32, Layout, Margin, RichText, TextEdit, Ui, vec2};
 use linux_imessage::{
     apple::{
-        AutomaticSetup, DeviceConnection, SmsPrompts, SshPrompt, TrustedDeviceResponse,
-        TrustedPhone,
+        self, AutomaticSetup, DeviceConnection, IcloudContactsGrant, Identity, SmsPrompts,
+        SshPrompt, TrustedDeviceResponse, TrustedPhone,
     },
     storage,
 };
@@ -21,9 +21,14 @@ pub(super) enum Outcome {
     Open,
     Closed,
     Saved,
+    ContactsAuthorized,
 }
 
 pub(super) struct MacSetup {
+    contacts_only: bool,
+    account_seeded: bool,
+    remembered: Option<String>,
+    remember_password: bool,
     host: String,
     mac_password: Zeroizing<String>,
     account: String,
@@ -72,15 +77,20 @@ enum Event {
 }
 
 struct Request {
-    setup: AutomaticSetup,
+    setup: Option<AutomaticSetup>,
     account: String,
     password: Zeroizing<String>,
     mac_password: Zeroizing<String>,
+    remember_password: bool,
 }
 
 impl MacSetup {
     pub(super) fn new() -> Self {
         Self {
+            contacts_only: false,
+            account_seeded: false,
+            remembered: None,
+            remember_password: true,
             host: std::env::var("IMESSAGE_MAC_HOST").unwrap_or_default(),
             mac_password: Zeroizing::default(),
             account: String::new(),
@@ -95,9 +105,31 @@ impl MacSetup {
         }
     }
 
+    pub(super) fn for_contacts(account: &str, password_saved: bool) -> Self {
+        let mut setup = Self::new();
+        setup.contacts_only = true;
+        setup.seed_account(account, password_saved);
+        setup
+    }
+
+    pub(super) fn seed_account(&mut self, account: &str, password_saved: bool) {
+        if self.account_seeded {
+            return;
+        }
+        self.account_seeded = true;
+        if self.account.is_empty() {
+            self.account = account.to_owned();
+        }
+        self.remembered = password_saved.then(|| account.to_owned());
+    }
+
     pub(super) fn show(&mut self, context: &egui::Context, root: &Path) -> Outcome {
         if self.poll() {
-            return Outcome::Saved;
+            return if self.contacts_only {
+                Outcome::ContactsAuthorized
+            } else {
+                Outcome::Saved
+            };
         }
 
         let can_cancel = !matches!(self.step, Step::Saving);
@@ -108,7 +140,12 @@ impl MacSetup {
             .frame(chrome::sheet())
             .show(context, |ui| {
                 ui.set_width(404.);
-                ui.label(chrome::bold("Set Up with a Mac", 19.));
+                let title = if self.contacts_only {
+                    "Authorize iCloud Contacts"
+                } else {
+                    "Set Up with a Mac"
+                };
+                ui.label(chrome::bold(title, 19.));
                 ui.add_space(7.);
                 let (label, enabled) = match &mut self.step {
                     Step::Form => {
@@ -204,27 +241,33 @@ impl MacSetup {
     }
 
     fn form(&mut self, ui: &mut Ui) -> (&'static str, bool) {
-        ui.label(
-            RichText::new(
-                "Enable Remote Login on your Mac. iMessage installs its setup helper over SSH.",
-            )
-            .color(MUTED),
-        );
-        edit(
-            ui,
-            "Mac SSH address",
-            &mut self.host,
-            "user@mac.local",
-            false,
-        );
-        edit(
-            ui,
-            "Mac login password",
-            &mut self.mac_password,
-            "Optional if you use an SSH key",
-            true,
-        );
-        ui.add_space(5.);
+        if self.contacts_only {
+            ui.label(
+                RichText::new("Sign in with the Apple Account you use for iCloud.").color(MUTED),
+            );
+        } else {
+            ui.label(
+                RichText::new(
+                    "Enable Remote Login on your Mac. iMessage installs its setup helper over SSH.",
+                )
+                .color(MUTED),
+            );
+            edit(
+                ui,
+                "Mac SSH address",
+                &mut self.host,
+                "user@mac.local",
+                false,
+            );
+            edit(
+                ui,
+                "Mac login password",
+                &mut self.mac_password,
+                "Optional if you use an SSH key",
+                true,
+            );
+            ui.add_space(5.);
+        }
         edit(
             ui,
             "Apple Account",
@@ -232,13 +275,28 @@ impl MacSetup {
             "Email or phone number",
             false,
         );
-        edit(ui, "Apple Account password", &mut self.password, "", true);
-        let addr = self.host.trim();
-        let ready = !addr.is_empty()
+        let saved = self
+            .remembered
+            .as_deref()
+            .is_some_and(|account| account.eq_ignore_ascii_case(self.account.trim()));
+        let hint = if saved { "Use saved password" } else { "" };
+        edit(ui, "Apple Account password", &mut self.password, hint, true);
+        ui.checkbox(
+            &mut self.remember_password,
+            "Remember Apple Account password",
+        );
+        let mac_ready = !self.host.trim().is_empty() && self.mac_password.len() <= 1023;
+        let ready = (self.contacts_only || mac_ready)
             && !self.account.trim().is_empty()
-            && !self.password.is_empty()
-            && self.mac_password.len() <= 1023;
-        ("Connect", ready)
+            && (saved || !self.password.is_empty());
+        (
+            if self.contacts_only {
+                "Authorize"
+            } else {
+                "Connect"
+            },
+            ready,
+        )
     }
 
     fn submit(&mut self, context: &egui::Context, root: &Path, use_sms: bool) {
@@ -246,16 +304,19 @@ impl MacSetup {
         match std::mem::replace(&mut self.step, Step::Working("Contacting Apple…")) {
             Step::Form => {
                 let request = Request {
-                    setup: AutomaticSetup {
+                    setup: (!self.contacts_only).then(|| AutomaticSetup {
                         connection: DeviceConnection::MacOverSsh(self.host.trim().to_owned()),
                         opencore_config: None,
                         address: String::new(),
-                    },
+                    }),
                     account: self.account.trim().to_owned(),
                     password: std::mem::take(&mut self.password),
                     mac_password: std::mem::take(&mut self.mac_password),
+                    remember_password: self.remember_password,
                 };
-                self.step = Step::Working("Connecting to the Mac…");
+                if !self.contacts_only {
+                    self.step = Step::Working("Connecting to the Mac…");
+                }
                 self.worker = Some(Worker::start(context, root.to_owned(), request));
             }
             Step::Phone {
@@ -265,7 +326,7 @@ impl MacSetup {
                 let _ = answer.send(selected);
             }
             Step::Code(CodePrompt::Sms(answer)) => {
-                self.step = Step::Working("Verifying the code and registering the device…");
+                self.step = Step::Working("Verifying the code…");
                 let _ = answer.send(std::mem::take(&mut self.code));
             }
             Step::Code(CodePrompt::TrustedDevice(answer)) => {
@@ -274,7 +335,7 @@ impl MacSetup {
                     self.step = Step::Working("Requesting an SMS code…");
                     TrustedDeviceResponse::UseSms
                 } else {
-                    self.step = Step::Working("Verifying the code and registering the device…");
+                    self.step = Step::Working("Verifying the code…");
                     TrustedDeviceResponse::Code(code)
                 };
                 let _ = answer.send(response);
@@ -352,12 +413,14 @@ impl Worker {
                 send,
                 context,
                 mac_password: request.mac_password,
+                contacts_grant: None,
             };
             let result = run(
                 &root,
                 request.setup,
                 &request.account,
                 request.password,
+                request.remember_password,
                 &mut prompts,
                 canceled,
             );
@@ -372,23 +435,60 @@ impl Worker {
 
 fn run(
     root: &Path,
-    setup: AutomaticSetup,
+    setup: Option<AutomaticSetup>,
     account: &str,
-    password: Zeroizing<String>,
+    mut password: Zeroizing<String>,
+    remember_password: bool,
     prompts: &mut GuiPrompts,
     mut canceled: oneshot::Receiver<()>,
 ) -> Result<()> {
     storage::check_desktop_session_storage(root)?;
+    let current = if setup.is_none() || password.is_empty() {
+        storage::load_local_session(root)?
+    } else {
+        None
+    };
+    if password.is_empty() {
+        let identity = current
+            .as_ref()
+            .context("Enter your Apple Account password")?;
+        password = storage::load_apple_account(root, identity)?
+            .filter(|saved| {
+                saved.account.eq_ignore_ascii_case(account) && !saved.password.is_empty()
+            })
+            .context("Enter your Apple Account password")?
+            .password;
+    }
+    let remembered = if remember_password {
+        password.clone()
+    } else {
+        Zeroizing::default()
+    };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let session = runtime.block_on(async {
+    let (session, identity, contacts) = runtime.block_on(async {
         tokio::select! {
             biased;
             _ = &mut canceled => anyhow::bail!("Apple account setup canceled"),
-            result = setup.sign_in(root, account, password, prompts) => result,
+            result = async {
+                if let Some(setup) = setup {
+                    let session = setup.sign_in(root, account, password, prompts).await?;
+                    let identity = Identity::parse(&session)?;
+                    Ok((Some(session), identity, prompts.contacts_grant.take()))
+                } else {
+                    let identity = current.context("Sign in to iMessage to authorize Contacts")?;
+                    let contacts = apple::authorize_icloud_contacts(root, &identity, account, password, prompts).await?;
+                    Ok((None, identity, Some(contacts)))
+                }
+            } => result,
         }
     })?;
+    let mut saved = storage::SavedAppleAccount {
+        account: account.to_owned(),
+        password: remembered,
+        contacts,
+    };
     let (permit, mut confirmed) = oneshot::channel();
     prompts.emit(Event::Save(permit))?;
     loop {
@@ -399,7 +499,20 @@ fn run(
                 result = &mut confirmed => result.context("Apple account setup canceled"),
             }
         })?;
-        match storage::save_session(root, &session, None) {
+        let result = (|| {
+            if saved.contacts.is_none()
+                && let Some(previous) = storage::load_apple_account(root, &identity)?
+                && previous.account.eq_ignore_ascii_case(account)
+            {
+                saved.contacts = previous.contacts;
+            }
+            storage::save_apple_account(root, &identity, &saved)?;
+            if let Some(session) = &session {
+                storage::save_session(root, session, None)?;
+            }
+            Ok(())
+        })();
+        match result {
             Ok(()) => return Ok(()),
             Err(error) => {
                 let (retry, confirmation) = oneshot::channel();
@@ -414,6 +527,7 @@ struct GuiPrompts {
     send: Sender<Event>,
     context: egui::Context,
     mac_password: Zeroizing<String>,
+    contacts_grant: Option<IcloudContactsGrant>,
 }
 
 impl GuiPrompts {
@@ -427,6 +541,14 @@ impl GuiPrompts {
 }
 
 impl SmsPrompts for GuiPrompts {
+    fn request_icloud_contacts(&self) -> bool {
+        true
+    }
+
+    fn received_icloud_contacts(&mut self, grant: Result<IcloudContactsGrant>) {
+        self.contacts_grant = grant.ok();
+    }
+
     async fn choose_phone(&mut self, phones: &[TrustedPhone]) -> Result<usize> {
         let (answer, selected) = oneshot::channel();
         let labels = phones
@@ -519,6 +641,7 @@ mod tests {
             send,
             context: egui::Context::default(),
             mac_password: Zeroizing::new("fixture mac password".to_owned()),
+            contacts_grant: None,
         };
         let host = "fixture@mac.local".to_owned();
         let message = format!("{host}'s password:");

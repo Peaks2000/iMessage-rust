@@ -20,6 +20,7 @@ use super::{
     Identity,
     aps::{Courier, Frame, TOPIC, push_id},
     crypto::KeyPair,
+    http::plist_xml_gzip,
     message_content, mmcs, nonce, rsa_signature,
 };
 
@@ -179,10 +180,7 @@ impl Madrid {
         targets: &[&str],
         required: bool,
     ) -> Result<HashMap<String, Vec<Destination>>> {
-        let body = compress(&binary(&dictionary([(
-            "uris",
-            Value::Array(targets.iter().map(|uri| value(*uri)).collect()),
-        )]))?)?;
+        let body = lookup_body(targets)?;
         let nonce = nonce(1)?;
         let mut signed = nonce.to_vec();
         for field in [QUERY_KEY, b"", &body, &identity.token] {
@@ -570,6 +568,14 @@ impl Madrid {
     }
 }
 
+fn lookup_body(targets: &[&str]) -> Result<Vec<u8>> {
+    // The IDS endpoint requires XML, even though the APNs envelope uses binary plists.
+    plist_xml_gzip(&dictionary([(
+        "uris",
+        Value::Array(targets.iter().map(|uri| value(*uri)).collect()),
+    )]))
+}
+
 fn binary(value: &Dictionary) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     plist::to_writer_binary(&mut bytes, value)?;
@@ -619,4 +625,24 @@ pub(super) fn decompress(bytes: &[u8]) -> Result<Vec<u8>> {
         "Compressed Apple plist exceeds size limit"
     );
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ids_queries_encode_recipients_as_gzipped_xml() -> Result<()> {
+        let targets = ["mailto:sender@example.org", "tel:+15550100123"];
+        let body = lookup_body(&targets)?;
+        assert!(body.starts_with(&[0x1f, 0x8b]));
+        let xml = decompress(&body)?;
+        assert!(xml.starts_with(b"<?xml "));
+        let document: Dictionary = plist::from_bytes(&xml)?;
+        assert_eq!(
+            document["uris"],
+            Value::Array(targets.iter().map(|uri| value(*uri)).collect())
+        );
+        Ok(())
+    }
 }

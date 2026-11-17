@@ -27,9 +27,9 @@ The engine supports one-to-one text and attachments with devices that accept the
 
 ## Sync iCloud Contacts
 
-Open **Settings → iCloud Contacts**. Enter your Apple Account and an [app-specific password from Apple](https://support.apple.com/en-us/102654), then click **Sync Contacts**. The Linux desktop reads iCloud CardDAV directly in both connection modes. It shows contact names in conversations and suggests matching recipients when you compose a message.
+The Linux desktop uses the Apple Account from local iMessage setup to authorize iCloud Contacts. If you already signed in with an older build or imported a session, open **Settings → iCloud Contacts → Authorize Contacts…** once. You can also connect Contacts with an [app-specific password from Apple](https://support.apple.com/en-us/102654) when you use Server mode without a local Apple session.
 
-The app stores the password in Linux Secret Service and keeps the contact names, email addresses, and phone numbers in its private local data directory. It refreshes at startup and every 30 minutes while open. **Sync Contacts** refreshes immediately. **Disconnect** removes the saved credential and local cache.
+The app stores the Contacts credential and any remembered Apple Account password in Linux Secret Service. It syncs directly from iCloud at launch and every 30 minutes while open. **Sync Contacts** refreshes immediately. **Disconnect** removes Contacts access and the private local cache. Synced names appear in conversations and as recipient suggestions.
 
 ## Run the optional server
 

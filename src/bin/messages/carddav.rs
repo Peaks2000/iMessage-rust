@@ -12,7 +12,7 @@ const MAX_RESPONSE: usize = 16 * 1024 * 1024;
 const MAX_CARDS: usize = 10_000;
 const BATCH: usize = 64;
 
-#[derive(Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Recipient {
     pub name: String,
     pub address: String,
@@ -23,36 +23,76 @@ struct CardDav<'a> {
     origin: Url,
     account: &'a str,
     password: &'a str,
+    headers: header::HeaderMap,
 }
 
 pub(super) async fn fetch(account: &str, password: &str) -> Result<Vec<Recipient>> {
-    let dav = CardDav {
-        client: Client::builder()
+    CardDav::new(account, password)?.fetch(None).await
+}
+
+pub(super) async fn fetch_with_apple_grant(
+    grant: &linux_imessage::apple::IcloudContactsGrant,
+) -> Result<Vec<Recipient>> {
+    ensure!(
+        !grant.dsid.is_empty() && grant.dsid.bytes().all(|byte| byte.is_ascii_digit()),
+        "Invalid saved iCloud account identifier"
+    );
+    let mut dav = CardDav::new(&grant.dsid, &grant.token)?;
+    let principal = if let Some(url) = &grant.url {
+        let url = Url::parse(url)?;
+        dav.validate_url(&url)?;
+        dav.origin = url;
+        None
+    } else {
+        Some(dav.origin.join(&format!("{}/principal/", grant.dsid))?)
+    };
+    dav.headers = grant.carddav_headers().await?;
+    dav.fetch(principal).await
+}
+
+impl<'a> CardDav<'a> {
+    fn new(account: &'a str, password: &'a str) -> Result<Self> {
+        let client = Client::builder()
             .no_proxy()
             .https_only(true)
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(8))
             .timeout(Duration::from_secs(25))
-            .build()?,
-        origin: Url::parse("https://contacts.icloud.com/")?,
-        account,
-        password,
-    };
-    tokio::time::timeout(Duration::from_secs(100), dav.contacts(default_region()))
+            .build()?;
+        Ok(Self {
+            client,
+            origin: Url::parse("https://contacts.icloud.com/")?,
+            account,
+            password,
+            headers: header::HeaderMap::new(),
+        })
+    }
+
+    async fn fetch(&self, principal: Option<Url>) -> Result<Vec<Recipient>> {
+        tokio::time::timeout(
+            Duration::from_secs(100),
+            self.contacts(default_region(), principal),
+        )
         .await
         .context("iCloud Contacts sync timed out")?
-}
-
-impl CardDav<'_> {
-    async fn contacts(&self, region: Option<phonenumber::country::Id>) -> Result<Vec<Recipient>> {
-        let principal = self
-            .discovery(
-                &self.origin,
-                DAV,
-                "current-user-principal",
-                "<d:current-user-principal/>",
-            )
-            .await?;
+    }
+    async fn contacts(
+        &self,
+        region: Option<phonenumber::country::Id>,
+        principal: Option<Url>,
+    ) -> Result<Vec<Recipient>> {
+        let principal = match principal {
+            Some(principal) => principal,
+            None => {
+                self.discovery(
+                    &self.origin,
+                    DAV,
+                    "current-user-principal",
+                    "<d:current-user-principal/>",
+                )
+                .await?
+            }
+        };
         let home = self
             .discovery(
                 &principal,
@@ -191,6 +231,7 @@ impl CardDav<'_> {
             let mut response = self
                 .client
                 .request(method.clone(), url.clone())
+                .headers(self.headers.clone())
                 .basic_auth(self.account, Some(self.password))
                 .header("depth", depth)
                 .header(header::USER_AGENT, "iMessage for Linux")
@@ -214,7 +255,8 @@ impl CardDav<'_> {
                     url = self.href(&url, location)?;
                 }
                 StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => anyhow::bail!(
-                    "iCloud denied access. Check the Apple Account and its app-specific password."
+                    "iCloud denied access to Contacts (HTTP {})",
+                    response.status().as_u16()
                 ),
                 StatusCode::MULTI_STATUS => {
                     let mut bytes = Vec::new();
@@ -520,8 +562,11 @@ mod tests {
             origin,
             account: ACCOUNT,
             password: PASSWORD,
+            headers: header::HeaderMap::new(),
         };
-        let recipients = dav.contacts(Some(phonenumber::country::Id::GB)).await?;
+        let recipients = dav
+            .contacts(Some(phonenumber::country::Id::GB), None)
+            .await?;
         server.abort();
         assert_eq!(
             recipients

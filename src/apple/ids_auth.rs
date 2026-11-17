@@ -30,7 +30,7 @@ pub(super) async fn authenticate(
     apple: &Client,
     device: &DeviceRegistration,
     username: &str,
-    session: LoginSession,
+    session: &LoginSession,
     headers: DeviceHeaders,
 ) -> Result<AccountAuth> {
     let setup = client_builder().build()?;

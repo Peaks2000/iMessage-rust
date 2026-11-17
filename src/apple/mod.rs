@@ -2,6 +2,7 @@ mod aps;
 mod crypto;
 mod gsa;
 mod http;
+mod icloud_contacts;
 mod ids_auth;
 mod local_adi;
 mod madrid;
@@ -12,7 +13,10 @@ mod provider_command;
 mod provisioning;
 mod registration;
 mod ssh_setup;
-pub use gsa::{SmsPrompts, TrustedDeviceResponse, TrustedPhone, login_device_sms};
+pub use gsa::{
+    SmsPrompts, TrustedDeviceResponse, TrustedPhone, authorize_icloud_contacts, login_device_sms,
+};
+pub use icloud_contacts::IcloudContactsGrant;
 pub use provisioning::{AutomaticSetup, DeviceConnection, default_device_helper};
 pub use registration::register_device;
 pub use ssh_setup::{SshPrompt, run_ssh_askpass};
@@ -80,6 +84,10 @@ impl Drop for Session {
 }
 
 impl Identity {
+    pub fn handle(&self) -> &str {
+        &self.handle
+    }
+
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let session: Session =
             plist::from_bytes(bytes).context("Could not decode version 1 Apple session plist")?;
@@ -119,7 +127,7 @@ impl Identity {
         })
     }
 
-    pub(crate) fn profile_id(&self) -> String {
+    pub fn profile_id(&self) -> String {
         let mut identity = Zeroizing::new(self.token.to_vec());
         identity.extend_from_slice(self.handle.as_bytes());
         format!(

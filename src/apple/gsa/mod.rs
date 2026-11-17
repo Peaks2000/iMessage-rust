@@ -47,6 +47,12 @@ pub trait SmsPrompts {
     fn read_trusted_device_code(&mut self) -> impl Future<Output = Result<TrustedDeviceResponse>> {
         async { self.read_code().await.map(TrustedDeviceResponse::Code) }
     }
+
+    fn request_icloud_contacts(&self) -> bool {
+        false
+    }
+
+    fn received_icloud_contacts(&mut self, _grant: Result<super::IcloudContactsGrant>) {}
     fn prefers_ssh_password(&self) -> bool {
         false
     }
@@ -112,11 +118,47 @@ pub(super) async fn login(
         device.validation_data = proofs.qualification().await?;
         device.validate()?;
     }
-    let auth = super::ids_auth::authenticate(&client, device, account, session, headers).await?;
+    let auth = super::ids_auth::authenticate(&client, device, account, &session, headers).await?;
     if let Some(proofs) = proofs {
         device.validation_data = proofs.registration().await?;
     }
-    register(&client, device, auth).await
+    let registration = register(&client, device, auth).await?;
+    if prompts.request_icloud_contacts() {
+        let grant = super::icloud_contacts::authorize(account, &session, anisette).await;
+        prompts.received_icloud_contacts(grant);
+    }
+    Ok(registration)
+}
+
+pub async fn authorize_icloud_contacts(
+    root: &Path,
+    identity: &super::Identity,
+    account: &str,
+    password: Zeroizing<String>,
+    prompts: &mut impl SmsPrompts,
+) -> Result<super::IcloudContactsGrant> {
+    let account = account.trim();
+    validate_login(account, &password)?;
+    let profile = identity.profile_id();
+    let _lock = super::provisioning::lock_profile(root, &profile)?;
+    let computer = super::provisioning::Computer::for_contacts(identity);
+    let mut anisette = Anisette::from_local(super::local_adi::LocalAdi::new(
+        format!("icloud-adi:{}:{profile}", root.display()),
+        &computer,
+    )?);
+    let client = apple_client()?;
+    let gsa = GrandSlam {
+        client: &client,
+        origin: GSA,
+        push_token: identity.token,
+        mac_provisioned: true,
+    };
+    let password_hash = Zeroizing::new(sha256(password.as_bytes()));
+    drop(password);
+    let session = gsa
+        .sign_in(&mut anisette, account, &password_hash, prompts)
+        .await?;
+    super::icloud_contacts::authorize(account, &session, &mut anisette).await
 }
 
 struct GrandSlam<'a> {

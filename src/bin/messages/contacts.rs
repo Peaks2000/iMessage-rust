@@ -24,10 +24,24 @@ const CACHE_LIMIT: u64 = 8 * 1024 * 1024;
 const INTERVAL: Duration = Duration::from_secs(30 * 60);
 const HELP: &str = "https://support.apple.com/en-us/102654";
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct Snapshot {
     account: String,
     recipients: Vec<Recipient>,
+    #[serde(default)]
+    profile: Option<String>,
+}
+
+pub(super) struct AppleAccountHint {
+    pub account: String,
+    pub password_saved: bool,
+    authorized: bool,
+}
+
+struct Update {
+    apple: Option<AppleAccountHint>,
+    snapshot: Option<Snapshot>,
+    error: Option<String>,
 }
 
 #[derive(Default)]
@@ -47,7 +61,9 @@ pub(super) struct Contacts {
     snapshot: Option<Snapshot>,
     names: HashMap<String, String>,
     next_sync: Instant,
-    pending: Option<Receiver<Result<Option<Snapshot>>>>,
+    pending: Option<Receiver<Result<Update>>>,
+    refresh_queued: bool,
+    apple: Option<AppleAccountHint>,
     form: Option<Form>,
     error: Option<String>,
 }
@@ -64,10 +80,12 @@ impl Contacts {
             names: HashMap::new(),
             next_sync: Instant::now(),
             pending: None,
+            refresh_queued: true,
+            apple: None,
             form: None,
             error,
         };
-        contacts.set_snapshot(snapshot);
+        contacts.set_snapshot(snapshot.filter(|cache| cache.profile.is_none()));
         contacts
     }
 
@@ -128,26 +146,42 @@ impl Contacts {
             self.pending = None;
             self.next_sync = Instant::now() + INTERVAL;
             match result {
-                Ok(snapshot) => {
-                    self.set_snapshot(snapshot);
-                    if let Some(form) = &mut self.form {
-                        form.account = self
-                            .snapshot
-                            .as_ref()
-                            .map_or_else(String::new, |data| data.account.clone());
+                Ok(update) => {
+                    self.error = update.error;
+                    self.apple = update.apple;
+                    self.set_snapshot(update.snapshot);
+                    if let Some(form) = &mut self.form
+                        && form.account.is_empty()
+                        && let Some(snapshot) = &self.snapshot
+                    {
+                        form.account = snapshot.account.clone();
                     }
                 }
-                Err(error) => self.error = Some(error.to_string()),
+                Err(error) => self.error = Some(format!("{error:#}")),
             }
         }
-        if self.snapshot.is_some() {
+        if self.refresh_queued {
+            self.refresh_queued = false;
+            self.start(ctx, Operation::Refresh);
+        } else if self.snapshot.is_some()
+            || self.apple.as_ref().is_some_and(|apple| apple.authorized)
+        {
             let wait = self.next_sync.saturating_duration_since(Instant::now());
-            if wait.is_zero() && self.form.is_none() {
+            if wait.is_zero() {
                 self.start(ctx, Operation::Refresh);
-            } else if !wait.is_zero() {
+            } else {
                 ctx.request_repaint_after(wait);
             }
         }
+    }
+
+    pub(super) fn refresh_now(&mut self, ctx: &egui::Context) {
+        self.refresh_queued = true;
+        ctx.request_repaint();
+    }
+
+    pub(super) fn apple_account(&self) -> Option<&AppleAccountHint> {
+        self.apple.as_ref()
     }
 
     fn start(&mut self, ctx: &egui::Context, operation: Operation) {
@@ -170,8 +204,11 @@ impl Contacts {
         self.form.is_some()
     }
 
-    pub fn show(&mut self, ctx: &egui::Context) {
-        let Some(form) = &mut self.form else { return };
+    pub fn show(&mut self, ctx: &egui::Context) -> bool {
+        let Some(form) = &mut self.form else {
+            return false;
+        };
+        let mut authorize = false;
         let busy = self.pending.is_some();
         let mut operation = None;
         let dialog = egui::Modal::new(egui::Id::new("icloud-contacts"))
@@ -185,24 +222,29 @@ impl Contacts {
                     )
                     .color(MUTED),
                 );
-                let account = ui.label(chrome::bold("Apple Account", 11.));
-                ui.add_enabled(
-                    !busy,
-                    TextEdit::singleline(&mut form.account)
-                        .hint_text("Email or phone number")
-                        .desired_width(f32::INFINITY),
-                )
-                .labelled_by(account.id);
-                let password = ui.label(chrome::bold("App-specific password", 11.));
-                ui.add_enabled(
-                    !busy,
-                    TextEdit::singleline(&mut *form.password)
-                        .password(true)
-                        .hint_text("App-specific password from Apple")
-                        .desired_width(f32::INFINITY),
-                )
-                .labelled_by(password.id);
-                ui.hyperlink_to("Create an app-specific password", HELP);
+                if let Some(apple) = &self.apple {
+                    ui.label(chrome::bold("Apple Account", 11.));
+                    ui.label(&apple.account);
+                } else if !busy || self.snapshot.is_some() {
+                    let account = ui.label(chrome::bold("Apple Account", 11.));
+                    ui.add_enabled(
+                        !busy,
+                        TextEdit::singleline(&mut form.account)
+                            .hint_text("Email or phone number")
+                            .desired_width(f32::INFINITY),
+                    )
+                    .labelled_by(account.id);
+                    let password = ui.label(chrome::bold("App-specific password", 11.));
+                    ui.add_enabled(
+                        !busy,
+                        TextEdit::singleline(&mut *form.password)
+                            .password(true)
+                            .hint_text("App-specific password from Apple")
+                            .desired_width(f32::INFINITY),
+                    )
+                    .labelled_by(password.id);
+                    ui.hyperlink_to("Create an app-specific password", HELP);
+                }
                 if let Some(snapshot) = &self.snapshot {
                     ui.label(
                         RichText::new(format!(
@@ -221,35 +263,61 @@ impl Contacts {
                 if let Some(error) = &self.error {
                     ui.label(RichText::new(error).color(DANGER));
                 }
+                if let Some(apple) = &self.apple
+                    && ((!apple.authorized && self.snapshot.is_some())
+                        || (apple.authorized && self.error.is_some()))
+                {
+                    let label = if apple.authorized {
+                        "Authorize Again…"
+                    } else {
+                        "Authorize Contacts…"
+                    };
+                    authorize = ui.add_enabled(!busy, egui::Button::new(label)).clicked();
+                }
                 ui.add_space(5.);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let done = ui.button("Done").clicked();
-                    let has_password = !form.password.trim().is_empty();
-                    let use_saved = !has_password
-                        && self.snapshot.as_ref().is_some_and(|data| {
-                            form.account.trim().eq_ignore_ascii_case(&data.account)
-                        });
-                    if ui
-                        .add_enabled(
-                            !busy
-                                && (use_saved || (has_password && !form.account.trim().is_empty())),
-                            egui::Button::new(RichText::new("Sync Contacts").color(Color32::WHITE))
-                                .fill(BLUE)
-                                .corner_radius(5)
-                                .min_size(vec2(98., 25.)),
-                        )
-                        .clicked()
-                    {
-                        operation = Some(if use_saved {
-                            Operation::Refresh
+                    if let Some(apple) = &self.apple {
+                        let label = if apple.authorized || self.snapshot.is_some() {
+                            "Sync Contacts"
                         } else {
-                            Operation::Connect(Form {
-                                account: form.account.trim().to_owned(),
-                                password: std::mem::take(&mut form.password),
-                            })
-                        });
+                            "Authorize Contacts…"
+                        };
+                        if ui.add_enabled(!busy, primary(label)).clicked() {
+                            if apple.authorized || self.snapshot.is_some() {
+                                operation = Some(Operation::Refresh);
+                            } else {
+                                authorize = true;
+                            }
+                        }
+                    } else {
+                        let has_password = !form.password.trim().is_empty();
+                        let use_saved = !has_password
+                            && self.snapshot.as_ref().is_some_and(|data| {
+                                form.account.trim().eq_ignore_ascii_case(&data.account)
+                            });
+                        if ui
+                            .add_enabled(
+                                !busy
+                                    && (use_saved
+                                        || (has_password && !form.account.trim().is_empty())),
+                                primary("Sync Contacts"),
+                            )
+                            .clicked()
+                        {
+                            operation = Some(if use_saved {
+                                Operation::Refresh
+                            } else {
+                                Operation::Connect(Form {
+                                    account: form.account.trim().to_owned(),
+                                    password: std::mem::take(&mut form.password),
+                                })
+                            });
+                        }
                     }
-                    if self.snapshot.is_some()
+                    let connected = self.snapshot.is_some()
+                        || self.apple.as_ref().is_some_and(|apple| apple.authorized);
+                    if connected
                         && ui
                             .add_enabled(!busy, egui::Button::new("Disconnect"))
                             .clicked()
@@ -265,7 +333,15 @@ impl Contacts {
         } else if dialog.inner || dialog.should_close() {
             self.form = None;
         }
+        authorize
     }
+}
+
+fn primary(label: &str) -> egui::Button<'_> {
+    egui::Button::new(RichText::new(label).color(Color32::WHITE))
+        .fill(BLUE)
+        .corner_radius(5)
+        .min_size(vec2(98., 25.))
 }
 
 fn read_cache(root: &Path) -> Result<Option<Snapshot>> {
@@ -281,7 +357,7 @@ fn password_key(root: &Path, account: &str) -> String {
     format!("icloud-contacts:{}:{account}", root.display())
 }
 
-fn run(root: &Path, operation: Operation) -> Result<Option<Snapshot>> {
+fn run(root: &Path, operation: Operation) -> Result<Update> {
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -291,21 +367,116 @@ fn run(root: &Path, operation: Operation) -> Result<Option<Snapshot>> {
         .open(root.join("icloud-contacts.lock"))?;
     fs2::FileExt::try_lock_exclusive(&lock)
         .context("iCloud Contacts is being updated in another window")?;
-    let previous = match operation {
-        Operation::Connect(_) => read_cache(root).unwrap_or_default(),
-        _ => read_cache(root)?,
+    let identity = if root.join("apple-session.enc").exists() {
+        None
+    } else {
+        storage::load_local_session(root)?
     };
+    let mut saved = identity
+        .as_ref()
+        .map(|identity| storage::load_apple_account(root, identity))
+        .transpose()?
+        .flatten();
+    let mut apple = identity.as_ref().map(|identity| AppleAccountHint {
+        account: saved.as_ref().map_or_else(
+            || display_address(identity.handle()).to_owned(),
+            |saved| saved.account.clone(),
+        ),
+        password_saved: saved
+            .as_ref()
+            .is_some_and(|saved| !saved.password.is_empty()),
+        authorized: saved.as_ref().is_some_and(|saved| saved.contacts.is_some()),
+    });
+    let profile = identity.as_ref().map(|identity| identity.profile_id());
+    let mut error = None;
+    let previous = match read_cache(root) {
+        Ok(previous) => previous,
+        Err(cause) => {
+            error = Some(format!("{cause:#}"));
+            None
+        }
+    };
+    let visible = previous
+        .as_ref()
+        .filter(|snapshot| match &snapshot.profile {
+            Some(value) => {
+                profile.as_ref() == Some(value)
+                    && apple.as_ref().is_some_and(|apple| {
+                        apple.authorized && snapshot.account.eq_ignore_ascii_case(&apple.account)
+                    })
+            }
+            None => apple
+                .as_ref()
+                .is_none_or(|apple| snapshot.account.eq_ignore_ascii_case(&apple.account)),
+        });
+    let result = sync(root, operation, identity.as_ref(), &mut saved, visible);
+    let snapshot = match result {
+        Ok(snapshot) => {
+            if let Some(apple) = &mut apple {
+                apple.authorized = saved.as_ref().is_some_and(|saved| saved.contacts.is_some());
+            }
+            if snapshot.is_some() {
+                error = None;
+            }
+            snapshot
+        }
+        Err(cause) => {
+            error = Some(format!("{cause:#}"));
+            visible.cloned()
+        }
+    };
+    Ok(Update {
+        apple,
+        snapshot,
+        error,
+    })
+}
+
+fn sync(
+    root: &Path,
+    operation: Operation,
+    identity: Option<&linux_imessage::apple::Identity>,
+    saved: &mut Option<storage::SavedAppleAccount>,
+    previous: Option<&Snapshot>,
+) -> Result<Option<Snapshot>> {
     let (login, save_password) = match operation {
         Operation::Disconnect => {
-            if let Some(previous) = previous {
+            if let (Some(identity), Some(saved)) = (identity, saved)
+                && saved.contacts.take().is_some()
+            {
+                storage::save_apple_account(root, identity, saved)?;
+            }
+            if let Some(previous) = previous
+                && previous.profile.is_none()
+            {
                 storage::forget_secret(&password_key(root, &previous.account))?;
-                fs::remove_file(root.join(CACHE))
+            }
+            let path = root.join(CACHE);
+            if path.try_exists()? {
+                fs::remove_file(path)
                     .context("Could not remove the local iCloud Contacts cache")?;
             }
             return Ok(None);
         }
         Operation::Refresh => {
-            let Some(previous) = &previous else {
+            if let (Some(identity), Some(saved)) = (identity, saved)
+                && let Some(grant) = &saved.contacts
+            {
+                let recipients = runtime()?.block_on(carddav::fetch_with_apple_grant(grant))?;
+                let snapshot = Snapshot {
+                    account: saved.account.clone(),
+                    profile: Some(identity.profile_id()),
+                    recipients,
+                };
+                write_snapshot(root, &snapshot)?;
+                if let Some(previous) = previous
+                    && previous.profile.is_none()
+                {
+                    let _ = storage::forget_secret(&password_key(root, &previous.account));
+                }
+                return Ok(Some(snapshot));
+            }
+            let Some(previous) = previous.filter(|snapshot| snapshot.profile.is_none()) else {
                 return Ok(None);
             };
             let password = storage::read_password(&password_key(root, &previous.account))?;
@@ -335,38 +506,41 @@ fn run(root: &Path, operation: Operation) -> Result<Option<Snapshot>> {
             && password.bytes().all(|ch| ch.is_ascii_graphic()),
         "Enter the app-specific password generated by Apple"
     );
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    let recipients = runtime.block_on(carddav::fetch(&account, password))?;
+    let recipients = runtime()?.block_on(carddav::fetch(&account, password))?;
     let snapshot = Snapshot {
         account,
         recipients,
+        profile: None,
     };
-    let encoded = Zeroizing::new(serde_json::to_vec(&snapshot)?);
-    ensure!(
-        encoded.len() as u64 <= CACHE_LIMIT,
-        "The iCloud Contacts cache is too large"
-    );
-    let prior = previous
-        .as_ref()
-        .filter(|data| data.account != snapshot.account);
+    let prior = previous.filter(|data| data.account != snapshot.account && data.profile.is_none());
     let key = password_key(root, &snapshot.account);
     if save_password {
         storage::save_password(&key, password)?;
     }
-    if let Err(error) = storage::write_private(&root.join(CACHE), &encoded) {
-        if save_password
-            && previous
-                .as_ref()
-                .is_none_or(|data| data.account != snapshot.account)
-        {
+    if let Err(error) = write_snapshot(root, &snapshot) {
+        if save_password && previous.is_none_or(|data| data.account != snapshot.account) {
             let _ = storage::forget_secret(&key);
         }
-        return Err(error).context("Could not save the local iCloud Contacts cache");
+        return Err(error);
     }
     if let Some(prior) = prior {
         let _ = storage::forget_secret(&password_key(root, &prior.account));
     }
     Ok(Some(snapshot))
+}
+
+fn runtime() -> Result<tokio::runtime::Runtime> {
+    Ok(tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?)
+}
+
+fn write_snapshot(root: &Path, snapshot: &Snapshot) -> Result<()> {
+    let encoded = Zeroizing::new(serde_json::to_vec(snapshot)?);
+    ensure!(
+        encoded.len() as u64 <= CACHE_LIMIT,
+        "The iCloud Contacts cache is too large"
+    );
+    storage::write_private(&root.join(CACHE), &encoded)
+        .context("Could not save the local iCloud Contacts cache")
 }

@@ -437,6 +437,30 @@ pub(super) struct Computer {
 }
 
 impl Computer {
+    pub(super) fn for_contacts(identity: &super::Identity) -> Self {
+        let parts: Vec<_> = identity
+            .user_agent
+            .trim_matches(['[', ']'])
+            .splitn(4, ',')
+            .collect();
+        let (os, build, model) = match parts.as_slice() {
+            ["macOS", os, build, model] => (*os, *build, *model),
+            _ => ("15.7.5", "24G624", "Mac14,2"),
+        };
+        let seed = sha256(format!("icloud-contacts/{}", identity.profile_id()).as_bytes());
+        let uuid =
+            uuid::Builder::from_random_bytes(seed[..16].try_into().expect("Fixed UUID size"))
+                .into_uuid();
+        Self {
+            model: model.into(),
+            serial: String::new(),
+            uuid,
+            os_version: os.into(),
+            build_version: build.into(),
+            device_name: "iMessage for Linux".into(),
+        }
+    }
+
     fn validate(&self) -> Result<()> {
         let sample = |value: &str, max, extra: &[u8]| {
             (1..=max).contains(&value.len())
@@ -565,7 +589,7 @@ impl Drop for PushActivation {
     }
 }
 
-fn lock_profile(root: &Path, profile: &str) -> Result<std::fs::File> {
+pub(super) fn lock_profile(root: &Path, profile: &str) -> Result<std::fs::File> {
     let lock = OpenOptions::new()
         .mode(0o600)
         .create(true)

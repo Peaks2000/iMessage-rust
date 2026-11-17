@@ -16,6 +16,8 @@ The Linux app generates Anisette with its installed local ADI library and stores
 
 If Apple sends a sign-in alert to your iPhone or another trusted device, tap **Allow** and enter the six-digit code in iMessage. Choose **Use SMS** if you prefer a text message to a trusted phone number.
 
+With **Remember Apple Account password** selected, Linux Secret Service keeps the Apple Account credentials for later sign-in. The desktop also requests iCloud Contacts access from the same sign-in. Once authorized, Contacts syncs directly from iCloud whenever the app opens.
+
 For a source build, install the local Anisette library with `bash tools/build-local-adi.sh "$HOME/.local/lib/linux-imessage"`. The script uses Git, CMake, a C++20 compiler and the mbed TLS development libraries.
 
 The helper can use the system push signers from Apple's OS X El Capitan 10.11.6 Combo Update, El Capitan Security Update 2018-004, and macOS Big Sur 11.7.10. On El Capitan, it also uses the Combo Update's validation routines. The helper checks the exact system binaries before calling those routines. On Big Sur and later, it uses the validation interface in AppleAccount.framework. If the native push signer is unavailable and there is no cached push identity, setup needs your authorised Apple-issued activation chain (`activation-chain.pem`) and matching owner-only RSA private key (`activation-key.pem`) in `~/Library/Application Support/LinuxMessages`. Apple validates the signed activation before issuing a push certificate.

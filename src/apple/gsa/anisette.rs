@@ -8,7 +8,11 @@ use plist::{Dictionary, Value};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use zeroize::Zeroize;
 
-use super::super::{local_adi::LocalAdi, provider_command, provisioning::DeviceProvider};
+use super::super::{
+    local_adi::{LocalAdi, LocalAdiDevice},
+    provider_command,
+    provisioning::DeviceProvider,
+};
 
 const MAX_HEADERS: u64 = 16 * 1024;
 const REQUIRED: &[&str] = &[
@@ -64,7 +68,14 @@ impl Anisette {
         }
     }
 
-    pub(super) async fn headers(&mut self) -> Result<DeviceHeaders> {
+    pub(in crate::apple) fn local_device(&self) -> Option<&LocalAdiDevice> {
+        match &self.source {
+            Source::OnDevice(adi) => Some(adi.device()),
+            _ => None,
+        }
+    }
+
+    pub(in crate::apple) async fn headers(&mut self) -> Result<DeviceHeaders> {
         let bytes = match &mut self.source {
             Source::Helper(helper) => {
                 provider_command::run(helper, &[], "Anisette", &[], MAX_HEADERS).await?

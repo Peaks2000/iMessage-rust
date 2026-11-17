@@ -10,6 +10,7 @@ use openssl::{
     rand::rand_bytes,
     symm::{Cipher, decrypt_aead, encrypt_aead},
 };
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 const SERVICE: &str = "io.github.Peaks2000.LinuxMessages";
@@ -75,6 +76,44 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 
 fn entry(account: &str) -> Result<keyring::Entry> {
     keyring::Entry::new(SERVICE, account).context("Could not access Linux Secret Service")
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct SavedAppleAccount {
+    pub account: String,
+    pub password: Zeroizing<String>,
+    pub contacts: Option<crate::apple::IcloudContactsGrant>,
+}
+
+fn apple_account_key(root: &Path, identity: &crate::apple::Identity) -> String {
+    format!("apple-account:{}:{}", root.display(), identity.profile_id())
+}
+
+pub fn load_apple_account(
+    root: &Path,
+    identity: &crate::apple::Identity,
+) -> Result<Option<SavedAppleAccount>> {
+    match entry(&apple_account_key(root, identity))?.get_secret() {
+        Ok(bytes) => {
+            let bytes = Zeroizing::new(bytes);
+            serde_json::from_slice(&bytes).context("Could not read the remembered Apple Account")
+        }
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => {
+            Err(error).context("Could not read the Apple Account from Linux Secret Service")
+        }
+    }
+}
+
+pub fn save_apple_account(
+    root: &Path,
+    identity: &crate::apple::Identity,
+    account: &SavedAppleAccount,
+) -> Result<()> {
+    let bytes = Zeroizing::new(serde_json::to_vec(account)?);
+    entry(&apple_account_key(root, identity))?
+        .set_secret(&bytes)
+        .context("Could not remember the Apple Account in Linux Secret Service")
 }
 
 pub fn read_password(account: &str) -> Result<Zeroizing<String>> {
