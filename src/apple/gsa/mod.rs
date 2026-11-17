@@ -1,10 +1,11 @@
 mod anisette;
 mod srp;
 
-use std::path::Path;
+use std::{fmt, path::Path, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use chrono::{DateTime, Utc};
 use openssl::sha::sha256;
 use plist::{Dictionary, Value};
 use reqwest::{Client, Method, Response, StatusCode, header::HeaderValue};
@@ -22,6 +23,8 @@ use srp::Exchange;
 
 const GSA: &str = "https://gsa.apple.com";
 const PET_SERVICE: &str = "com.apple.gs.idms.pet";
+const DEFAULT_SIGN_IN_RETRY: Duration = Duration::from_secs(2);
+const MAX_SIGN_IN_RETRY: Duration = Duration::from_secs(10);
 
 pub struct TrustedPhone {
     id: u32,
@@ -170,6 +173,51 @@ impl ApplePhone {
     }
 }
 
+#[derive(Debug)]
+struct SignInUnavailable {
+    retry_after: Option<Duration>,
+}
+
+impl SignInUnavailable {
+    fn new(response: &Response) -> Self {
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| {
+                if let Ok(seconds) = value.parse::<u64>() {
+                    Some(Duration::from_secs(seconds))
+                } else {
+                    let date = DateTime::parse_from_rfc2822(value).ok()?;
+                    let delay = date.signed_duration_since(Utc::now());
+                    Some(delay.to_std().unwrap_or_default())
+                }
+            });
+        Self { retry_after }
+    }
+
+    fn retry_delay(&self) -> Option<Duration> {
+        let delay = self.retry_after.unwrap_or(DEFAULT_SIGN_IN_RETRY);
+        (delay <= MAX_SIGN_IN_RETRY).then_some(delay)
+    }
+}
+
+impl fmt::Display for SignInUnavailable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Apple Account sign-in is temporarily unavailable (HTTP 503)."
+        )?;
+        if let Some(delay) = self.retry_after.filter(|delay| !delay.is_zero()) {
+            let seconds = delay.as_secs() + u64::from(delay.subsec_nanos() != 0);
+            write!(formatter, " Apple requested a wait of {seconds} seconds.")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for SignInUnavailable {}
+
 struct PhoneOptions {
     phones: Vec<TrustedPhone>,
     sent_to: Option<u32>,
@@ -202,20 +250,14 @@ impl GrandSlam<'_> {
         password: &[u8; 32],
         prompts: &mut impl SmsPrompts,
     ) -> Result<LoginSession> {
-        let challenge = match self
-            .password_step(&anisette.headers().await?, account, password)
-            .await?
-        {
+        let challenge = match self.password_step(anisette, account, password).await? {
             PasswordStep::Verified(session) => return Ok(session),
             PasswordStep::Sms(challenge) => challenge,
         };
         if let Some(session) = self.complete_sms(anisette, &challenge, prompts).await? {
             return Ok(session);
         }
-        match self
-            .password_step(&anisette.headers().await?, account, password)
-            .await?
-        {
+        match self.password_step(anisette, account, password).await? {
             PasswordStep::Verified(session) => {
                 ensure!(
                     session.adsid == challenge.adsid,
@@ -261,12 +303,10 @@ impl GrandSlam<'_> {
 
     async fn password_step(
         &self,
-        device: &DeviceHeaders,
+        anisette: &mut Anisette,
         account: &str,
         password: &[u8; 32],
     ) -> Result<PasswordStep> {
-        let srp = Exchange::start()?;
-        let request_id = Uuid::new_v4().to_string().to_uppercase();
         let token = if self.mac_provisioned {
             self.push_token
                 .iter()
@@ -275,19 +315,39 @@ impl GrandSlam<'_> {
         } else {
             STANDARD.encode(self.push_token)
         };
-        let cpd = device.client_data(&request_id, &token);
-        let init = self
-            .srp_request(
-                device,
-                Dictionary::from_iter([
-                    ("o", "init".into()),
-                    ("u", account.into()),
-                    ("A2k", Value::Data(srp.public().to_vec())),
-                    ("ps", Value::Array(vec!["s2k".into(), "s2k_fo".into()])),
-                    ("cpd", Value::Dictionary(cpd.clone())),
-                ]),
-            )
-            .await?;
+        let mut retried = false;
+        let (device, srp, cpd, init) = loop {
+            let device = anisette.headers().await?;
+            let srp = Exchange::start()?;
+            let request_id = Uuid::new_v4().to_string().to_uppercase();
+            let cpd = device.client_data(&request_id, &token);
+            let result = self
+                .srp_request(
+                    &device,
+                    Dictionary::from_iter([
+                        ("o", "init".into()),
+                        ("u", account.into()),
+                        ("A2k", Value::Data(srp.public().to_vec())),
+                        ("ps", Value::Array(vec!["s2k".into(), "s2k_fo".into()])),
+                        ("cpd", Value::Dictionary(cpd.clone())),
+                    ]),
+                )
+                .await;
+            match result {
+                Ok(init) => break (device, srp, cpd, init),
+                Err(error) => {
+                    let delay = error
+                        .downcast_ref::<SignInUnavailable>()
+                        .and_then(SignInUnavailable::retry_delay);
+                    let Some(delay) = delay.filter(|_| !retried) else {
+                        return Err(error);
+                    };
+                    // Each attempt opens a fresh SRP exchange before submitting a password proof.
+                    retried = true;
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        };
         let salt = required_bytes(&init, "s")?;
         let server = required_bytes(&init, "B")?;
         let iterations = init
@@ -299,7 +359,7 @@ impl GrandSlam<'_> {
         let proof = srp.answer(account, password, salt, iterations, protocol, server)?;
         let complete = self
             .srp_request(
-                device,
+                &device,
                 Dictionary::from_iter([
                     ("o", "complete".into()),
                     ("u", account.into()),
@@ -389,13 +449,17 @@ impl GrandSlam<'_> {
             .await
             .context("Could not reach Apple Account sign-in")?;
         let status = response.status();
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            return Err(SignInUnavailable::new(&response).into());
+        }
         let body = read_response(response).await?;
-        let decoded: GsaReply = plist::from_bytes(&body).with_context(|| {
-            format!(
-                "Apple returned an unreadable sign-in response (HTTP {})",
-                status.as_u16()
-            )
-        })?;
+        let decoded: GsaReply = match plist::from_bytes(&body) {
+            Ok(decoded) => decoded,
+            Err(_) if !status.is_success() => {
+                anyhow::bail!("Apple Account sign-in failed (HTTP {})", status.as_u16())
+            }
+            Err(_) => anyhow::bail!("Apple returned an unreadable sign-in response"),
+        };
         let returned = decoded
             .response
             .get("Status")
@@ -610,6 +674,7 @@ mod tests {
 
     use axum::{
         Json, Router,
+        body::Bytes,
         extract::State,
         http::HeaderMap,
         response::IntoResponse,
@@ -700,17 +765,7 @@ mod tests {
                 identity_token: Zeroizing::new("fixture-identity".into()),
             };
             let temp = tempfile::tempdir()?;
-            let helper = temp.path().join("headers");
-            std::fs::write(
-                &helper,
-                r#"#!/bin/sh
-cat <<'JSON'
-{"X-Apple-I-MD":"otp","X-Apple-I-MD-M":"machine","X-Apple-I-MD-RINFO":"1","X-Apple-I-MD-LU":"local","X-Mme-Device-Id":"device","X-Apple-I-Client-Time":"2026-11-15T12:01:00Z","X-Mme-Client-Info":"fixture client","User-Agent":"fixture agent","Authorization":"must not be forwarded"}
-JSON
-"#,
-            )?;
-            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))?;
-            let mut anisette = Anisette::new(&helper)?;
+            let mut anisette = fixture_anisette(temp.path())?;
             let mut prompts = Prompts {
                 choices: 0,
                 code: "000123",
@@ -741,6 +796,113 @@ JSON
             server.abort();
         }
         Ok(())
+    }
+
+    #[derive(Clone)]
+    struct SignInFixture {
+        retry_after: &'static str,
+        requests: Arc<Mutex<Vec<Dictionary>>>,
+    }
+
+    #[tokio::test]
+    async fn unavailable_sign_in_retries_only_a_fresh_challenge() -> Result<()> {
+        for retry_after in ["0", "120"] {
+            let fixture = SignInFixture {
+                retry_after,
+                requests: Arc::new(Mutex::new(Vec::new())),
+            };
+            let app = Router::new()
+                .route(
+                    "/grandslam/GsService2",
+                    post(
+                        |State(fixture): State<SignInFixture>, body: Bytes| async move {
+                            let document: Dictionary = plist::from_bytes(&body).unwrap();
+                            let request = document["Request"].as_dictionary().unwrap().clone();
+                            let is_init = request["o"].as_string() == Some("init");
+                            let mut requests = fixture.requests.lock().unwrap();
+                            requests.push(request);
+                            if requests.len() == 1 || !is_init {
+                                return (
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    [
+                                        ("retry-after", fixture.retry_after),
+                                        ("content-type", "text/html"),
+                                    ],
+                                    "<html>Service Unavailable</html>",
+                                )
+                                    .into_response();
+                            }
+                            let reply = Dictionary::from_iter([(
+                                "Response",
+                                Value::Dictionary(Dictionary::from_iter([
+                                    (
+                                        "Status",
+                                        Value::Dictionary(Dictionary::from_iter([("ec", 0_i64)])),
+                                    ),
+                                    ("s", Value::Data(vec![1; 16])),
+                                    ("B", Value::Data(vec![3])),
+                                    ("i", 1.into()),
+                                    ("c", "fixture challenge".into()),
+                                ])),
+                            )]);
+                            (StatusCode::OK, plist_xml(&reply).unwrap().to_vec()).into_response()
+                        },
+                    ),
+                )
+                .with_state(fixture.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let origin = format!("http://{}", listener.local_addr()?);
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let client = Client::builder().no_proxy().build()?;
+            let service = GrandSlam {
+                client: &client,
+                origin: &origin,
+                push_token: [0; 32],
+                mac_provisioned: true,
+            };
+            let temp = tempfile::tempdir()?;
+            let mut anisette = fixture_anisette(temp.path())?;
+            let error = service
+                .password_step(&mut anisette, "fixture@example.com", &[1; 32])
+                .await
+                .err()
+                .context("The fixture returns an unavailable response")?;
+            assert!(error.is::<SignInUnavailable>());
+            let message = error.to_string();
+            assert!(
+                message.contains("Apple Account sign-in is temporarily unavailable (HTTP 503)")
+            );
+            let requests = fixture.requests.lock().unwrap();
+            if retry_after == "0" {
+                let operations: Vec<_> = requests
+                    .iter()
+                    .map(|request| request["o"].as_string().unwrap())
+                    .collect();
+                assert_eq!(operations, ["init", "init", "complete"]);
+                assert_ne!(requests[0]["A2k"], requests[1]["A2k"]);
+                assert_ne!(requests[0]["cpd"], requests[1]["cpd"]);
+                assert_eq!(requests[1]["cpd"], requests[2]["cpd"]);
+            } else {
+                assert_eq!(requests.len(), 1);
+                assert!(message.contains("120 seconds"));
+            }
+            server.abort();
+        }
+        Ok(())
+    }
+
+    fn fixture_anisette(root: &Path) -> Result<Anisette> {
+        let helper = root.join("headers");
+        std::fs::write(
+            &helper,
+            r#"#!/bin/sh
+cat <<'JSON'
+{"X-Apple-I-MD":"otp","X-Apple-I-MD-M":"machine","X-Apple-I-MD-RINFO":"1","X-Apple-I-MD-LU":"local","X-Mme-Device-Id":"device","X-Apple-I-Client-Time":"2026-11-15T12:01:00Z","X-Mme-Client-Info":"fixture client","User-Agent":"fixture agent","Authorization":"must not be forwarded"}
+JSON
+"#,
+        )?;
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))?;
+        Anisette::new(&helper)
     }
 
     fn assert_headers(headers: &HeaderMap) {
