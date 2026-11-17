@@ -125,6 +125,11 @@ struct MessageQuery {
     offset: u32,
 }
 
+#[derive(Deserialize)]
+struct ConversationQuery {
+    address: String,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct ApiError {
     pub error: String,
@@ -133,7 +138,10 @@ pub struct ApiError {
 pub fn router(engine: Engine, access: AccessPolicy) -> Router {
     Router::new()
         .route("/v1/status", get(status))
-        .route("/v1/conversations", get(conversations))
+        .route(
+            "/v1/conversations",
+            get(conversations).delete(delete_conversation),
+        )
         .route("/v1/messages", get(messages).post(send))
         .route("/v1/attachments/{id}/{index}", get(attachment))
         .layer(DefaultBodyLimit::max(
@@ -150,6 +158,14 @@ async fn status(State(engine): State<Engine>) -> Json<Status> {
 
 async fn conversations(State(engine): State<Engine>) -> Result<Json<Vec<Conversation>>, Failure> {
     Ok(Json(engine.chats()?))
+}
+
+async fn delete_conversation(
+    State(engine): State<Engine>,
+    Query(query): Query<ConversationQuery>,
+) -> Result<StatusCode, Failure> {
+    engine.delete_conversation(&query.address)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn messages(

@@ -2433,6 +2433,7 @@ name = "linux-imessage"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arboard",
  "argon2",
  "axum",
  "axum-server",
@@ -2456,6 +2457,7 @@ dependencies = [
  "plist",
  "prost",
  "quick-xml 0.38.4",
+ "raw-window-handle",
  "reqwest",
  "roxmltree",
  "rpassword",
@@ -2463,12 +2465,15 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "smithay-client-toolkit 0.20.0",
  "subtle",
  "tempfile",
  "tokio",
  "tokio-rustls",
  "url",
  "uuid",
+ "wayland-client",
+ "winit",
  "zeroize",
 ]
 

@@ -70,6 +70,7 @@ pub enum Action {
     Refresh(Option<String>),
     Older { chat: String, offset: u32 },
     Send(SendText),
+    DeleteConversation(String),
     Attachment { id: AttachmentId, purpose: Purpose },
 }
 
@@ -89,6 +90,10 @@ pub enum Event {
     Sent {
         request: SendText,
         result: Result<Message>,
+    },
+    ConversationDeleted {
+        chat: String,
+        result: Result<()>,
     },
     Attachment {
         id: AttachmentId,
@@ -228,6 +233,10 @@ async fn work(
                 let result = backend.send(&request).await;
                 Event::Sent { request, result }
             }
+            Action::DeleteConversation(chat) => {
+                let result = backend.delete_conversation(&chat).await;
+                Event::ConversationDeleted { chat, result }
+            }
             Action::Attachment { id, purpose } => {
                 let backend = backend.clone();
                 let events = events.clone();
@@ -322,6 +331,23 @@ impl Backend {
                             .json(request),
                     )
                     .await
+            }
+        }
+    }
+
+    async fn delete_conversation(&self, chat: &str) -> Result<()> {
+        match self {
+            Self::Local(engine) => engine.delete_conversation(chat),
+            Self::Remote(remote) => {
+                remote
+                    .body(
+                        remote
+                            .request(Method::DELETE, "/v1/conversations")
+                            .query(&[("address", chat)]),
+                        4096,
+                    )
+                    .await?;
+                Ok(())
             }
         }
     }

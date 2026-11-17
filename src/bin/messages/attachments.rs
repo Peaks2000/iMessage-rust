@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     fs::File,
-    io::{Cursor, Read, Write},
+    io::{self, Cursor, Read, Write},
     path::Path,
     sync::mpsc::{self, Receiver},
     time::Instant,
@@ -13,7 +13,10 @@ use eframe::egui::{
     self, Align, Align2, ColorImage, FontId, Layout, Rect, RichText, Sense, TextureHandle, Ui,
     Vec2, vec2,
 };
-use image::{DynamicImage, ImageDecoder, ImageReader, Limits, RgbaImage};
+use image::{
+    DynamicImage, ExtendedColorType, ImageDecoder, ImageEncoder, ImageReader, Limits, RgbaImage,
+    codecs::png::PngEncoder,
+};
 use linux_imessage::{Attachment, FILE_LIMIT, MAX_ATTACHMENTS, Upload};
 use uuid::Uuid;
 
@@ -339,6 +342,54 @@ impl TranscriptMedia {
 }
 
 impl LoadedFile {
+    pub(super) fn from_clipboard_bytes(bytes: Bytes) -> Result<Self> {
+        ensure!(bytes.len() <= FILE_LIMIT, "Paste an image up to 32 MiB");
+        let format = image::guess_format(&bytes).context("Could not read the clipboard image")?;
+        let suffix = format
+            .extensions_str()
+            .first()
+            .context("Unknown clipboard image format")?;
+        let file = Self::from_bytes(&format!("Pasted Image.{suffix}"), bytes)?;
+        ensure!(
+            file.preview.is_some(),
+            "Could not preview the clipboard image"
+        );
+        Ok(file)
+    }
+
+    pub(super) fn from_clipboard_pixels(image: arboard::ImageData<'_>) -> Result<Self> {
+        let width = u32::try_from(image.width)?;
+        let height = u32::try_from(image.height)?;
+        let pixels = u64::from(width) * u64::from(height);
+        ensure!(
+            (1..=MAX_PIXELS).contains(&pixels),
+            "The clipboard image is too large to preview"
+        );
+        ensure!(
+            image.bytes.len() as u64 == pixels * 4,
+            "Invalid clipboard image pixels"
+        );
+        let mut encoded = PastedPng(Vec::new());
+        PngEncoder::new(&mut encoded)
+            .write_image(&image.bytes, width, height, ExtendedColorType::Rgba8)
+            .context("Could not encode the clipboard image")?;
+        let image = RgbaImage::from_raw(width, height, image.bytes.into_owned())
+            .context("Invalid clipboard image pixels")?;
+        Ok(Self {
+            upload: Upload {
+                info: Attachment {
+                    name: "Pasted Image.png".to_owned(),
+                    mime: "image/png".to_owned(),
+                    size: encoded.0.len(),
+                    width,
+                    height,
+                },
+                bytes: encoded.0.into(),
+            },
+            preview: Some(color_image(&DynamicImage::ImageRgba8(image), 1024)),
+        })
+    }
+
     fn read(path: &Path) -> Result<Self> {
         ensure!(path.metadata()?.is_file(), "Select a regular file");
         let mut bytes = Vec::new();
@@ -405,6 +456,24 @@ impl LoadedFile {
             },
             preview,
         })
+    }
+}
+
+struct PastedPng(Vec<u8>);
+
+impl Write for PastedPng {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > FILE_LIMIT - self.0.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "Paste an image up to 32 MiB",
+            ));
+        }
+        self.0.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 

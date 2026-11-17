@@ -84,6 +84,10 @@ impl Engine {
         self.state.history()?.messages(&address(chat)?, offset)
     }
 
+    pub fn delete_conversation(&self, chat: &str) -> Result<()> {
+        self.state.history()?.delete_conversation(&address(chat)?)
+    }
+
     pub async fn send(&self, mut request: SendText) -> Result<Message> {
         request.address = address(&request.address)?;
         ensure!(
@@ -245,7 +249,8 @@ async fn send_on_courier(
 }
 
 fn read_previous(history: &History, request: &SendText) -> Result<Option<Message>> {
-    let existing = history.get(&request.id.to_string())?;
+    let id = request.id.to_string();
+    let existing = history.get(&id)?;
     if let Some(existing) = &existing {
         ensure!(
             existing.outgoing
@@ -257,6 +262,8 @@ fn read_previous(history: &History, request: &SendText) -> Result<Option<Message
                 }),
             "Message ID is already used by a different message"
         );
+    } else {
+        ensure!(!history.was_deleted(&id)?, "This message was deleted");
     }
     Ok(existing)
 }
@@ -354,6 +361,95 @@ mod tests {
         assert!(!start_send(&history, &request)?.1);
         request.files[0].bytes = bytes::Bytes::from_static(b"5678");
         assert!(start_send(&history, &request).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deleting_a_conversation_removes_attachments_and_rejects_replays() -> Result<()> {
+        let folder = tempfile::tempdir()?;
+        let history = History::open(folder.path(), "delete")?;
+        let request = SendText {
+            id: uuid::Uuid::new_v4(),
+            address: "tel:+15550100123".into(),
+            body: String::new(),
+            files: vec![Upload {
+                info: Attachment {
+                    name: "test.png".into(),
+                    mime: "image/png".into(),
+                    size: 1,
+                    width: 1,
+                    height: 1,
+                },
+                bytes: bytes::Bytes::from_static(b"x"),
+            }],
+        };
+        let (message, _) = start_send(&history, &request)?;
+        assert!(history.delete_conversation(&request.address).is_err());
+        history.update(&message.id, Delivery::Accepted)?;
+        let other = Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            address: "mailto:another@example.com".into(),
+            body: "Another conversation".into(),
+            outgoing: false,
+            timestamp_ms: now_ms(),
+            status: Delivery::Received,
+            attachments: Vec::new(),
+        };
+        history.insert(&other, [])?;
+        let engine = Engine {
+            state: Arc::new(State {
+                history: Mutex::new(history),
+                _lock: File::open(folder.path())?,
+            }),
+            requests: mpsc::channel(1).0,
+            status: watch::channel(Status {
+                connected: false,
+                detail: String::new(),
+            })
+            .1,
+        };
+        let router = crate::api::router(engine.clone(), crate::api::AccessPolicy::loopback());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/v1/conversations", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+        let client = reqwest::Client::builder().no_proxy().build()?;
+        let delete = || {
+            client
+                .delete(&url)
+                .query(&[("address", "+1 (555) 010-0123")])
+        };
+        assert_eq!(
+            delete().send().await?.status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
+        assert_eq!(engine.messages(&request.address, 0)?.len(), 1);
+        for _ in 0..2 {
+            assert_eq!(
+                delete()
+                    .header("x-messages-api", "1")
+                    .send()
+                    .await?
+                    .status(),
+                reqwest::StatusCode::NO_CONTENT
+            );
+        }
+        server.abort();
+        let history = engine.state.history()?;
+        assert!(history.attachment(request.id, 0).is_err());
+        assert!(start_send(&history, &request).is_err());
+        history.insert(
+            &message,
+            [MediaSource::Local(request.files[0].bytes.clone())],
+        )?;
+        assert!(history.messages(&request.address, 0)?.is_empty());
+        let new = Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            address: request.address.clone(),
+            ..other
+        };
+        history.insert(&new, [])?;
+        assert_eq!(history.chats()?.len(), 2);
+        assert_eq!(history.messages(&request.address, 0)?[0].id, new.id);
         Ok(())
     }
 }

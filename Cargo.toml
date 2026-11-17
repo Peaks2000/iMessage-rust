@@ -8,7 +8,11 @@ publish = false
 
 [features]
 default = ["desktop"]
-desktop = ["dep:eframe", "dep:heic-rs", "dep:image", "dep:linkify", "dep:phonenumber", "dep:roxmltree"]
+desktop = [
+    "dep:arboard", "dep:eframe", "dep:heic-rs", "dep:image", "dep:linkify",
+    "dep:phonenumber", "dep:raw-window-handle", "dep:roxmltree",
+    "dep:smithay-client-toolkit", "dep:wayland-client", "dep:winit",
+]
 
 [[bin]]
 name = "messages"
@@ -21,6 +25,7 @@ path = "src/bin/messages-server.rs"
 
 [dependencies]
 anyhow = "1"
+arboard = { version = "3.7", optional = true }
 argon2 = "0.5"
 axum = { version = "0.8", features = ["json"] }
 axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
@@ -44,6 +49,7 @@ phonenumber = { version = "0.3.10", optional = true }
 plist = "1"
 prost = "0.14"
 quick-xml = "0.38"
+raw-window-handle = { version = "0.6", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json", "cookies", "stream"] }
 roxmltree = { version = "0.21", default-features = false, features = ["std"], optional = true }
 rpassword = "7"
@@ -51,10 +57,13 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+smithay-client-toolkit = { version = "0.20", default-features = false, optional = true }
 subtle = "2"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 url = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+wayland-client = { version = "0.31", features = ["system", "dlopen"], optional = true }
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen", "x11"], optional = true }
 zeroize = { version = "1", features = ["derive", "serde"] }

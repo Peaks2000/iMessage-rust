@@ -25,6 +25,7 @@ impl History {
                 status TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS recent_messages ON messages(address, timestamp_ms DESC, id DESC);
+            CREATE TABLE IF NOT EXISTS deleted_messages (id TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS attachments (
                 message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
                 position INTEGER NOT NULL,
@@ -73,6 +74,31 @@ impl History {
         }
         rows.reverse();
         Ok(rows)
+    }
+
+    pub fn delete_conversation(&self, address: &str) -> Result<()> {
+        let transaction = self.0.unchecked_transaction()?;
+        let sending: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE address = ?1 AND status = 'pending')",
+            [address],
+            |row| row.get(0),
+        )?;
+        ensure!(!sending, "A message in this conversation is still sending");
+        transaction.execute(
+            "INSERT OR IGNORE INTO deleted_messages (id) SELECT id FROM messages WHERE address = ?1",
+            [address],
+        )?;
+        transaction.execute("DELETE FROM messages WHERE address = ?1", [address])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn was_deleted(&self, id: &str) -> Result<bool> {
+        Ok(self.0.query_row(
+            "SELECT EXISTS(SELECT 1 FROM deleted_messages WHERE id = ?1)",
+            [id],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn get(&self, id: &str) -> Result<Option<Message>> {
@@ -124,7 +150,10 @@ impl History {
     ) -> Result<()> {
         let transaction = self.0.unchecked_transaction()?;
         let inserted = transaction.execute(
-            "INSERT INTO messages (id, address, body, outgoing, timestamp_ms, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(id) DO NOTHING",
+            "INSERT INTO messages (id, address, body, outgoing, timestamp_ms, status)
+            SELECT ?1, ?2, ?3, ?4, ?5, ?6
+            WHERE NOT EXISTS (SELECT 1 FROM deleted_messages WHERE id = ?1)
+            ON CONFLICT(id) DO NOTHING",
             params![
                 message.id,
                 message.address,

@@ -9,6 +9,8 @@ mod attachments;
 mod carddav;
 #[path = "messages/chrome.rs"]
 mod chrome;
+#[path = "messages/clipboard.rs"]
+mod clipboard;
 #[path = "messages/connection.rs"]
 mod connection;
 #[path = "messages/contacts.rs"]
@@ -53,16 +55,12 @@ fn main() -> anyhow::Result<()> {
             .with_min_inner_size([700., 480.]),
         ..Default::default()
     };
-    eframe::run_native(
-        "Messages for Linux",
-        options,
-        Box::new(move |context| {
-            Ok(Box::new(window::MessagesApp::new(
-                &context.egui_ctx,
-                root,
-                args.mac_setup,
-            )))
-        }),
-    )
-    .map_err(|error| anyhow::anyhow!("{error}"))
+    clipboard::run("Messages for Linux", options, move |context, clipboard| {
+        Box::new(window::MessagesApp::new(
+            &context.egui_ctx,
+            root,
+            args.mac_setup,
+            clipboard,
+        ))
+    })
 }

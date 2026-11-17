@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
+    rc::Rc,
     sync::mpsc::{Receiver, TryRecvError},
     time::{Duration, Instant},
 };
@@ -19,6 +20,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use super::{
     attachments::{self, AttachmentId, DraftFile, LoadedFile, Preview, TranscriptMedia},
+    clipboard::Clipboard,
     connection::{Action, Connection, Event, Mode, Settings},
     contacts::Contacts,
     links::MessageText,
@@ -38,6 +40,7 @@ pub struct MessagesApp {
     root: PathBuf,
     config: Settings,
     settings: Option<SettingsForm>,
+    delete_conversation: Option<DeleteConversation>,
     session_import: Option<SessionImport>,
     mac_setup: Option<MacSetup>,
     contacts: Contacts,
@@ -59,6 +62,7 @@ pub struct MessagesApp {
     drafts: HashMap<String, Draft>,
     pending_draft: Option<Draft>,
     picking: Option<(String, Receiver<anyhow::Result<Vec<LoadedFile>>>)>,
+    clipboard: Rc<Clipboard>,
     media: TranscriptMedia,
     composing: Option<String>,
     compose_error: Option<String>,
@@ -85,6 +89,12 @@ struct SettingsForm {
     opened: Instant,
 }
 
+struct DeleteConversation {
+    chat: String,
+    pending: bool,
+    error: Option<String>,
+}
+
 impl Drop for SettingsForm {
     fn drop(&mut self) {
         self.password.zeroize();
@@ -92,7 +102,12 @@ impl Drop for SettingsForm {
 }
 
 impl MessagesApp {
-    pub fn new(ctx: &egui::Context, root: PathBuf, mac_setup: bool) -> Self {
+    pub fn new(
+        ctx: &egui::Context,
+        root: PathBuf,
+        mac_setup: bool,
+        clipboard: Rc<Clipboard>,
+    ) -> Self {
         chrome::theme(ctx);
         let (config, error) = match Settings::read(&root) {
             Ok(config) => (config, None),
@@ -113,6 +128,7 @@ impl MessagesApp {
             root,
             config,
             settings: None,
+            delete_conversation: None,
             session_import: None,
             mac_setup: mac_setup.then(MacSetup::new),
             contacts,
@@ -134,6 +150,7 @@ impl MessagesApp {
             drafts: HashMap::new(),
             pending_draft: None,
             picking: None,
+            clipboard,
             media: TranscriptMedia::default(),
             composing: None,
             compose_error: None,
@@ -159,6 +176,7 @@ impl MessagesApp {
             match event {
                 Event::Ready(status) => {
                     self.connection = self.candidate.take();
+                    self.delete_conversation = None;
                     if let Some(form) = self.settings.take() {
                         self.config = form.config.clone();
                     }
@@ -225,7 +243,13 @@ impl MessagesApp {
                     if let Some((chat, messages)) = thread
                         && self.selected.as_deref() == Some(&chat)
                     {
-                        if self.messages.len() < PAGE_SIZE as usize {
+                        if messages.len() < PAGE_SIZE as usize && !self.sending {
+                            // A complete refresh also reflects deletions made by another client.
+                            self.messages.retain(|previous| {
+                                messages.iter().any(|message| message.id == previous.id)
+                            });
+                            self.history_all = true;
+                        } else if self.messages.len() < PAGE_SIZE as usize {
                             self.history_all = messages.len() < PAGE_SIZE as usize;
                         }
                         if self.thread_loaded {
@@ -293,6 +317,15 @@ impl MessagesApp {
                     }
                     self.refresh_at = Instant::now();
                 }
+                Event::ConversationDeleted { chat, result } => match result {
+                    Ok(()) => self.conversation_deleted(&chat),
+                    Err(error) => {
+                        if let Some(form) = &mut self.delete_conversation {
+                            form.pending = false;
+                            form.error = Some(format!("{error:#}"));
+                        }
+                    }
+                },
                 Event::Attachment {
                     id,
                     purpose,
@@ -332,9 +365,9 @@ impl MessagesApp {
         let result = match pending.try_recv() {
             Ok(result) => result,
             Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => {
-                Err(anyhow::anyhow!("The file picker closed unexpectedly"))
-            }
+            Err(TryRecvError::Disconnected) => Err(anyhow::anyhow!(
+                "Loading the attachment stopped unexpectedly"
+            )),
         };
         let (chat, _) = self.picking.take().expect("A picker returned a result");
         match result {
@@ -495,6 +528,10 @@ impl MessagesApp {
         } else {
             self.pins.push(address.to_owned());
         }
+        self.save_pins();
+    }
+
+    fn save_pins(&mut self) {
         if let Err(error) = serde_json::to_vec(&self.pins)
             .map_err(anyhow::Error::from)
             .and_then(|bytes| storage::write_private(&self.pins_path(), &bytes))
@@ -571,7 +608,7 @@ impl MessagesApp {
                     self.search.trim().to_lowercase()
                 };
                 let mut clicked = None;
-                let mut pin_change = None;
+                let mut menu = None;
                 ScrollArea::vertical()
                     .id_salt("conversation-list")
                     .auto_shrink([false, false])
@@ -607,8 +644,9 @@ impl MessagesApp {
                                             if response.clicked() {
                                                 clicked = Some(chat.address.clone());
                                             }
-                                            if pin_menu(&response, true) {
-                                                pin_change = Some(chat.address.clone());
+                                            if let Some(action) = conversation_menu(&response, true)
+                                            {
+                                                menu = Some((chat.address.clone(), action));
                                             }
                                         }
                                     });
@@ -640,8 +678,8 @@ impl MessagesApp {
                             if response.clicked() {
                                 clicked = Some(chat.address.clone());
                             }
-                            if pin_menu(&response, pinned) {
-                                pin_change = Some(chat.address.clone());
+                            if let Some(action) = conversation_menu(&response, pinned) {
+                                menu = Some((chat.address.clone(), action));
                             }
                         }
 
@@ -665,8 +703,17 @@ impl MessagesApp {
                     self.composing = None;
                     self.select(address, false);
                 }
-                if let Some(address) = pin_change {
-                    self.toggle_pin(&address);
+                if let Some((chat, action)) = menu {
+                    match action {
+                        ConversationMenu::TogglePin => self.toggle_pin(&chat),
+                        ConversationMenu::Delete => {
+                            self.delete_conversation = Some(DeleteConversation {
+                                chat,
+                                pending: false,
+                                error: None,
+                            })
+                        }
+                    }
                 }
                 let rect = ui.max_rect();
                 ui.painter().line_segment(
@@ -702,11 +749,11 @@ impl MessagesApp {
         );
     }
 
-    fn right_panel(&mut self, ctx: &egui::Context) {
+    fn right_panel(&mut self, ctx: &egui::Context, paste: bool) {
         let chat = self.selected.clone().filter(|_| self.composing.is_none());
         self.toolbar(ctx, chat.as_deref());
         if let Some(chat) = &chat {
-            self.composer(ctx, chat);
+            self.composer(ctx, chat, paste);
         }
         egui::CentralPanel::default()
             .frame(Frame::new().fill(CANVAS).corner_radius(egui::CornerRadius {
@@ -918,14 +965,16 @@ impl MessagesApp {
             });
     }
 
-    fn composer(&mut self, ctx: &egui::Context, chat: &str) {
+    fn composer(&mut self, ctx: &egui::Context, chat: &str, paste: bool) {
         let can_attach = self.connection.is_some() && !self.sending && self.picking.is_none();
-        if can_attach
+        let accepts_attachments = can_attach
             && self.settings.is_none()
+            && self.delete_conversation.is_none()
             && self.mac_setup.is_none()
             && self.session_import.is_none()
-            && !self.media.is_open()
-        {
+            && !self.contacts.is_open()
+            && !self.media.is_open();
+        if accepts_attachments {
             let dropped = ctx.input_mut(|input| std::mem::take(&mut input.raw.dropped_files));
             if !dropped.is_empty() {
                 self.picking = Some((
@@ -960,6 +1009,7 @@ impl MessagesApp {
 
                 let enabled = self.status.as_ref().is_some_and(|status| status.connected)
                     && !self.sending
+                    && self.delete_conversation.is_none()
                     && self.picking.is_none();
                 let draft = self.drafts.entry(chat.to_owned()).or_default();
                 let mut send = false;
@@ -1061,7 +1111,16 @@ impl MessagesApp {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 0.;
                                 let id = ui.make_persistent_id(("draft", chat));
-                                let enter = ui.memory(|memory| memory.has_focus(id))
+                                let focused = ui.memory(|memory| memory.has_focus(id));
+                                if paste
+                                    && focused
+                                    && accepts_attachments
+                                    && self.picking.is_none()
+                                    && let Some(load) = self.clipboard.load_image(ctx)
+                                {
+                                    self.picking = Some((chat.to_owned(), load));
+                                }
+                                let enter = focused
                                     && ui.input_mut(|input| {
                                         input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
                                     });
@@ -1072,7 +1131,7 @@ impl MessagesApp {
                                     .auto_shrink([true, true])
                                     .show(ui, |ui| {
                                         ui.add_enabled(
-                                            !self.sending,
+                                            !self.sending && self.delete_conversation.is_none(),
                                             TextEdit::multiline(&mut draft.text)
                                                 .id(id)
                                                 .frame(false)
@@ -1163,7 +1222,7 @@ impl MessagesApp {
                             .size(11.),
                     );
                 }
-                if send {
+                if send && self.picking.is_none() {
                     self.send(chat);
                 }
                 if let Some(photos) = picker
@@ -1363,6 +1422,93 @@ impl MessagesApp {
                 self.session_import = None;
                 self.contacts.refresh_now(ctx);
                 self.open_saved_session(ctx);
+            }
+        }
+    }
+
+    fn conversation_deleted(&mut self, chat: &str) {
+        self.delete_conversation = None;
+        self.error = None;
+        self.chats.retain(|entry| entry.address != chat);
+        self.drafts.remove(chat);
+        if self
+            .retry
+            .as_ref()
+            .is_some_and(|request| request.address == chat)
+        {
+            self.retry = None;
+        }
+        if self
+            .picking
+            .as_ref()
+            .is_some_and(|(address, _)| address == chat)
+        {
+            self.picking = None;
+        }
+        let pinned = self.pins.len();
+        self.pins.retain(|address| address != chat);
+        if pinned != self.pins.len() {
+            self.save_pins();
+        }
+        if self.selected.as_deref() == Some(chat) {
+            self.selected = None;
+            self.messages.clear();
+            self.message_motion.clear();
+            self.info_started = None;
+            self.media = TranscriptMedia::default();
+            if let Some(next) = self.chats.first() {
+                self.select(next.address.clone(), false);
+            }
+        }
+        self.refresh_at = Instant::now();
+    }
+
+    fn delete_dialog(&mut self, ctx: &egui::Context) {
+        let Some(form) = &mut self.delete_conversation else {
+            return;
+        };
+        let name = self.contacts.name(&form.chat);
+        let location = match self.config.mode {
+            Mode::Local => "this computer",
+            Mode::Remote => "the server",
+        };
+        let panel = egui::Modal::new(egui::Id::new("delete-conversation"))
+            .frame(chrome::sheet())
+            .show(ctx, |ui| {
+                ui.set_width(345.);
+                ui.label(chrome::bold("Delete Conversation?", 19.));
+                ui.label(format!("Remove all messages and attachments in the conversation with {name} from {location}."));
+                if let Some(error) = &form.error {
+                    ui.label(RichText::new(error).color(DANGER));
+                }
+                ui.add_space(6.);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let label = if form.pending { "Deleting…" } else { "Delete" };
+                    let delete = ui.add_enabled(
+                        self.connection.is_some() && !form.pending,
+                        egui::Button::new(RichText::new(label).color(Color32::WHITE))
+                            .fill(DANGER)
+                            .corner_radius(5)
+                            .min_size(vec2(70., 25.)),
+                    ).clicked();
+                    let cancel = ui.add_enabled(!form.pending, egui::Button::new("Cancel")
+                        .min_size(vec2(65., 25.))).clicked();
+                    (cancel, delete)
+                }).inner
+            });
+        let (cancel, delete) = panel.inner;
+        if !form.pending && (cancel || panel.should_close()) {
+            self.delete_conversation = None;
+        } else if delete && let Some(connection) = &self.connection {
+            if connection
+                .actions
+                .send(Action::DeleteConversation(form.chat.clone()))
+                .is_ok()
+            {
+                form.pending = true;
+                form.error = None;
+            } else {
+                form.error = Some("The Messages connection is unavailable".to_owned());
             }
         }
     }
@@ -1573,13 +1719,19 @@ impl MessagesApp {
 }
 
 impl eframe::App for MessagesApp {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
+        self.clipboard.restore_wayland_text_paste(input);
+    }
+
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         [0., 0., 0., 0.]
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process(ctx);
+        let paste = self.clipboard.take_paste_request(ctx);
         if self.settings.is_none()
+            && self.delete_conversation.is_none()
             && self.mac_setup.is_none()
             && !self.media.is_open()
             && !self.contacts.is_open()
@@ -1599,8 +1751,10 @@ impl eframe::App for MessagesApp {
             }
         }
         self.sidebar(ctx);
-        self.right_panel(ctx);
-        if self.mac_setup.is_some() {
+        self.right_panel(ctx, paste);
+        if self.delete_conversation.is_some() {
+            self.delete_dialog(ctx);
+        } else if self.mac_setup.is_some() {
             self.mac_setup_dialog(ctx);
         } else if self.session_import.is_some() {
             self.import_dialog(ctx);
@@ -1671,8 +1825,13 @@ fn settings_field(ui: &mut Ui, label: &str, value: &mut String, hint: &str, secr
     .labelled_by(label.id);
 }
 
-fn pin_menu(response: &egui::Response, pinned: bool) -> bool {
-    let mut toggle = false;
+enum ConversationMenu {
+    TogglePin,
+    Delete,
+}
+
+fn conversation_menu(response: &egui::Response, pinned: bool) -> Option<ConversationMenu> {
+    let mut action = None;
     response.context_menu(|ui| {
         if ui
             .button(if pinned {
@@ -1682,11 +1841,18 @@ fn pin_menu(response: &egui::Response, pinned: bool) -> bool {
             })
             .clicked()
         {
-            toggle = true;
+            action = Some(ConversationMenu::TogglePin);
+            ui.close();
+        }
+        if ui
+            .button(RichText::new("Delete Conversation…").color(DANGER))
+            .clicked()
+        {
+            action = Some(ConversationMenu::Delete);
             ui.close();
         }
     });
-    toggle
+    action
 }
 
 fn pin_tile(
