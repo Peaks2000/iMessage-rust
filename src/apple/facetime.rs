@@ -10,6 +10,8 @@ use uuid::Uuid;
 
 use crate::{CallMode, IncomingCall, address, now_ms};
 
+#[cfg(test)]
+pub(crate) use description::tests::signed_avc_fixture;
 #[cfg(feature = "desktop")]
 pub(crate) use description::{
     AAC_ELD_PT, AAC_ELD_SAMPLE_RATE, AUDIO_RED_PT, CAMERA_HEIGHT, CAMERA_WIDTH, CallDevice,
@@ -17,7 +19,10 @@ pub(crate) use description::{
 };
 pub use description::{CallAvcMaterial, CallMediaDescription, CallRtpDescription};
 pub use media::{CallKey, CallKeyOffer, CallMediaHandshake, CallMediaKey, CallPeerKeys};
-pub(crate) use media::{CallMediaExchange, PeerKeyOffer, PeerMediaOffer, PeerPrekey};
+pub(crate) use media::{
+    CallMediaExchange, LocalCallPrekey, PeerKeyOffer, PeerMediaOffer, PeerPrekey,
+};
+pub(crate) use relay::OutgoingRelay;
 pub use relay::{
     CallRelayAllocation, CallRelayBinding, CallRelayConnection, CallRelayKeys, CallRelayProfile,
     CallRelayStream, RelayChannel, RelayDatagramChannel, RelayStreamDirection,
@@ -35,7 +40,7 @@ pub(super) const LEAVE_COMMAND: u64 = 208;
 pub(super) const PREKEY_COMMAND: u64 = 210;
 pub(super) const KEY_MATERIAL_COMMAND: u64 = 211;
 pub(super) const DECLINE: u64 = 9;
-const RING_TIMEOUT_MS: i64 = 45_000;
+pub(crate) const RING_TIMEOUT_MS: i64 = 45_000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CallEndpoint {
@@ -77,6 +82,11 @@ pub(crate) enum CallSignal {
         endpoint: CallEndpoint,
         media: Option<PeerMediaOffer>,
     },
+    Accepted {
+        call: IncomingCall,
+        endpoint: CallEndpoint,
+        media: PeerMediaOffer,
+    },
     Prekey {
         id: Uuid,
         sender: String,
@@ -97,6 +107,15 @@ pub(crate) enum CallSignal {
     },
 }
 
+impl CallSignal {
+    pub(crate) fn id(&self) -> Uuid {
+        match self {
+            Self::Ring { call, .. } | Self::Accepted { call, .. } => call.id,
+            Self::Prekey { id, .. } | Self::MediaKeys { id, .. } | Self::End { id, .. } => *id,
+        }
+    }
+}
+
 #[derive(prost::Message)]
 struct ConversationSignal {
     #[prost(int32, tag = "2")]
@@ -107,8 +126,18 @@ struct ConversationSignal {
     participants: Vec<Participant>,
     #[prost(string, tag = "5")]
     group_id: String,
+    #[prost(message, repeated, tag = "19")]
+    invitation_preferences: Vec<InvitationPreference>,
     #[prost(int32, optional, tag = "28")]
     mode: Option<i32>,
+}
+
+#[derive(prost::Message)]
+struct InvitationPreference {
+    #[prost(int32, tag = "2")]
+    handle_kind: i32,
+    #[prost(uint32, tag = "3")]
+    notification_style: u32,
 }
 
 #[derive(prost::Message)]
@@ -212,32 +241,72 @@ pub(super) fn participant_update(
     own: &str,
     caller: &str,
     join: Option<(&[u8], &[u8; 65], CallMode)>,
+    initiator: bool,
 ) -> plist::Dictionary {
-    let call = allocation.call_id.to_string().to_ascii_uppercase();
+    participant_payload(
+        allocation.call_id,
+        own,
+        caller,
+        allocation.local_participant,
+        [allocation.caller_participant],
+        initiator,
+        join,
+    )
+}
+
+pub(super) fn outgoing_invitation(
+    allocation: &OutgoingRelay,
+    own: &str,
+    recipient: &str,
+    join: Option<(&[u8], &[u8; 65], CallMode)>,
+) -> plist::Dictionary {
+    participant_payload(
+        allocation.call_id(),
+        own,
+        recipient,
+        allocation.local_participant(),
+        allocation
+            .endpoints()
+            .iter()
+            .filter_map(|endpoint| endpoint.participant()),
+        true,
+        join,
+    )
+}
+
+fn participant_payload(
+    session: Uuid,
+    own: &str,
+    caller: &str,
+    local_participant: u64,
+    recipient_participants: impl IntoIterator<Item = u64>,
+    initiator: bool,
+    join: Option<(&[u8], &[u8; 65], CallMode)>,
+) -> plist::Dictionary {
+    let call = session.to_string().to_ascii_uppercase();
     let members = [own, caller];
     let participants = plist::Dictionary::from_iter([
-        (
-            own,
-            Value::Array(vec![Value::from(allocation.local_participant)]),
-        ),
+        (own, Value::Array(vec![Value::from(local_participant)])),
         (
             caller,
-            Value::Array(vec![Value::from(allocation.caller_participant)]),
+            Value::Array(
+                recipient_participants
+                    .into_iter()
+                    .map(Value::from)
+                    .collect(),
+            ),
         ),
     ]);
     let mut update = plist::Dictionary::from_iter([
         ("s", Value::from(call.as_str())),
         ("fanout-groupID-key", Value::from(call.as_str())),
-        ("is-initiator-key", Value::Boolean(false)),
+        ("is-initiator-key", Value::Boolean(initiator)),
         ("is-u-plus-one-key", Value::Boolean(join.is_none())),
         (
             "join-notification-key",
             Value::from(if join.is_some() { 1 } else { 2 }),
         ),
-        (
-            "participant-id-key",
-            Value::from(allocation.local_participant),
-        ),
+        ("participant-id-key", Value::from(local_participant)),
         (
             "fanout-groupMembers-key",
             Value::Array(members.into_iter().map(Value::from).collect()),
@@ -254,6 +323,19 @@ pub(super) fn participant_update(
                 })
                 .collect(),
             message: Some(ConversationSignal {
+                kind: i32::from(initiator),
+                group_id: call.clone(),
+                invitation_preferences: if initiator {
+                    [2, 1, 3]
+                        .into_iter()
+                        .map(|handle_kind| InvitationPreference {
+                            handle_kind,
+                            notification_style: 1,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                },
                 mode: Some(if video { 2 } else { 1 }),
                 ..Default::default()
             }),
@@ -339,7 +421,7 @@ pub(crate) fn decode(
                 id,
                 sender,
                 received_ms,
-                endpoint: None,
+                endpoint: Some(CallEndpoint::new(push_token, None)),
             }),
             _ => None,
         };
@@ -390,8 +472,7 @@ pub(crate) fn decode(
             let offer = context.message.as_ref()?;
             if offer.suppress_ui
                 || (!offer.group_id.is_empty() && Uuid::parse_str(&offer.group_id).ok() != Some(id))
-                || !(offer.kind == 1
-                    || (offer.kind == 0 && participant.is_initiator_key == Some(true)))
+                || !matches!(offer.kind, 0 | 1)
             {
                 return None;
             }
@@ -417,16 +498,25 @@ pub(crate) fn decode(
                     }
                 })
             });
-            Some(ring(
-                id,
-                sender,
-                mode,
-                endpoint,
-                Some(PeerMediaOffer {
-                    description: description.into(),
-                    prekey,
-                }),
-            ))
+            let media = PeerMediaOffer {
+                description: description.into(),
+                prekey,
+            };
+            if offer.kind == 1 || participant.is_initiator_key == Some(true) {
+                Some(ring(id, sender, mode, endpoint, Some(media)))
+            } else {
+                Some(CallSignal::Accepted {
+                    call: IncomingCall {
+                        id,
+                        caller: sender,
+                        mode,
+                        received_ms,
+                        expires_ms,
+                    },
+                    endpoint,
+                    media,
+                })
+            }
         }
         LEAVE_COMMAND => Some(CallSignal::End {
             id,
@@ -595,7 +685,11 @@ mod tests {
         assert!(parse(JOIN_COMMAND, &context, wire.clone(), peer, own)?.is_none());
         context.message.as_mut().unwrap().group_id.clear();
         context.message.as_mut().unwrap().kind = 0;
-        assert!(parse(JOIN_COMMAND, &context, wire.clone(), peer, own)?.is_none());
+        assert!(
+            matches!(parse(JOIN_COMMAND, &context, wire.clone(), peer, own)?,
+            Some(CallSignal::Accepted { call, endpoint, .. }) if call.id == id
+                && endpoint == CallEndpoint::new([7; 32], Some(-11_i64 as u64)))
+        );
         wire.insert("is-initiator-key".into(), Value::Boolean(true));
         context.video = Some(false);
         assert!(

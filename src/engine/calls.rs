@@ -12,6 +12,7 @@ use zeroize::Zeroizing;
 mod aac;
 #[cfg(feature = "desktop")]
 mod audio;
+pub(super) mod outgoing;
 #[cfg(feature = "desktop")]
 pub mod video;
 
@@ -33,6 +34,21 @@ pub struct CallAnswerConfig<'a> {
     pub mode: CallMode,
     pub avc_plist: &'a [u8],
     pub relay_profile: CallRelayProfile<'a>,
+}
+
+#[cfg(feature = "desktop")]
+impl<'a> CallAnswerConfig<'a> {
+    fn desktop(device: &'a crate::apple::CallDevice, avc_plist: &'a [u8], mode: CallMode) -> Self {
+        Self {
+            mode,
+            avc_plist,
+            relay_profile: CallRelayProfile {
+                os_version: &device.relay_os_version,
+                hardware_version: &device.model,
+                capabilities: 9_271_791, // QuickRelay one-to-one channel binding.
+            },
+        }
+    }
 }
 
 /// A joined call with verified peer media parameters and a live relay.
@@ -139,6 +155,7 @@ pub(super) struct ConnectedCall {
     pub(super) endpoint: CallEndpoint,
     pub(super) relay: Arc<CallRelayAllocation>,
     pub(super) exchange: CallMediaExchange,
+    pub(super) initiator: bool,
     local_hangup: oneshot::Receiver<()>,
     _ended: watch::Sender<()>,
 }
@@ -158,19 +175,8 @@ impl Engine {
             .as_ref()
             .context("The local Apple session has no FaceTime device profile")?;
         let avc_plist = device.description(mode)?;
-        self.answer_call(
-            id,
-            CallAnswerConfig {
-                mode,
-                avc_plist: &avc_plist,
-                relay_profile: CallRelayProfile {
-                    os_version: &device.relay_os_version,
-                    hardware_version: &device.model,
-                    capabilities: 9_271_791, // QuickRelay one-to-one channel binding.
-                },
-            },
-        )
-        .await
+        self.answer_call(id, CallAnswerConfig::desktop(device, &avc_plist, mode))
+            .await
     }
 
     /// Answer the identified incoming call using the provided, locally supported media description.
@@ -209,13 +215,11 @@ impl Engine {
                 .await?;
             Ok::<_, anyhow::Error>((relay, local_keys, allocation.caller_participant, attempt))
         };
-        let (mut relay, local_keys, caller_participant, AnswerAttempt { lease, handshake }) = tokio::select! {
+        let (relay, local_keys, caller_participant, AnswerAttempt { lease, handshake }) = tokio::select! {
             biased;
             error = wait_for_ring_to_end(self.watch_status(), id) => return Err(error),
             result = timeout(remaining, setup) => result.context("The FaceTime call expired during setup")??,
         };
-        let mut peer_keys = handshake.watch_peer_keys();
-
         let (reply, joined) = oneshot::channel();
         self.requests
             .try_send(Request::JoinCall {
@@ -228,37 +232,18 @@ impl Engine {
                 reply,
             })
             .context("The Apple engine is busy or stopped")?;
-        let mut lifetime = joined
+        let lifetime = joined
             .await
             .context("The Apple engine stopped before joining FaceTime")??;
-        // Announce our route while the IDS engine receives the peer's keys.
-        let media_setup = async {
-            relay.negotiate_media_path().await?;
-            wait_for_media(&handshake, &mut relay, &mut peer_keys).await
-        };
-        let remote_description = tokio::select! {
-            biased;
-            _ = lifetime.ended.changed() => anyhow::bail!("This FaceTime call has ended"),
-            result = timeout(MEDIA_SETUP_TIMEOUT, media_setup) =>
-                result.context("The caller did not finish FaceTime media setup")??,
-        };
-        let rtp = CallRtpProtection::new(
-            id,
-            caller_participant,
-            &local_keys.media,
-            &local_description,
-            &remote_description,
-        )?;
-        Ok(AnsweredCall {
-            call: handshake.call().clone(),
-            local_description,
-            remote_description,
-            local_keys,
+        complete_media(
+            handshake,
             relay,
-            peer_keys,
+            local_keys,
+            local_description,
+            caller_participant,
             lifetime,
-            rtp,
-        })
+        )
+        .await
     }
 
     async fn wait_for_caller_prekey(&self, id: Uuid) -> Result<AnswerAttempt> {
@@ -300,6 +285,45 @@ async fn wait_for_ring_to_end(mut status: watch::Receiver<Status>, id: Uuid) -> 
     }
 }
 
+async fn complete_media(
+    handshake: Arc<CallMediaHandshake>,
+    mut relay: CallRelayBinding,
+    local_keys: Arc<CallKeyOffer>,
+    local_description: CallMediaDescription,
+    peer_participant: u64,
+    mut lifetime: AnswerLifetime,
+) -> Result<AnsweredCall> {
+    let mut peer_keys = handshake.watch_peer_keys();
+    // Announce our route while the IDS engine receives the peer's keys.
+    let media_setup = async {
+        relay.negotiate_media_path().await?;
+        wait_for_media(&handshake, &mut relay, &mut peer_keys).await
+    };
+    let remote_description = tokio::select! {
+        biased;
+        _ = lifetime.ended.changed() => anyhow::bail!("This FaceTime call has ended"),
+        result = timeout(MEDIA_SETUP_TIMEOUT, media_setup) =>
+            result.context("The other device did not finish FaceTime media setup")??,
+    };
+    let rtp = CallRtpProtection::new(
+        handshake.call().id,
+        peer_participant,
+        &local_keys.media,
+        &local_description,
+        &remote_description,
+    )?;
+    Ok(AnsweredCall {
+        call: handshake.call().clone(),
+        local_description,
+        remote_description,
+        local_keys,
+        relay,
+        peer_keys,
+        lifetime,
+        rtp,
+    })
+}
+
 async fn wait_for_media(
     handshake: &CallMediaHandshake,
     relay: &mut CallRelayBinding,
@@ -335,12 +359,7 @@ impl IncomingCalls {
             "FaceTime is disconnected"
         );
         ensure!(
-            self.connected.is_none()
-                && self
-                    .answering
-                    .as_ref()
-                    .and_then(|lease| lease.upgrade())
-                    .is_none(),
+            !self.call_in_progress(),
             "A FaceTime call is already in progress"
         );
         active_call(status, id)?;
@@ -401,6 +420,7 @@ impl IncomingCalls {
                     exchange.handshake.public_prekey(),
                     answer.mode,
                 )),
+                false,
             )
             .await?;
         Ok(JoinReceipt {
@@ -429,30 +449,60 @@ impl IncomingCalls {
             .remove(&call.id)
             .context("The FaceTime caller is unavailable")?;
         let exchange = details.exchange.context("Missing FaceTime key exchange")?;
-        let (hangup, local_hangup) = oneshot::channel();
-        let (ready, ended) = watch::channel(());
         let id = call.id;
+        let lifetime = self.connect_call(
+            call,
+            receipt.endpoint,
+            receipt.relay.clone(),
+            exchange,
+            false,
+        );
+        status.send_modify(|status| status.incoming_calls.retain(|candidate| candidate.id != id));
+        Ok(lifetime)
+    }
+
+    fn connect_call(
+        &mut self,
+        call: IncomingCall,
+        endpoint: CallEndpoint,
+        relay: Arc<CallRelayAllocation>,
+        exchange: CallMediaExchange,
+        initiator: bool,
+    ) -> AnswerLifetime {
+        let (hangup, local_hangup) = oneshot::channel();
+        let (_ended, ended) = watch::channel(());
         self.connected = Some(ConnectedCall {
             call,
-            endpoint: receipt.endpoint,
-            relay: receipt.relay.clone(),
+            endpoint,
+            relay,
             exchange,
+            initiator,
             local_hangup,
-            _ended: ready,
+            _ended,
         });
-        status.send_modify(|status| status.incoming_calls.retain(|candidate| candidate.id != id));
-        Ok(AnswerLifetime {
+        AnswerLifetime {
             _hangup: hangup,
             ended,
-        })
+        }
+    }
+
+    fn call_in_progress(&self) -> bool {
+        self.connected.is_some()
+            || self.outgoing.is_some()
+            || self
+                .answering
+                .as_ref()
+                .and_then(|lease| lease.upgrade())
+                .is_some()
     }
 
     pub(super) async fn wait_for_local_hangup(&mut self) {
-        match &mut self.connected {
-            Some(connected) => {
-                let _ = (&mut connected.local_hangup).await;
-            }
-            None => pending().await,
+        if let Some(connected) = &mut self.connected {
+            let _ = (&mut connected.local_hangup).await;
+        } else if let Some(outgoing) = &mut self.outgoing {
+            outgoing.wait_to_cancel().await;
+        } else {
+            pending().await
         }
     }
 }

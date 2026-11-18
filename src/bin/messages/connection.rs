@@ -91,8 +91,9 @@ pub enum Action {
         request: SetTapback,
     },
     DeclineCall(uuid::Uuid),
-    AnswerCall {
+    StartCall {
         id: Uuid,
+        start: CallStart,
         muted: watch::Receiver<bool>,
         hang_up: oneshot::Receiver<()>,
         video: Option<VideoAnswer>,
@@ -102,6 +103,11 @@ pub enum Action {
         id: AttachmentId,
         purpose: Purpose,
     },
+}
+
+pub enum CallStart {
+    Answer,
+    Dial(String),
 }
 
 pub struct OlderRefresh {
@@ -134,7 +140,10 @@ pub enum Event {
         id: uuid::Uuid,
         result: Result<()>,
     },
-    CallConnected(Uuid),
+    CallConnected {
+        id: Uuid,
+        mode: CallMode,
+    },
     CallFinished {
         id: Uuid,
         result: Result<()>,
@@ -192,6 +201,12 @@ impl CallControls {
             CallMode::Video
         } else {
             CallMode::Audio
+        }
+    }
+
+    pub fn set_negotiated_mode(&mut self, mode: CallMode) {
+        if mode == CallMode::Audio {
+            self.video = None;
         }
     }
 
@@ -275,6 +290,14 @@ impl Connection {
     }
 
     pub fn answer_call(&self, id: Uuid, mode: CallMode) -> Result<CallControls> {
+        self.start_call(id, mode, CallStart::Answer)
+    }
+
+    pub fn dial_call(&self, id: Uuid, recipient: &str, mode: CallMode) -> Result<CallControls> {
+        self.start_call(id, mode, CallStart::Dial(recipient.to_owned()))
+    }
+
+    fn start_call(&self, id: Uuid, mode: CallMode, start: CallStart) -> Result<CallControls> {
         let (mute, muted) = watch::channel(false);
         let (end, hang_up) = oneshot::channel();
         let (video, controls) = if mode == CallMode::Video {
@@ -294,8 +317,9 @@ impl Connection {
             (None, None)
         };
         self.actions
-            .send(Action::AnswerCall {
+            .send(Action::StartCall {
                 id,
+                start,
                 muted,
                 hang_up,
                 video,
@@ -475,8 +499,9 @@ async fn work(
                 let result = backend.decline_call(id).await;
                 Event::CallDeclined { id, result }
             }
-            Action::AnswerCall {
+            Action::StartCall {
                 id,
+                start,
                 muted,
                 mut hang_up,
                 video,
@@ -487,14 +512,26 @@ async fn work(
                 tokio::spawn(async move {
                     let call = async {
                         let Backend::Local(engine) = backend.as_ref() else {
-                            anyhow::bail!(
-                                "Answer FaceTime using the Apple session on this computer"
-                            );
+                            anyhow::bail!("Use FaceTime with the Apple session on this computer");
                         };
-                        let ready = || emit(&events, &context, Event::CallConnected(id));
-                        if let Some(video) = video {
-                            let camera = prepare_camera().await?;
-                            let accepted = engine.answer_desktop_call(id, CallMode::Video).await?;
+                        let (mode, camera) = if video.is_some() {
+                            (CallMode::Video, Some(prepare_camera().await?))
+                        } else {
+                            (CallMode::Audio, None)
+                        };
+                        let accepted = match start {
+                            CallStart::Answer => engine.answer_desktop_call(id, mode).await?,
+                            CallStart::Dial(recipient) => {
+                                engine.dial_desktop_call(&recipient, mode).await?
+                            }
+                        };
+                        let mode = accepted
+                            .local_description
+                            .mode
+                            .context("Missing FaceTime media mode")?;
+                        let ready = || emit(&events, &context, Event::CallConnected { id, mode });
+                        if let (CallMode::Video, Some(camera), Some(video)) = (mode, camera, video)
+                        {
                             let mut frames = video.frames.subscribe();
                             let update = async {
                                 while frames.changed().await.is_ok() {
@@ -512,11 +549,7 @@ async fn work(
                                 result = update => result,
                             }
                         } else {
-                            engine
-                                .answer_desktop_call(id, CallMode::Audio)
-                                .await?
-                                .run_audio(muted, ready)
-                                .await
+                            accepted.run_audio(muted, ready).await
                         }
                     };
                     let result = tokio::select! {
@@ -822,8 +855,9 @@ mod tests {
         let (connection, mut requests, _report) = Connection::test_channels();
         let id = Uuid::new_v4();
         let mut controls = connection.answer_call(id, CallMode::Audio)?;
-        let Some(Action::AnswerCall {
+        let Some(Action::StartCall {
             id: answered,
+            start: CallStart::Answer,
             mut muted,
             hang_up,
             video: None,
@@ -842,7 +876,7 @@ mod tests {
         assert!(controls.ending());
 
         let controls = connection.answer_call(Uuid::new_v4(), CallMode::Audio)?;
-        let Some(Action::AnswerCall { hang_up, .. }) = requests.recv().await else {
+        let Some(Action::StartCall { hang_up, .. }) = requests.recv().await else {
             panic!("Expected a call answer");
         };
         drop(controls);

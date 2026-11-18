@@ -84,7 +84,9 @@ pub struct MessagesApp {
 }
 
 struct DesktopCall {
-    offer: IncomingCall,
+    id: Uuid,
+    peer: String,
+    outgoing: bool,
     connected_at: Option<Instant>,
     controls: CallControls,
     video_texture: Option<egui::TextureHandle>,
@@ -368,19 +370,16 @@ impl MessagesApp {
                     self.refresh_at = Instant::now();
                 }
                 Event::IncomingCalls(calls) => self.incoming_calls = calls,
-                Event::CallConnected(id) => {
+                Event::CallConnected { id, mode } => {
                     if let Some(call) = &mut self.active_call
-                        && call.offer.id == id
+                        && call.id == id
                     {
+                        call.controls.set_negotiated_mode(mode);
                         call.connected_at = Some(Instant::now());
                     }
                 }
                 Event::CallFinished { id, result } => {
-                    if self
-                        .active_call
-                        .as_ref()
-                        .is_some_and(|call| call.offer.id == id)
-                    {
+                    if self.active_call.as_ref().is_some_and(|call| call.id == id) {
                         self.active_call = None;
                         if let Err(error) = result {
                             let error = format!("{error:#}");
@@ -1015,15 +1014,46 @@ impl MessagesApp {
                         .layout(Layout::left_to_right(Align::Center)),
                 );
                 controls.spacing_mut().item_spacing.x = 9.;
-                controls.add_enabled_ui(false, |ui| {
-                    chrome::icon_button(
-                        ui,
-                        Icon::Video,
-                        "FaceTime requires a supported calling service",
-                        None,
-                    )
-                    .on_disabled_hover_text("FaceTime requires a supported calling service");
-                });
+                let can_call = chat.is_some()
+                    && !compose
+                    && self.config.mode == Mode::Local
+                    && self.connection.is_some()
+                    && self.active_call.is_none()
+                    && self
+                        .status
+                        .as_ref()
+                        .is_some_and(|status| status.connected && status.facetime_registered);
+                let facetime = controls
+                    .add_enabled_ui(can_call, |ui| {
+                        chrome::icon_button(ui, Icon::Video, "FaceTime", None)
+                            .on_disabled_hover_text(
+                                "FaceTime uses the Apple session on this computer",
+                            )
+                    })
+                    .inner;
+                let mut outgoing = None;
+                egui::Popup::menu(&facetime)
+                    .frame(chrome::popover())
+                    .show(|ui| {
+                        if !can_call {
+                            ui.close();
+                            return;
+                        }
+                        for (mode, label, icon) in [
+                            (CallMode::Video, "FaceTime Video", Icon::Video),
+                            (CallMode::Audio, "FaceTime Audio", Icon::Phone),
+                        ] {
+                            if chrome::attachment_item(ui, icon, label, CALL_GREEN).clicked() {
+                                outgoing = Some(mode);
+                                ui.close();
+                            }
+                        }
+                    });
+                if let Some(mode) = outgoing
+                    && let Some(peer) = chat
+                {
+                    self.start_outgoing_call(peer, mode);
+                }
                 let info =
                     chrome::icon_button(&mut controls, Icon::Info, "Conversation Details", None);
                 if info.clicked() {
@@ -1585,7 +1615,7 @@ impl MessagesApp {
 
     fn call_panel(&mut self, ctx: &egui::Context) {
         if let Some(call) = &mut self.active_call {
-            let name = self.contacts.name(&call.offer.caller);
+            let name = self.contacts.name(&call.peer);
             let mode = call.controls.mode();
             let is_video = mode == CallMode::Video;
             let (title, symbol, width) = if is_video {
@@ -1610,7 +1640,15 @@ impl MessagesApp {
                     "End",
                 )
             } else {
-                ("Connecting…".to_owned(), "Cancel")
+                (
+                    if call.outgoing {
+                        "Calling…"
+                    } else {
+                        "Connecting…"
+                    }
+                    .to_owned(),
+                    "Cancel",
+                )
             };
             if let Some(frame) = call.controls.next_video_frame() {
                 let image = egui::ColorImage::from_rgba_unmultiplied(
@@ -1756,7 +1794,9 @@ impl MessagesApp {
             match connection.answer_call(call.id, mode) {
                 Ok(controls) => {
                     self.active_call = Some(DesktopCall {
-                        offer: call,
+                        id: call.id,
+                        peer: call.caller,
+                        outgoing: false,
                         connected_at: None,
                         controls,
                         video_texture: None,
@@ -1773,6 +1813,27 @@ impl MessagesApp {
         {
             self.declining_call = Some(call.id);
             self.call_error = None;
+        }
+    }
+
+    fn start_outgoing_call(&mut self, peer: &str, mode: CallMode) {
+        let Some(connection) = &self.connection else {
+            return;
+        };
+        let id = Uuid::new_v4();
+        match connection.dial_call(id, peer, mode) {
+            Ok(controls) => {
+                self.error = None;
+                self.active_call = Some(DesktopCall {
+                    id,
+                    peer: peer.to_owned(),
+                    outgoing: true,
+                    connected_at: None,
+                    controls,
+                    video_texture: None,
+                });
+            }
+            Err(error) => self.error = Some(error.to_string()),
         }
     }
 
@@ -2637,6 +2698,64 @@ mod call_panel_tests {
     use super::*;
 
     #[test]
+    fn conversation_toolbar_places_a_video_call_and_displays_an_audio_answer() -> anyhow::Result<()>
+    {
+        let ctx = egui::Context::default();
+        let root = tempfile::tempdir()?;
+        let mut app = MessagesApp::new(&ctx, root.path().to_owned(), true, Clipboard::empty());
+        let (connection, mut actions, report) = Connection::test_channels();
+        app.connection = Some(connection);
+        app.status = Some(Status {
+            connected: true,
+            detail: String::new(),
+            tapback_revision: None,
+            facetime_registered: true,
+            incoming_calls: Vec::new(),
+        });
+        app.refresh_at = Instant::now() + Duration::from_secs(120);
+        let peer = "mailto:peer@example.org";
+        let mut frame = |events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(932., 700.))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.process(ctx);
+                    app.toolbar(ctx, Some(peer));
+                    app.call_panel(ctx);
+                },
+            )
+        };
+        click_at(&mut frame, pos2(865., 24.));
+        click(&mut frame, "FaceTime Video");
+        let Action::StartCall {
+            id,
+            start: super::super::connection::CallStart::Dial(recipient),
+            video: Some(video),
+            mut hang_up,
+            ..
+        } = actions.try_recv()?
+        else {
+            panic!("Expected an outgoing video call");
+        };
+        assert_eq!(recipient, peer);
+        assert!(
+            report
+                .send(Event::CallConnected {
+                    id,
+                    mode: CallMode::Audio
+                })
+                .is_ok()
+        );
+        click(&mut frame, "End");
+        hang_up.try_recv()?;
+        assert!(video.camera_enabled.has_changed().is_err());
+        Ok(())
+    }
+
+    #[test]
     fn incoming_call_card_answers_audio_video_and_video_as_audio() -> anyhow::Result<()> {
         for (offered, answer, label) in [
             (CallMode::Audio, CallMode::Audio, "Answer"),
@@ -2688,8 +2807,9 @@ mod call_panel_tests {
             )
         };
         click(&mut frame, label);
-        let Action::AnswerCall {
+        let Action::StartCall {
             id: accepted,
+            start: super::super::connection::CallStart::Answer,
             muted,
             mut hang_up,
             video,
@@ -2700,7 +2820,11 @@ mod call_panel_tests {
         assert_eq!(accepted, id);
         assert_eq!(video.is_some(), answer == CallMode::Video);
         assert!(!*muted.borrow());
-        assert!(report.send(Event::CallConnected(id)).is_ok());
+        assert!(
+            report
+                .send(Event::CallConnected { id, mode: answer })
+                .is_ok()
+        );
         assert!(report.send(Event::IncomingCalls(Vec::new())).is_ok());
         if let Some(video) = video {
             assert!(*video.camera_enabled.borrow());
@@ -2735,6 +2859,14 @@ mod call_panel_tests {
             .iter()
             .find_map(|shape| label_position(&shape.shape, label))
             .unwrap_or_else(|| panic!("Missing FaceTime button {label}"));
+        click_at(frame, position);
+    }
+
+    fn click_at(
+        frame: &mut impl FnMut(Vec<egui::Event>) -> egui::FullOutput,
+        position: egui::Pos2,
+    ) {
+        frame(vec![egui::Event::PointerMoved(position)]);
         for pressed in [true, false] {
             frame(vec![
                 egui::Event::PointerMoved(position),

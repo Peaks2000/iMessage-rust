@@ -179,26 +179,55 @@ pub(crate) struct CallMediaExchange {
     received: watch::Sender<CallPeerKeys>,
 }
 
+pub(crate) struct LocalCallPrekey {
+    private: PKey<Private>,
+    public: [u8; POINT_LEN],
+}
+
+impl LocalCallPrekey {
+    pub(crate) fn generate() -> Result<Self> {
+        let (private, public) = new_key()?;
+        Ok(Self { private, public })
+    }
+
+    pub(crate) fn public(&self) -> &[u8; POINT_LEN] {
+        &self.public
+    }
+}
+
 impl CallMediaExchange {
     pub(crate) fn prepare(
         call: IncomingCall,
         description: &[u8],
         peer: &PeerPrekey,
     ) -> Result<Self> {
-        let (local, local_public) = new_key()?;
+        Ok(Self::with_prekey(
+            call,
+            description,
+            peer,
+            LocalCallPrekey::generate()?,
+        ))
+    }
+
+    pub(crate) fn with_prekey(
+        call: IncomingCall,
+        description: &[u8],
+        peer: &PeerPrekey,
+        local: LocalCallPrekey,
+    ) -> Self {
         let (received, keys) = watch::channel(CallPeerKeys::default());
         let handshake = Arc::new(CallMediaHandshake {
             call,
             description: description.to_vec(),
             peer: peer.clone(),
-            local_public,
+            local_public: local.public,
             peer_keys: keys,
         });
-        Ok(Self {
+        Self {
             handshake,
-            local,
+            local: local.private,
             received,
-        })
+        }
     }
 
     /// Install newer keys only after the engine matches the IDS sender to the call.

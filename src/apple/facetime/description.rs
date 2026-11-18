@@ -780,6 +780,10 @@ pub(super) mod tests {
         Ok(hex::decode(ENCRYPTED)?)
     }
 
+    pub(crate) fn signed_avc_fixture() -> Result<Vec<u8>> {
+        Ok(hex::decode(AVC)?)
+    }
+
     pub(crate) fn local_offer() -> Result<CallAvcMaterial> {
         let keys = CallKeyOffer {
             payload: Vec::new(),

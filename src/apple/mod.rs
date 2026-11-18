@@ -30,6 +30,8 @@ pub(crate) use facetime::RtpHeader as CallRtpHeader;
 pub(crate) use facetime::decode as decode_call_fixture;
 #[cfg(test)]
 pub(crate) use facetime::relay::tests::parsed_allocation as call_relay_fixture;
+#[cfg(test)]
+pub(crate) use facetime::signed_avc_fixture;
 #[cfg(feature = "desktop")]
 pub(crate) use facetime::{
     AAC_ELD_PT, AAC_ELD_SAMPLE_RATE, AUDIO_RED_PT, CAMERA_HEIGHT, CAMERA_WIDTH, CallDevice,
@@ -42,9 +44,10 @@ pub use facetime::{
     RelayStreamDirection,
 };
 pub(crate) use facetime::{
-    CallEndpoint, CallMediaExchange, CallRtpProtection, CallSignal, PeerMediaOffer, PeerPrekey,
+    CallEndpoint, CallMediaExchange, CallRtpProtection, CallSignal, LocalCallPrekey, PeerKeyOffer,
+    PeerMediaOffer, PeerPrekey, RING_TIMEOUT_MS,
 };
-pub(crate) use madrid::{Incoming, Madrid, Notification};
+pub(crate) use madrid::{Incoming, Madrid, Notification, OutgoingCallTargets};
 use openssl::{
     hash::MessageDigest,
     pkey::{Id, PKey, PKeyRef, Private},

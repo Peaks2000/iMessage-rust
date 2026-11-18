@@ -1,5 +1,6 @@
 mod calls;
 
+use calls::outgoing::{DialRequest, OutgoingAnswer, OutgoingAttempt, PendingOutgoing};
 #[cfg(feature = "desktop")]
 pub use calls::video;
 use calls::{AnswerAttempt, AnswerLifetime, ConnectedCall, JoinAnswer};
@@ -77,6 +78,14 @@ enum Request {
     JoinCall {
         answer: JoinAnswer,
         reply: oneshot::Sender<Result<AnswerLifetime>>,
+    },
+    DialCall {
+        dial: DialRequest,
+        reply: oneshot::Sender<Result<OutgoingAttempt>>,
+    },
+    FinishOutgoing {
+        id: uuid::Uuid,
+        reply: oneshot::Sender<Result<OutgoingAnswer>>,
     },
     Download {
         id: uuid::Uuid,
@@ -318,6 +327,9 @@ async fn run_apple(
         if let Some(call) = calls.connected.as_ref() {
             calls.end(call.call.id, now_ms());
         }
+        if let Some(outgoing) = calls.outgoing.take() {
+            calls.end(outgoing.call.id, now_ms());
+        }
         set_status(&status, false, &error.to_string());
         let delay = sleep(retry_delay);
         tokio::pin!(delay);
@@ -357,6 +369,12 @@ async fn run_apple(
                         Request::JoinCall { reply, .. } => {
                             let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
                         }
+                        Request::DialCall { reply, .. } => {
+                            let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
+                        }
+                        Request::FinishOutgoing { reply, .. } => {
+                            let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
+                        }
                     }
                 }
             }
@@ -392,9 +410,13 @@ async fn online(
                     let call = connected.call.clone();
                     let endpoint = connected.endpoint;
                     let relay = connected.relay.clone();
+                    let initiator = connected.initiator;
                     drop(connected); // Close the local call and clear peer keys before network I/O.
                     calls.end(call.id, now_ms());
-                    let _ = madrid.update_call_participant(identity, &call, endpoint, &relay, None).await;
+                    let _ = madrid.update_call_participant(identity, &call, endpoint, &relay, None, initiator).await;
+                } else if let Some(outgoing) = calls.outgoing.take() {
+                    calls.end(outgoing.call.id, now_ms());
+                    outgoing.cancel(identity, madrid).await;
                 }
             }
             request = requests.recv() => {
@@ -487,13 +509,33 @@ async fn online(
                                 let joined = calls.finish_answer(status, &receipt);
                                 if joined.is_err() {
                                     let _ = madrid.update_call_participant(
-                                        identity, &receipt.call, receipt.endpoint, &receipt.relay, None,
+                                        identity, &receipt.call, receipt.endpoint, &receipt.relay, None, false,
                                     ).await;
                                 }
                                 joined
                             }
                             Err(error) => Err(error),
                         };
+                        let _ = reply.send(result);
+                    }
+                    Request::DialCall { dial, reply } => {
+                        calls.begin_outgoing(identity, madrid, status, dial, reply).await;
+                    }
+                    Request::FinishOutgoing { id, reply } => {
+                        for notification in madrid.take_queued() {
+                            receive_notification(identity, state, madrid, status, calls, notification).await?;
+                        }
+                        if reply.is_closed() {
+                            continue;
+                        }
+                        let result = calls.finish_outgoing(identity, madrid, id).await;
+                        for notification in madrid.take_queued() {
+                            receive_notification(identity, state, madrid, status, calls, notification).await?;
+                        }
+                        let result = result.and_then(|answer| {
+                            ensure!(calls.connected.as_ref().is_some_and(|active| active.call.id == id), "The FaceTime call has ended");
+                            Ok(answer)
+                        });
                         let _ = reply.send(result);
                     }
                 }
@@ -538,6 +580,7 @@ struct IncomingCalls {
     ended: HashMap<uuid::Uuid, i64>,
     answering: Option<Weak<()>>,
     connected: Option<ConnectedCall>,
+    outgoing: Option<PendingOutgoing>,
 }
 
 struct IncomingCallDetails {
@@ -686,6 +729,12 @@ impl IncomingCalls {
     }
 
     fn update(&mut self, status: &watch::Sender<Status>, own: &str, signal: CallSignal) {
+        if let Some(outgoing) = &mut self.outgoing
+            && outgoing.call.id == signal.id()
+        {
+            outgoing.receive(signal);
+            return;
+        }
         let now = now_ms();
         status.send_if_modified(|status| {
             let expired = self.expire(status, now);
@@ -787,7 +836,8 @@ impl IncomingCalls {
                 } => {
                     if self.connected.as_ref().is_some_and(|connected| {
                         connected.call.id == id
-                            && (endpoint.is_some() || sender == own)
+                            && (endpoint.and_then(CallEndpoint::participant).is_some()
+                                || sender == own)
                             && can_end_call(
                                 &connected.call,
                                 Some(connected.endpoint),
@@ -817,7 +867,7 @@ impl IncomingCalls {
                     }
                     expired
                 }
-                CallSignal::Ring { .. } => expired,
+                CallSignal::Ring { .. } | CallSignal::Accepted { .. } => expired,
             }
         });
     }
@@ -834,7 +884,14 @@ fn can_end_call(
     received_ms >= call.received_ms
         && match endpoint {
             Some(leaving) => {
-                sender == call.caller && verified.is_some_and(|known| known.matches(leaving))
+                sender == call.caller
+                    && verified.is_some_and(|known| {
+                        if leaving.participant().is_some() {
+                            known.matches(leaving)
+                        } else {
+                            known.same_device(leaving)
+                        }
+                    })
             }
             None => sender == own || sender == call.caller,
         }

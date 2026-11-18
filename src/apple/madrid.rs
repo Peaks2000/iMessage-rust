@@ -57,6 +57,11 @@ struct Destination {
     public_key: KeyPair<Public>,
 }
 
+pub(crate) struct OutgoingCallTargets {
+    pub(crate) relay: facetime::OutgoingRelay,
+    targets: HashMap<String, Vec<Destination>>,
+}
+
 struct DeliveryPayload<'a> {
     recipient: &'a str,
     guid: Uuid,
@@ -71,6 +76,7 @@ enum DeliveryKind {
     CallInvitation(u64),
     CallParticipant {
         joined: bool,
+        initiator: bool,
     },
     CallMaterial {
         command: u64,
@@ -568,6 +574,7 @@ impl Madrid {
         endpoint: facetime::CallEndpoint,
         allocation: &facetime::CallRelayAllocation,
         join: Option<(&[u8], &[u8; 65], CallMode)>,
+        initiator: bool,
     ) -> Result<()> {
         ensure!(
             call.id == allocation.call_id
@@ -585,8 +592,13 @@ impl Madrid {
             let targets = self
                 .call_destination(identity, &call.caller, endpoint)
                 .await?;
-            let payload =
-                facetime::participant_update(allocation, &identity.handle, &call.caller, join);
+            let payload = facetime::participant_update(
+                allocation,
+                &identity.handle,
+                &call.caller,
+                join,
+                initiator,
+            );
             let bytes = binary(&payload)?;
             let sent = self
                 .deliver_message(
@@ -598,6 +610,7 @@ impl Madrid {
                         bytes: &bytes,
                         kind: DeliveryKind::CallParticipant {
                             joined: join.is_some(),
+                            initiator,
                         },
                     },
                     &targets,
@@ -636,29 +649,15 @@ impl Madrid {
                 .find(|target| target.push == endpoint.push_token())
                 .context("The FaceTime caller device is no longer in the IDS directory")?;
             ensure!(call.expires_ms > now_ms(), "This FaceTime call has ended");
-            let request = Uuid::new_v4();
-            let id = push_id()?;
-            let wire = facetime::relay::allocation_request(
-                request,
-                call.id,
-                id,
-                &identity.handle,
-                &identity.user_agent,
-                (&call.caller, endpoint.push_token(), &caller.session),
-            );
-            let topic = facetime::relay::RELAY_TOPIC;
-            ensure!(
-                self.send_push_on(topic, id, &binary(&wire)?).await?,
-                "Apple rejected the FaceTime relay request"
-            );
-            let response = self
-                .wait_for_push(
-                    |item| {
-                        item.topic == topic
-                            && field_data(&item.data, "U") == Some(request.as_bytes())
-                            && item.data.get("c").and_then(Value::as_unsigned_integer) != Some(255)
-                    },
-                    "Apple returned no FaceTime relay allocation",
+            let (request, response) = self
+                .request_call_relay(
+                    identity,
+                    call.id,
+                    [(
+                        call.caller.as_str(),
+                        caller.push.as_slice(),
+                        caller.session.as_slice(),
+                    )],
                 )
                 .await?;
             facetime::CallRelayAllocation::parse(
@@ -671,6 +670,142 @@ impl Madrid {
         })
         .await
         .context("The FaceTime call ended while waiting for a relay")?
+    }
+
+    pub(crate) async fn outgoing_call_targets(
+        &mut self,
+        identity: &Identity,
+        call: &IncomingCall,
+    ) -> Result<OutgoingCallTargets> {
+        ensure!(
+            call.caller != identity.handle,
+            "Choose a FaceTime recipient"
+        );
+        let mut targets = self
+            .query(identity, facetime::SIGNALING, &[&call.caller], true)
+            .await?;
+        let devices = targets
+            .get_mut(&call.caller)
+            .context("Apple IDS could not find the FaceTime recipient")?;
+        let mut seen = HashSet::new();
+        devices.retain(|device| device.push != identity.token && seen.insert(device.push.clone()));
+        ensure!(
+            (1..64).contains(&devices.len()),
+            "Apple IDS returned an invalid number of FaceTime devices"
+        );
+        ensure!(call.expires_ms > now_ms(), "This FaceTime call has ended");
+        let (request, response) = self
+            .request_call_relay(
+                identity,
+                call.id,
+                devices.iter().map(|device| {
+                    (
+                        call.caller.as_str(),
+                        device.push.as_slice(),
+                        device.session.as_slice(),
+                    )
+                }),
+            )
+            .await?;
+        let relay = facetime::OutgoingRelay::parse(
+            response,
+            request,
+            call.id,
+            (&identity.handle, &identity.token),
+            &call.caller,
+            devices
+                .iter()
+                .filter_map(|device| device.push.as_slice().try_into().ok()),
+        )?;
+        devices.retain(|device| {
+            relay
+                .endpoints()
+                .iter()
+                .any(|endpoint| endpoint.push_token() == device.push.as_slice())
+        });
+        Ok(OutgoingCallTargets { relay, targets })
+    }
+
+    pub(crate) async fn send_outgoing_call(
+        &mut self,
+        identity: &Identity,
+        call: &IncomingCall,
+        target: &OutgoingCallTargets,
+        join: Option<(&[u8], &[u8; 65], CallMode)>,
+    ) -> Result<()> {
+        ensure!(
+            target.relay.call_id() == call.id,
+            "FaceTime relay belongs to a different call"
+        );
+        ensure!(
+            join.is_none() || call.expires_ms > now_ms(),
+            "This FaceTime call has ended"
+        );
+        let payload = binary(&facetime::outgoing_invitation(
+            &target.relay,
+            &identity.handle,
+            &call.caller,
+            join,
+        ))?;
+        let result = self
+            .deliver_message(
+                identity,
+                DeliveryPayload {
+                    recipient: &call.caller,
+                    guid: Uuid::new_v4(),
+                    bytes: &payload,
+                    request_receipt: false,
+                    kind: DeliveryKind::CallParticipant {
+                        joined: join.is_some(),
+                        initiator: true,
+                    },
+                },
+                &target.targets,
+            )
+            .await?;
+        ensure!(
+            result == Delivery::Accepted,
+            "Apple did not confirm the FaceTime call invitation"
+        );
+        Ok(())
+    }
+
+    async fn request_call_relay<'a>(
+        &mut self,
+        identity: &Identity,
+        call: Uuid,
+        devices: impl IntoIterator<Item = (&'a str, &'a [u8], &'a [u8])>,
+    ) -> Result<(Uuid, Dictionary)> {
+        let request = Uuid::new_v4();
+        let id = push_id()?;
+        let bytes = binary(&facetime::relay::allocation_request(
+            request,
+            call,
+            id,
+            &identity.handle,
+            &identity.user_agent,
+            devices,
+        ))?;
+        ensure!(
+            bytes.len() <= MAX_BATCH,
+            "FaceTime relay request exceeds the device limit"
+        );
+        let topic = facetime::relay::RELAY_TOPIC;
+        ensure!(
+            self.send_push_on(topic, id, &bytes).await?,
+            "Apple rejected the FaceTime relay request"
+        );
+        let response = self
+            .wait_for_push(
+                |item| {
+                    item.topic == topic
+                        && field_data(&item.data, "U") == Some(request.as_bytes())
+                        && item.data.get("c").and_then(Value::as_unsigned_integer) != Some(255)
+                },
+                "Apple returned no FaceTime relay allocation",
+            )
+            .await?;
+        Ok((request, response))
     }
 
     async fn message_destinations(
@@ -747,10 +882,10 @@ impl Madrid {
                             DeliveryKind::Message => 100,
                             DeliveryKind::CallInvitation(_) => facetime::INVITATION_COMMAND,
                             DeliveryKind::CallMaterial { command, .. } => command,
-                            DeliveryKind::CallParticipant { joined: true } => {
+                            DeliveryKind::CallParticipant { joined: true, .. } => {
                                 facetime::JOIN_COMMAND
                             }
-                            DeliveryKind::CallParticipant { joined: false } => {
+                            DeliveryKind::CallParticipant { joined: false, .. } => {
                                 facetime::LEAVE_COMMAND
                             }
                         }
@@ -776,8 +911,8 @@ impl Madrid {
                             wire.insert("eX".into(), expires_at.into());
                         }
                     }
-                    DeliveryKind::CallParticipant { joined } => {
-                        wire.insert("is-initiator-key".into(), Value::Boolean(false));
+                    DeliveryKind::CallParticipant { joined, initiator } => {
+                        wire.insert("is-initiator-key".into(), Value::Boolean(initiator));
                         wire.insert("up1".into(), Value::Boolean(!joined));
                         if !joined {
                             wire.insert("cc".into(), 1.into());
@@ -1556,10 +1691,128 @@ mod tests {
                         local.handshake.public_prekey(),
                         CallMode::Audio
                     )),
+                    false,
                 ),
                 simulate_update,
             )?;
         }
+        let local_prekey = facetime::LocalCallPrekey::generate()?;
+        let description = crate::apple::signed_avc_fixture()?;
+        let call = IncomingCall {
+            mode: Some(CallMode::Audio),
+            ..call
+        };
+        let simulate_outgoing = async {
+            answer_directory_lookup(&mut mock, &recipient_key).await?;
+            let frame = Frame::read(&mut mock).await?;
+            let request: Dictionary =
+                plist::from_bytes(frame.field(3).context("Missing relay request")?)?;
+            let mut tokens = request["dtl"]
+                .as_array()
+                .context("Missing allocated devices")?
+                .iter()
+                .filter_map(Value::as_dictionary)
+                .filter_map(|device| field_data(device, "t"))
+                .collect::<Vec<_>>();
+            tokens.sort_unstable();
+            assert_eq!(tokens, vec![[2; 32].as_slice(), [3; 32].as_slice()]);
+            let request_id =
+                Uuid::from_slice(field_data(&request, "U").context("Missing relay request ID")?)?;
+            let mut response = allocation_fixture(request_id, call.id);
+            let Some(Value::Array(allocations)) = response.get_mut("qal") else {
+                anyhow::bail!("Missing relay allocations");
+            };
+            let other_participant = CALLER_ID + 1;
+            allocations.push(Value::Dictionary(dictionary([
+                ("qri", other_participant.into()),
+                ("tP", value(CALLER)),
+                ("t", data(&[3; 32])),
+            ])));
+            write_frame(
+                &mut mock,
+                0x0b,
+                &[(4, frame.field(4).context("Missing push ID")?), (8, &[0])],
+            )
+            .await?;
+            write_frame(
+                &mut mock,
+                0x0a,
+                &[
+                    (2, &sha1(relay_topic.as_bytes())),
+                    (3, &binary(&response)?),
+                    (4, &[6; 4]),
+                ],
+            )
+            .await?;
+            assert_eq!(
+                Frame::read(&mut mock).await?.field(4),
+                Some([6; 4].as_slice())
+            );
+            for command in [facetime::JOIN_COMMAND, facetime::LEAVE_COMMAND] {
+                let frame = Frame::read(&mut mock).await?;
+                let delivery: Dictionary =
+                    plist::from_bytes(frame.field(3).context("Missing invitation")?)?;
+                assert_eq!(delivery["c"].as_unsigned_integer(), Some(command));
+                assert_eq!(delivery["is-initiator-key"].as_boolean(), Some(true));
+                let devices = delivery["dtl"]
+                    .as_array()
+                    .context("Missing call recipients")?;
+                assert_eq!(devices.len(), 2);
+                for device in devices {
+                    let device = device.as_dictionary().context("Invalid call recipient")?;
+                    assert_eq!(field_str(device, "tP"), Some(CALLER));
+                    let sealed = field_data(device, "P").context("Missing signed invitation")?;
+                    let invitation = recipient.open(&sender_key, sealed)?;
+                    let signal = facetime::decode(
+                        command,
+                        &invitation,
+                        LOCAL.into(),
+                        CALLER,
+                        [1; 32],
+                        now_ms(),
+                    );
+                    if command == facetime::JOIN_COMMAND {
+                        assert!(
+                            matches!(signal, Some(facetime::CallSignal::Ring { call: ring, media: Some(media), .. }) if ring.id == call.id && ring.mode == Some(CallMode::Audio) && media.prekey.is_some())
+                        );
+                    } else {
+                        assert!(
+                            matches!(signal, Some(facetime::CallSignal::End { id, .. }) if id == call.id)
+                        );
+                    }
+                }
+                write_frame(
+                    &mut mock,
+                    0x0b,
+                    &[(4, frame.field(4).context("Missing push ID")?), (8, &[0])],
+                )
+                .await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let outgoing = async {
+            let targets = madrid.outgoing_call_targets(&identity, &call).await?;
+            let second = facetime::CallEndpoint::new([3; 32], Some(CALLER_ID + 1));
+            assert!(targets.relay.for_peer(second).is_ok());
+            assert!(
+                targets
+                    .relay
+                    .for_peer(facetime::CallEndpoint::new([3; 32], Some(CALLER_ID)))
+                    .is_err()
+            );
+            madrid
+                .send_outgoing_call(
+                    &identity,
+                    &call,
+                    &targets,
+                    Some((&description, local_prekey.public(), CallMode::Audio)),
+                )
+                .await?;
+            madrid
+                .send_outgoing_call(&identity, &call, &targets, None)
+                .await
+        };
+        tokio::try_join!(outgoing, simulate_outgoing)?;
         Ok(())
     }
 }

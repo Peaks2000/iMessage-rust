@@ -23,27 +23,32 @@ pub use quic::{CallRelayConnection, CallRelayStream, RelayStreamDirection};
 
 pub(in crate::apple) const RELAY_TOPIC: &str = "com.apple.private.alloy.quickrelay";
 
-pub(in crate::apple) fn allocation_request(
+pub(in crate::apple) fn allocation_request<'a>(
     request: Uuid,
     session: Uuid,
     push_id: [u8; 4],
     local: &str,
     user_agent: &str,
-    (caller, caller_push, caller_session_token): (&str, &[u8; 32], &[u8]),
+    destinations: impl IntoIterator<Item = (&'a str, &'a [u8], &'a [u8])>,
 ) -> Dictionary {
-    let destination = Dictionary::from_iter([
-        ("tP", Value::from(caller)),
-        ("t", Value::Data(caller_push.to_vec())),
-        ("sT", Value::Data(caller_session_token.to_vec())),
-        ("D", Value::Boolean(false)),
-    ]);
+    let destinations = destinations
+        .into_iter()
+        .map(|(address, token, session)| {
+            Value::Dictionary(Dictionary::from_iter([
+                ("tP", Value::from(address)),
+                ("t", Value::Data(token.to_vec())),
+                ("sT", Value::Data(session.to_vec())),
+                ("D", Value::Boolean(false)),
+            ]))
+        })
+        .collect();
     Dictionary::from_iter([
         ("c", Value::from(200)),
         ("ua", Value::from(user_agent)),
         ("i", Value::from(i32::from_be_bytes(push_id))),
         ("U", Value::Data(request.as_bytes().to_vec())),
         ("sP", Value::from(local)),
-        ("dtl", Value::Array(vec![Value::Dictionary(destination)])),
+        ("dtl", Value::Array(destinations)),
         ("qr", Value::from(0)),
         ("qids", Value::Data(session.as_bytes().to_vec())),
         (
@@ -68,29 +73,22 @@ pub struct CallRelayAllocation {
     shared_key: Zeroizing<Vec<u8>>,
 }
 
-#[derive(Clone, Copy)]
-struct RelayCall {
-    id: Uuid,
-    local: u64,
-    peer: u64,
+struct RelayGrant {
+    call_id: Uuid,
+    endpoint: SocketAddr,
+    local_participant: u64,
+    relay_id: Vec<u8>,
+    token: Zeroizing<Vec<u8>>,
+    shared_key: Zeroizing<Vec<u8>>,
 }
 
-/// Fresh authentication and packet keys for one relay connection attempt.
-pub struct CallRelayKeys {
-    pub identity: Zeroizing<Vec<u8>>,
-    pub tls_psk: Zeroizing<[u8; 32]>,
-    pub hop_keys: Zeroizing<[u8; 64]>,
-    pub session_keys: Zeroizing<[u8; 48]>,
-}
-
-impl CallRelayAllocation {
-    pub(in crate::apple) fn parse(
+impl RelayGrant {
+    fn parse(
         mut reply: Dictionary,
         request: Uuid,
         session: Uuid,
         local: (&str, &[u8; 32]),
-        caller: (&str, CallEndpoint),
-    ) -> Result<Self> {
+    ) -> Result<(Self, Vec<Value>)> {
         // Own the secret fields before validating anything else, including on failure.
         let shared_key = remove_secret(&mut reply, "qrsk");
         let token = remove_secret(&mut reply, "qrst");
@@ -137,53 +135,171 @@ impl CallRelayAllocation {
             .get("qri")
             .and_then(participant_id)
             .context("Missing local FaceTime relay participant")?;
+        let allocations = match reply.remove("qal") {
+            Some(Value::Array(allocations)) if allocations.len() <= 64 => allocations,
+            _ => anyhow::bail!("Invalid FaceTime relay participants"),
+        };
+        ensure!(
+            allocation_matches(&allocations, local_participant, local.0, local.1),
+            "FaceTime relay does not match the local device"
+        );
+        Ok((
+            Self {
+                call_id: session,
+                endpoint: SocketAddr::new(ip, port),
+                local_participant,
+                relay_id,
+                token,
+                shared_key,
+            },
+            allocations,
+        ))
+    }
+
+    fn for_peer(&self, participant: u64) -> CallRelayAllocation {
+        CallRelayAllocation {
+            call_id: self.call_id,
+            endpoint: self.endpoint,
+            local_participant: self.local_participant,
+            caller_participant: participant,
+            relay_id: self.relay_id.clone(),
+            token: self.token.clone(),
+            shared_key: self.shared_key.clone(),
+        }
+    }
+}
+
+fn allocation_matches(allocations: &[Value], participant: u64, handle: &str, token: &[u8]) -> bool {
+    let id = |entry: &Dictionary| entry.get("qri").and_then(participant_id);
+    let mut matching = allocations
+        .iter()
+        .filter_map(Value::as_dictionary)
+        .filter(|entry| {
+            id(entry) == Some(participant) || entry.get("t").and_then(Value::as_data) == Some(token)
+        });
+    matching.next().is_some_and(|entry| {
+        id(entry) == Some(participant)
+            && entry.get("t").and_then(Value::as_data) == Some(token)
+            && entry
+                .get("tP")
+                .and_then(Value::as_string)
+                .and_then(|uri| address(uri).ok())
+                .as_deref()
+                == Some(handle)
+    }) && matching.next().is_none()
+}
+
+pub(crate) struct OutgoingRelay {
+    grant: RelayGrant,
+    endpoints: Vec<CallEndpoint>,
+}
+
+impl OutgoingRelay {
+    pub(in crate::apple) fn parse(
+        reply: Dictionary,
+        request: Uuid,
+        call: Uuid,
+        local: (&str, &[u8; 32]),
+        recipient: &str,
+        tokens: impl IntoIterator<Item = [u8; 32]>,
+    ) -> Result<Self> {
+        let (grant, allocations) = RelayGrant::parse(reply, request, call, local)?;
+        let mut endpoints = Vec::new();
+        for token in tokens {
+            if &token == local.1
+                || endpoints
+                    .iter()
+                    .any(|other: &CallEndpoint| other.push_token() == &token)
+            {
+                continue;
+            }
+            let assigned = allocations
+                .iter()
+                .filter_map(Value::as_dictionary)
+                .find_map(|entry| {
+                    if entry.get("t")?.as_data()? != token {
+                        return None;
+                    }
+                    participant_id(entry.get("qri")?)
+                });
+            if let Some(id) = assigned {
+                ensure!(
+                    id != grant.local_participant
+                        && allocation_matches(&allocations, id, recipient, &token),
+                    "FaceTime relay returned a conflicting recipient device"
+                );
+                endpoints.push(CallEndpoint::new(token, Some(id)));
+            }
+        }
+        ensure!(
+            !endpoints.is_empty(),
+            "Apple allocated no FaceTime recipient devices"
+        );
+        Ok(Self { grant, endpoints })
+    }
+
+    pub(super) fn local_participant(&self) -> u64 {
+        self.grant.local_participant
+    }
+
+    pub(crate) fn call_id(&self) -> Uuid {
+        self.grant.call_id
+    }
+
+    pub(crate) fn endpoints(&self) -> &[CallEndpoint] {
+        &self.endpoints
+    }
+
+    pub(crate) fn for_peer(&self, endpoint: CallEndpoint) -> Result<CallRelayAllocation> {
+        ensure!(
+            self.endpoints.contains(&endpoint),
+            "Unexpected FaceTime answering device"
+        );
+        Ok(self
+            .grant
+            .for_peer(endpoint.participant().context("Missing peer participant")?))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RelayCall {
+    id: Uuid,
+    local: u64,
+    peer: u64,
+}
+
+/// Fresh authentication and packet keys for one relay connection attempt.
+pub struct CallRelayKeys {
+    pub identity: Zeroizing<Vec<u8>>,
+    pub tls_psk: Zeroizing<[u8; 32]>,
+    pub hop_keys: Zeroizing<[u8; 64]>,
+    pub session_keys: Zeroizing<[u8; 48]>,
+}
+
+impl CallRelayAllocation {
+    pub(in crate::apple) fn parse(
+        reply: Dictionary,
+        request: Uuid,
+        session: Uuid,
+        local: (&str, &[u8; 32]),
+        caller: (&str, CallEndpoint),
+    ) -> Result<Self> {
+        let (grant, allocations) = RelayGrant::parse(reply, request, session, local)?;
         let caller_participant = caller
             .1
             .participant()
             .context("Missing authenticated caller participant")?;
         ensure!(
-            local_participant != caller_participant,
-            "FaceTime relay reused a participant ID"
-        );
-        let allocations = reply
-            .get("qal")
-            .and_then(Value::as_array)
-            .filter(|entries| entries.len() <= 64)
-            .context("Invalid FaceTime relay participants")?;
-        let bound = |expected_id, expected_handle: &str, expected_token: &[u8]| {
-            let mut matching =
-                allocations
-                    .iter()
-                    .filter_map(Value::as_dictionary)
-                    .filter(|entry| {
-                        entry.get("qri").and_then(participant_id) == Some(expected_id)
-                            || entry.get("t").and_then(Value::as_data) == Some(expected_token)
-                    });
-            matching.next().is_some_and(|entry| {
-                entry.get("qri").and_then(participant_id) == Some(expected_id)
-                    && entry.get("t").and_then(Value::as_data) == Some(expected_token)
-                    && entry
-                        .get("tP")
-                        .and_then(Value::as_string)
-                        .and_then(|uri| address(uri).ok())
-                        .as_deref()
-                        == Some(expected_handle)
-            }) && matching.next().is_none()
-        };
-        ensure!(
-            bound(local_participant, local.0, local.1)
-                && bound(caller_participant, caller.0, caller.1.push_token()),
+            grant.local_participant != caller_participant
+                && allocation_matches(
+                    &allocations,
+                    caller_participant,
+                    caller.0,
+                    caller.1.push_token()
+                ),
             "FaceTime relay participants do not match the call"
         );
-        Ok(Self {
-            call_id: session,
-            endpoint: SocketAddr::new(ip, port),
-            local_participant,
-            caller_participant,
-            relay_id,
-            token,
-            shared_key,
-        })
+        Ok(grant.for_peer(caller_participant))
     }
 
     pub fn derive_keys(&self) -> Result<CallRelayKeys> {
