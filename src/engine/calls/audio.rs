@@ -1,10 +1,14 @@
-use std::{process::Stdio, time::Instant};
+use std::{
+    future::pending,
+    process::Stdio,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, ensure};
 use openssl::rand::rand_bytes;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    process::{Child, Command},
+    process::{Child, ChildStdout, Command},
     sync::{mpsc, watch},
 };
 use zeroize::Zeroizing;
@@ -16,7 +20,7 @@ use crate::{
 
 use super::{
     AnsweredCall,
-    aac::{self, Decoder, FRAME_SAMPLES, SAMPLE_RATE},
+    aac::{self, Decoder, Encoder, FRAME_SAMPLES, SAMPLE_RATE},
     video::{VideoCallOptions, VideoSession},
 };
 
@@ -47,7 +51,7 @@ impl AnsweredCall {
 
     async fn run_media(
         mut self,
-        mut muted: watch::Receiver<bool>,
+        muted: watch::Receiver<bool>,
         video: Option<VideoCallOptions>,
         media_ready: impl FnOnce(),
     ) -> Result<()> {
@@ -91,25 +95,18 @@ impl AnsweredCall {
                 )
             })
             .transpose()?;
-        let (mut encoder, decoder) = aac::open()?;
-        let mut capture_device = audio_device(true)?;
+        let (encoder, decoder) = aac::open()?;
+        let mut microphone = Microphone::new(muted, encoder);
         let mut playback_device = audio_device(false)?;
-        let mut input = Capture::new(
-            capture_device
-                .stdout
-                .take()
-                .context("Opening FaceTime microphone stream")?,
-        );
         let output = playback_device
             .stdin
             .take()
             .context("Opening FaceTime speaker stream")?;
-        let (packets, pending) = mpsc::channel(6);
+        let (packets, queued) = mpsc::channel(6);
         let mut rtp = AudioSender::new(self.local_description.audio.ssrc)?;
         let mut feedback = AudioFeedback::default();
-        let mut discard_partial_frame = false;
         let incoming_ssrc = self.remote_description.audio.ssrc;
-        let playback = play_audio(output, decoder, pending, incoming_ssrc);
+        let playback = play_audio(output, decoder, queued, incoming_ssrc);
         tokio::pin!(playback);
         media_ready();
 
@@ -122,38 +119,38 @@ impl AnsweredCall {
                         if let Some(video) = &mut video {
                             video.next_packet().await
                         } else {
-                            std::future::pending::<Result<Zeroizing<Vec<u8>>>>().await
+                            pending::<Result<Zeroizing<Vec<u8>>>>().await
                         }
                     } => {
                         let packet = packet?;
                         if let Some(video) = &video {
                             let mut camera = video.camera_switch();
                             if *camera.borrow() && camera.has_changed().is_ok_and(|changed| !changed) {
+                                let mut muted = microphone.muted.clone();
                                 tokio::select! {
                                     biased;
                                     _ = camera.changed() => (),
+                                    Ok(()) = muted.changed() => (),
                                     result = self.send_rtp(&packet) => result?,
                                 }
                             }
                         }
                     },
-                    frame = input.next_frame() => {
-                        let mut frame = frame?;
-                        let mute_changed = muted.has_changed().unwrap_or(false);
-                        let suppress_frame = *muted.borrow_and_update()
-                            || mute_changed
-                            || discard_partial_frame;
-                        discard_partial_frame = false;
-                        if suppress_frame {
-                            // Flush any buffered audio through the encoder while suppressing RTP.
-                            frame.fill(0);
-                        }
-                        let encoded = encoder.encode(&mut frame)?;
-                        let packet = rtp.frame(encoded, suppress_frame, &feedback);
-                        if let Some(packet) = packet {
+                    packet = microphone.next_packet(&mut rtp, &feedback, Recording::start) => {
+                        let packet = packet?;
+                        let mut muted = microphone.muted.clone();
+                        if !*muted.borrow() && muted.has_changed().is_ok_and(|changed| !changed) {
+                            let camera_change = async {
+                                if let Some(video) = &video {
+                                    video.camera_switch().changed().await.ok()
+                                } else {
+                                    pending().await
+                                }
+                            };
                             tokio::select! {
                                 biased;
-                                Ok(()) = muted.changed() => discard_partial_frame = true,
+                                _ = muted.changed() => (),
+                                Some(()) = camera_change => (),
                                 result = self.send_rtp(&packet) => result?,
                             }
                         }
@@ -175,7 +172,7 @@ impl AnsweredCall {
         }
         .await;
 
-        drop(capture_device);
+        drop(microphone);
         drop(playback_device);
         if ended.has_changed().is_err() {
             Ok(())
@@ -226,6 +223,98 @@ fn audio_device(capture: bool) -> Result<Child> {
     command
         .spawn()
         .with_context(|| format!("Opening the Linux {label} with {executable}"))
+}
+
+struct Recording {
+    _device: Child,
+    input: Capture<ChildStdout>,
+    encoder: Encoder,
+}
+
+impl Recording {
+    fn start(encoder: Encoder) -> Result<Self> {
+        Self::with_device(audio_device(true)?, encoder)
+    }
+
+    fn with_device(mut device: Child, encoder: Encoder) -> Result<Self> {
+        let input = Capture::new(
+            device
+                .stdout
+                .take()
+                .context("Opening the FaceTime microphone stream")?,
+        );
+        Ok(Self {
+            _device: device,
+            input,
+            encoder,
+        })
+    }
+}
+
+struct Microphone {
+    muted: watch::Receiver<bool>,
+    paused_at: Option<Instant>,
+    first_encoder: Option<Encoder>,
+    recording: Option<Recording>,
+}
+
+impl Microphone {
+    fn new(muted: watch::Receiver<bool>, encoder: Encoder) -> Self {
+        Self {
+            muted,
+            paused_at: None,
+            first_encoder: Some(encoder),
+            recording: None,
+        }
+    }
+
+    fn stop(&mut self) {
+        // Closing the capture process and codec also discards partial samples and codec history.
+        self.recording = None;
+        self.paused_at.get_or_insert_with(Instant::now);
+    }
+
+    async fn next_packet(
+        &mut self,
+        rtp: &mut AudioSender,
+        feedback: &AudioFeedback,
+        start: impl Fn(Encoder) -> Result<Recording>,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        loop {
+            let control_open = self.muted.has_changed().is_ok();
+            let (capture, switch_changed) = {
+                let state = self.muted.borrow_and_update();
+                (control_open && !*state, state.has_changed())
+            };
+            if !capture || switch_changed {
+                self.stop();
+            }
+            if capture && self.recording.is_none() {
+                let encoder = self.first_encoder.take().map_or_else(Encoder::open, Ok)?;
+                self.recording = Some(start(encoder)?);
+                if let Some(paused_at) = self.paused_at.take() {
+                    rtp.advance_clock(paused_at.elapsed());
+                }
+            }
+            let next = async {
+                let Some(recording) = &mut self.recording else {
+                    return pending().await;
+                };
+                let mut samples = recording.input.next_frame().await?;
+                let encoded = recording.encoder.encode(&mut samples)?;
+                anyhow::Ok(rtp.frame(encoded, feedback))
+            };
+            tokio::select! {
+                biased;
+                _ = self.muted.changed(), if control_open => self.stop(),
+                frame = next => {
+                    if let Some(packet) = frame? {
+                        return Ok(packet);
+                    }
+                }
+            }
+        }
+    }
 }
 
 struct Capture<R> {
@@ -288,12 +377,11 @@ impl AudioSender {
     fn frame(
         &mut self,
         access_unit: &[u8],
-        muted: bool,
         feedback: &AudioFeedback,
     ) -> Option<Zeroizing<Vec<u8>>> {
         let timestamp = self.timestamp;
         self.timestamp = self.timestamp.wrapping_add(FRAME_SAMPLES as u32);
-        if muted || access_unit.is_empty() {
+        if access_unit.is_empty() {
             self.marker = true;
             return None;
         }
@@ -309,6 +397,12 @@ impl AudioSender {
         self.sequence = self.sequence.wrapping_add(1);
         self.marker = false;
         Some(packet)
+    }
+
+    fn advance_clock(&mut self, pause: Duration) {
+        let paused_samples = pause.as_micros() * u128::from(SAMPLE_RATE) / 1_000_000;
+        self.timestamp = self.timestamp.wrapping_add(paused_samples as u32);
+        self.marker = true;
     }
 }
 
@@ -432,6 +526,7 @@ async fn play_audio(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{cell::RefCell, path::Path};
     use tokio::io;
 
     #[tokio::test]
@@ -449,20 +544,99 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn muting_closes_the_microphone_and_unmuting_uses_a_clean_encoder() -> Result<()> {
+        let (mute, control) = watch::channel(true);
+        let opened = RefCell::new(Vec::new());
+        let start = |encoder| {
+            let pattern = if opened.borrow().is_empty() { "F" } else { "Z" };
+            let device = Command::new("yes")
+                .arg(pattern)
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()?;
+            opened.borrow_mut().push(device.id().unwrap());
+            Recording::with_device(device, encoder)
+        };
+        let mut mic = Microphone::new(control, Encoder::open()?);
+        let mut sender = AudioSender::new(7)?;
+        let feedback = AudioFeedback::default();
+
+        let mut waiting = Box::pin(mic.next_packet(&mut sender, &feedback, &start));
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        drop(waiting);
+        assert!(opened.borrow().is_empty());
+
+        mute.send_replace(false);
+        let first = tokio::time::timeout(
+            Duration::from_secs(2),
+            mic.next_packet(&mut sender, &feedback, &start),
+        )
+        .await??;
+        let pid = opened.borrow()[0];
+        let old_process = format!("/proc/{pid}");
+        assert!(Path::new(&old_process).exists());
+
+        mute.send_replace(true);
+        let mut waiting = Box::pin(mic.next_packet(&mut sender, &feedback, &start));
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        drop(waiting);
+        assert!(mic.recording.is_none());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while Path::new(&old_process).exists() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await?;
+
+        mute.send_replace(false);
+        let resumed = tokio::time::timeout(
+            Duration::from_secs(2),
+            mic.next_packet(&mut sender, &feedback, &start),
+        )
+        .await??;
+        assert_eq!(opened.borrow().len(), 2);
+        assert_eq!(resumed[1] >> 7, 1);
+        let first_header = CallRtpHeader::parse(&first).unwrap();
+        let resumed_header = CallRtpHeader::parse(&resumed).unwrap();
+        assert_eq!(
+            resumed_header.sequence,
+            first_header.sequence.wrapping_add(1)
+        );
+
+        let mut fresh = Encoder::open()?;
+        let mut pcm = Zeroizing::new([i16::from_le_bytes(*b"Z\n"); FRAME_SAMPLES]);
+        let payload = resumed_header
+            .payload(&resumed)
+            .context("Missing audio payload")?;
+        let expected = fresh.encode(&mut pcm)?;
+        assert_eq!(access_units(AAC_ELD_PT, payload), Some(vec![expected]));
+
+        mute.send_replace(true);
+        mute.send_replace(false);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            mic.next_packet(&mut sender, &feedback, &start),
+        )
+        .await??;
+        assert_eq!(opened.borrow().len(), 3);
+        Ok(())
+    }
+
     #[test]
     fn aac_and_redundancy_frames_are_bounded_and_muting_leaves_an_rtp_timestamp_gap() -> Result<()>
     {
         let mut sender = AudioSender::new(0xffab0011)?;
         let feedback = AudioFeedback::default();
-        let first = sender.frame(&[9, 10], false, &feedback).unwrap();
+        let first = sender.frame(&[9, 10], &feedback).unwrap();
         let header = CallRtpHeader::parse(&first).unwrap();
         assert_eq!(header.ssrc, 0xffab0011);
         assert_eq!(header.payload_type, AAC_ELD_PT);
         assert_eq!(header.extension(&first).unwrap().0, 0x8100);
         assert_eq!(header.payload(&first), Some(&[2, 9, 10][..]));
         assert_eq!(first[1] >> 7, 1);
-        assert!(sender.frame(&[11], true, &feedback).is_none());
-        let resumed = sender.frame(&[12], false, &feedback).unwrap();
+        sender.advance_clock(Duration::from_millis(20));
+        let resumed = sender.frame(&[12], &feedback).unwrap();
         let timestamp = |packet: &[u8]| u32::from_be_bytes(packet[4..8].try_into().unwrap());
         assert_eq!(timestamp(&resumed).wrapping_sub(timestamp(&first)), 960);
         assert_eq!(resumed[1] >> 7, 1);
@@ -489,7 +663,7 @@ mod tests {
                 (9000.0 * (440.0 * std::f64::consts::TAU * time).sin()) as i16
             }));
             let encoded = encoder.encode(&mut samples)?;
-            if let Some(packet) = sender.frame(encoded, false, &feedback)
+            if let Some(packet) = sender.frame(encoded, &feedback)
                 && frame != 12
             {
                 send.try_send(packet)?;

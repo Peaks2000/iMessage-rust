@@ -56,28 +56,17 @@ unsafe impl Send for Encoder {}
 unsafe impl Send for Decoder {}
 
 pub(super) fn open() -> Result<(Encoder, Decoder)> {
-    let mut encoder = Encoder::new()?;
-    let mut info = MaybeUninit::<fdk::AACENC_InfoStruct>::zeroed();
-    status(
-        unsafe { fdk::aacEncInfo(encoder.handle.as_ptr(), info.as_mut_ptr()) },
-        "reading AAC-ELD configuration",
-    )?;
-    let mut info = unsafe { info.assume_init() };
-    let length = info.confSize as usize;
-    ensure!(
-        (1..=info.confBuf.len()).contains(&length)
-            && info.frameLength as usize == FRAME_SAMPLES
-            && info.inputChannels == 1
-            && (MAX_ACCESS_UNIT..=16 * 1024).contains(&(info.maxOutBufBytes as usize)),
-        "FDK AAC returned an incompatible FaceTime audio configuration"
-    );
-    encoder.output.resize(info.maxOutBufBytes as usize, 0);
-    let decoder = Decoder::new(&mut info.confBuf[..length])?;
+    let (encoder, mut info) = Encoder::configured()?;
+    let decoder = Decoder::new(&mut info.confBuf[..info.confSize as usize])?;
     Ok((encoder, decoder))
 }
 
 impl Encoder {
-    fn new() -> Result<Self> {
+    pub(super) fn open() -> Result<Self> {
+        Self::configured().map(|(encoder, _)| encoder)
+    }
+
+    fn configured() -> Result<(Self, fdk::AACENC_InfoStruct)> {
         let mut handle = null_mut();
         let open = unsafe { fdk::aacEncOpen(&mut handle, 0, 1) };
         let encoder = NonNull::new(handle).map(|handle| Self {
@@ -85,7 +74,7 @@ impl Encoder {
             output: Zeroizing::new(Vec::new()),
         });
         status(open, "opening the AAC encoder")?;
-        let encoder = encoder.context("FDK AAC did not create an encoder")?;
+        let mut encoder = encoder.context("FDK AAC did not create an encoder")?;
         for (parameter, value) in [
             (
                 fdk::AACENC_PARAM_AACENC_AOT,
@@ -119,7 +108,21 @@ impl Encoder {
             },
             "initializing AAC-ELD",
         )?;
-        Ok(encoder)
+        let mut info = MaybeUninit::<fdk::AACENC_InfoStruct>::zeroed();
+        status(
+            unsafe { fdk::aacEncInfo(encoder.handle.as_ptr(), info.as_mut_ptr()) },
+            "reading AAC-ELD configuration",
+        )?;
+        let info = unsafe { info.assume_init() };
+        ensure!(
+            (1..=info.confBuf.len()).contains(&(info.confSize as usize))
+                && info.frameLength as usize == FRAME_SAMPLES
+                && info.inputChannels == 1
+                && (MAX_ACCESS_UNIT..=16 * 1024).contains(&(info.maxOutBufBytes as usize)),
+            "FDK AAC returned an incompatible FaceTime audio configuration"
+        );
+        encoder.output.resize(info.maxOutBufBytes as usize, 0);
+        Ok((encoder, info))
     }
 
     pub(super) fn encode(&mut self, samples: &mut [i16; FRAME_SAMPLES]) -> Result<&[u8]> {

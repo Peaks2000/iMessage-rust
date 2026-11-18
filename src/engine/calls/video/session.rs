@@ -82,10 +82,12 @@ impl VideoSession {
 
     pub(in crate::engine::calls) async fn next_packet(&mut self) -> Result<Zeroizing<Vec<u8>>> {
         loop {
-            let changed = self.camera_enabled.has_changed();
-            let can_change = changed.is_ok();
-            let enabled = can_change && *self.camera_enabled.borrow_and_update();
-            if !enabled || changed.unwrap_or(false) {
+            let can_change = self.camera_enabled.has_changed().is_ok();
+            let (enabled, changed) = {
+                let state = self.camera_enabled.borrow_and_update();
+                (can_change && *state, state.has_changed())
+            };
+            if !enabled || changed {
                 self.stop_capture();
             }
             if enabled && self.camera.is_none() {
