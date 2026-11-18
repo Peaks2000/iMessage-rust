@@ -40,6 +40,13 @@ pub enum TrustedDeviceResponse {
     UseSms,
 }
 
+pub enum AppleSetupStage {
+    ValidateDevice,
+    SignIn,
+    AuthorizeDevice,
+    RegisterDevice,
+}
+
 pub trait SmsPrompts {
     /// Return the zero-based index of the trusted phone to use.
     fn choose_phone(&mut self, phones: &[TrustedPhone]) -> impl Future<Output = Result<usize>>;
@@ -54,6 +61,9 @@ pub trait SmsPrompts {
     }
 
     fn received_icloud_contacts(&mut self, _grant: Result<super::IcloudContactsGrant>) {}
+
+    fn setup_stage(&mut self, _stage: AppleSetupStage) {}
+
     fn prefers_ssh_password(&self) -> bool {
         false
     }
@@ -112,6 +122,10 @@ pub(super) async fn login(
 ) -> Result<Zeroizing<Vec<u8>>> {
     let account = account.trim();
     validate_login(account, &password)?;
+    if let Some(proofs) = &proofs {
+        prompts.setup_stage(AppleSetupStage::ValidateDevice);
+        qualify_device(device, proofs).await?;
+    }
     let client = apple_client()?;
     let gsa = GrandSlam {
         client: &client,
@@ -121,14 +135,20 @@ pub(super) async fn login(
     };
     let password_hash = Zeroizing::new(sha256(password.as_bytes()));
     drop(password);
+    prompts.setup_stage(AppleSetupStage::SignIn);
     let session = gsa
         .sign_in(anisette, account, &password_hash, prompts)
         .await?;
-    let headers = anisette.headers().await?;
-    if let Some(proofs) = &proofs {
-        device.validation_data = proofs.qualification().await?;
-        device.validate()?;
+    // The account can pause for a trusted-device or SMS code. A connected provider can
+    // issue a fresh qualification proof when Apple Account verification has finished.
+    if session.verified_with_code
+        && let Some(proofs @ Proofs::Provider(_)) = &proofs
+    {
+        prompts.setup_stage(AppleSetupStage::ValidateDevice);
+        qualify_device(device, proofs).await?;
     }
+    prompts.setup_stage(AppleSetupStage::AuthorizeDevice);
+    let headers = anisette.headers().await?;
     let auth = super::ids_auth::authenticate(
         &client,
         device,
@@ -143,14 +163,27 @@ pub(super) async fn login(
         _ => None,
     };
     if let Some(proofs) = proofs {
-        device.validation_data = proofs.registration().await?;
+        prompts.setup_stage(AppleSetupStage::ValidateDevice);
+        device.validation_data = proofs
+            .registration()
+            .await
+            .context("Could not validate the device for registration")?;
     }
+    prompts.setup_stage(AppleSetupStage::RegisterDevice);
     let registration = register(&client, device, auth, fresh_proof_provider, existing).await?;
     if existing.is_none() && prompts.request_icloud_contacts() {
         let grant = super::icloud_contacts::authorize(account, &session, anisette).await;
         prompts.received_icloud_contacts(grant);
     }
     Ok(registration)
+}
+
+async fn qualify_device(device: &mut DeviceRegistration, proofs: &Proofs<'_>) -> Result<()> {
+    device.validation_data = proofs
+        .qualification()
+        .await
+        .context("Could not validate the Apple device")?;
+    device.validate()
 }
 
 pub async fn authorize_icloud_contacts(
@@ -194,6 +227,7 @@ struct GrandSlam<'a> {
 pub(super) struct LoginSession {
     pub adsid: String,
     pub pet: Zeroizing<String>,
+    verified_with_code: bool,
 }
 
 enum PasswordStep {
@@ -368,11 +402,12 @@ impl GrandSlam<'_> {
             return Ok(session);
         }
         match self.password_step(anisette, account, password).await? {
-            PasswordStep::Verified(session) => {
+            PasswordStep::Verified(mut session) => {
                 ensure!(
                     session.adsid == challenge.adsid,
                     "Apple changed the account after verification"
                 );
+                session.verified_with_code = true;
                 Ok(session)
             }
             PasswordStep::Challenge(_) => {
@@ -584,6 +619,7 @@ impl GrandSlam<'_> {
                 Ok(PasswordStep::Verified(LoginSession {
                     adsid,
                     pet: Zeroizing::new(pet.into()),
+                    verified_with_code: false,
                 }))
             }
         }
@@ -798,6 +834,7 @@ async fn finish_verification(
     Ok(Some(LoginSession {
         adsid: challenge.adsid.clone(),
         pet: Zeroizing::new(token.to_owned()),
+        verified_with_code: true,
     }))
 }
 
@@ -867,6 +904,7 @@ mod tests {
         response::IntoResponse,
         routing::{get, post, put},
     };
+    use plist::Data;
     use serde_json::json;
 
     use super::*;
@@ -874,6 +912,70 @@ mod tests {
     struct Prompts {
         choices: usize,
         code: &'static str,
+    }
+
+    #[tokio::test]
+    async fn validates_the_device_before_starting_apple_account_sign_in() -> Result<()> {
+        struct SetupProgress(Vec<AppleSetupStage>);
+
+        impl SmsPrompts for SetupProgress {
+            async fn choose_phone(&mut self, _: &[TrustedPhone]) -> Result<usize> {
+                anyhow::bail!("Device validation should fail before choosing a phone")
+            }
+
+            async fn read_code(&mut self) -> Result<Zeroizing<String>> {
+                anyhow::bail!("Device validation should fail before requesting a code")
+            }
+
+            fn setup_stage(&mut self, stage: AppleSetupStage) {
+                self.0.push(stage);
+            }
+        }
+
+        let folder = tempfile::tempdir()?;
+        let helper = folder.path().join("device-helper");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\n[ \"$1\" = validation ] || exit 1\nprintf '%s' 'invalid!'\n",
+        )?;
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))?;
+        let provider = crate::apple::provisioning::DeviceProvider::LocalHelper(helper);
+        let mut anisette = Anisette::from_provider(provider.clone());
+        let mut device = DeviceRegistration {
+            version: 1,
+            handle: "mailto:fixture@example.org".into(),
+            // An invalid push token ensures this fixture cannot reach Apple's account endpoints.
+            push_token: Data::new(Vec::new()),
+            push_certificate: Data::new(Vec::new()),
+            push_private_key: Data::new(Vec::new()),
+            protocol_version: 1660,
+            user_agent: "[macOS,11.7.10,20G1427,MacBookPro11,3]".into(),
+            device_name: "Fixture".into(),
+            hardware_version: "MacBookPro11,3".into(),
+            os_version: "macOS,11.7.10,20G1427".into(),
+            software_version: "20G1427".into(),
+            private_device_data: Dictionary::new(),
+            validation_data: Data::new(Vec::new()),
+            include_facetime: true,
+        };
+        let mut prompts = SetupProgress(Vec::new());
+        let result = login(
+            &mut device,
+            &mut anisette,
+            Some(Proofs::Provider(&provider)),
+            "fixture@example.org",
+            Zeroizing::new("fixture-password".to_owned()),
+            &mut prompts,
+            None,
+        )
+        .await;
+        let error = result.err().context("Invalid device proof was accepted")?;
+        assert!(format!("{error:#}").contains("invalid Apple validation data"));
+        assert!(matches!(
+            prompts.0.as_slice(),
+            [AppleSetupStage::ValidateDevice]
+        ));
+        Ok(())
     }
 
     impl SmsPrompts for Prompts {
@@ -969,6 +1071,7 @@ mod tests {
                 let result = result.context("The fixture supplies a PET")?;
                 assert_eq!(result.adsid, "123");
                 assert_eq!(result.pet.as_str(), "fixture-pet");
+                assert!(result.verified_with_code);
                 assert_eq!(prompts.choices, 1);
                 assert_eq!(
                     *fixture.requests.lock().unwrap(),

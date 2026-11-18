@@ -16,7 +16,8 @@ mod registration;
 mod ssh_setup;
 mod tapback;
 pub use gsa::{
-    SmsPrompts, TrustedDeviceResponse, TrustedPhone, authorize_icloud_contacts, login_device_sms,
+    AppleSetupStage, SmsPrompts, TrustedDeviceResponse, TrustedPhone, authorize_icloud_contacts,
+    login_device_sms,
 };
 pub use icloud_contacts::IcloudContactsGrant;
 pub use provisioning::{AutomaticSetup, DeviceConnection, default_device_helper};

@@ -7,8 +7,8 @@ use anyhow::{Context, Result};
 use eframe::egui::{self, Align, Color32, Layout, Margin, RichText, TextEdit, Ui, vec2};
 use linux_imessage::{
     apple::{
-        self, AutomaticSetup, DeviceConnection, IcloudContactsGrant, Identity, SmsPrompts,
-        SshPrompt, TrustedDeviceResponse, TrustedPhone,
+        self, AppleSetupStage, AutomaticSetup, DeviceConnection, IcloudContactsGrant, Identity,
+        SmsPrompts, SshPrompt, TrustedDeviceResponse, TrustedPhone,
     },
     storage,
 };
@@ -76,6 +76,7 @@ struct Worker {
 }
 
 enum Event {
+    Progress(&'static str),
     Phone(Vec<String>, oneshot::Sender<usize>),
     Code(CodePrompt),
     Ssh(SshPrompt, oneshot::Sender<Zeroizing<String>>),
@@ -387,6 +388,7 @@ impl MacSetup {
             return false;
         };
         match worker.events.try_recv() {
+            Ok(Event::Progress(message)) => self.step = Step::Working(message),
             Ok(Event::Phone(labels, answer)) => {
                 self.step = Step::Phone {
                     labels,
@@ -581,6 +583,16 @@ impl GuiPrompts {
 }
 
 impl SmsPrompts for GuiPrompts {
+    fn setup_stage(&mut self, stage: AppleSetupStage) {
+        let message = match stage {
+            AppleSetupStage::ValidateDevice => "Validating the Apple device…",
+            AppleSetupStage::SignIn => "Signing in to your Apple Account…",
+            AppleSetupStage::AuthorizeDevice => "Authorizing the device with Apple…",
+            AppleSetupStage::RegisterDevice => "Registering the device with Apple…",
+        };
+        let _ = self.emit(Event::Progress(message));
+    }
+
     fn request_icloud_contacts(&self) -> bool {
         true
     }
