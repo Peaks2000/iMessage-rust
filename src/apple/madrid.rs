@@ -358,7 +358,7 @@ impl Madrid {
         target: &Message,
         event: &TapbackEvent,
     ) -> Result<Delivery> {
-        let payload = binary(&tapback::encode(event, target, &identity.handle)?)?;
+        let payload = tapback_payload(event, target, &identity.handle)?;
         let targets = self.message_destinations(identity, &event.chat).await?;
         self.deliver_message(
             identity,
@@ -657,6 +657,17 @@ fn message_timestamp(wire: &Dictionary, now: i64) -> i64 {
         .unwrap_or(now)
 }
 
+fn tapback_payload(event: &TapbackEvent, target: &Message, sender: &str) -> Result<Vec<u8>> {
+    let payload = binary(&tapback::encode(event, target, sender)?)?;
+    // The message body appears in both the fallback text and the notification summary.
+    let gzipped = compress(&payload)?;
+    Ok(if gzipped.len() < payload.len() {
+        gzipped
+    } else {
+        payload
+    })
+}
+
 fn lookup_body(targets: &[&str]) -> Result<Vec<u8>> {
     // The IDS endpoint requires XML, even though the APNs envelope uses binary plists.
     plist_xml_gzip(&dictionary([(
@@ -719,6 +730,80 @@ pub(super) fn decompress(bytes: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{TEXT_LIMIT, Tapback, TapbackKind};
+    use openssl::{
+        ec::{EcGroup, EcKey},
+        nid::Nid,
+        pkey::PKey,
+        rsa::Rsa,
+    };
+
+    #[test]
+    fn encrypted_tapbacks_on_long_messages_fit_the_courier_budget() -> Result<()> {
+        let sender = "mailto:sender@example.org";
+        let chat = "mailto:recipient@example.org";
+        let target = Uuid::new_v4();
+        let text = "Here’s a note: café. 🍰\n";
+        let original = Message {
+            id: target.to_string(),
+            address: chat.into(),
+            body: text.repeat(TEXT_LIMIT / text.len()),
+            text_part: None,
+            outgoing: false,
+            timestamp_ms: 0,
+            status: Delivery::Received,
+            attachments: Vec::new(),
+            tapbacks: Vec::new(),
+        };
+        let key = || -> Result<_> {
+            let curve = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
+            let signing = PKey::from_ec_key(EcKey::generate(&curve)?)?;
+            let encryption = PKey::from_rsa(Rsa::generate(1280)?)?;
+            KeyPair::private(
+                &signing.private_key_to_der()?,
+                &encryption.private_key_to_der()?,
+            )
+        };
+        let sender_keys = key()?;
+        let recipient_keys = key()?;
+        let sender_public = KeyPair::decode(&sender_keys.public_der()?)?;
+        let recipient_public = KeyPair::decode(&recipient_keys.public_der()?)?;
+
+        for (kind, removed) in [
+            (TapbackKind::Like, false),
+            (TapbackKind::Emoji("🎉".into()), true),
+        ] {
+            let event = TapbackEvent {
+                id: Uuid::new_v4(),
+                target,
+                chat: chat.into(),
+                timestamp_ns: 1,
+                removed,
+                tapback: Tapback {
+                    kind,
+                    outgoing: true,
+                    part: 0,
+                },
+            };
+            assert!(binary(&tapback::encode(&event, &original, sender)?)?.len() > MAX_BATCH);
+            let payload = tapback_payload(&event, &original, sender)?;
+            let sealed = sender_keys.seal(&recipient_public, &payload)?;
+            // A device can have an IDS session token up to 4096 bytes.
+            assert!(sealed.len() + 4096 + 512 <= MAX_BATCH);
+            let plaintext = recipient_keys.open(&sender_public, &sealed)?;
+            let decoded: Dictionary = plist::from_bytes(&decompress(&plaintext)?)?;
+            let summary: Dictionary = plist::from_bytes(
+                field_data(&decoded, "msi").context("Missing reaction summary")?,
+            )?;
+            assert_eq!(field_str(&summary, "ams"), Some(original.body.as_str()));
+            let received = tapback::decode(&decoded, event.id, chat.into(), true, 1)
+                .context("Missing reaction after opening encrypted packet")?;
+            assert_eq!(received.target, target);
+            assert_eq!(received.removed, removed);
+            assert_eq!(received.tapback, event.tapback);
+        }
+        Ok(())
+    }
 
     #[test]
     fn retried_messages_keep_their_original_timestamp() {
