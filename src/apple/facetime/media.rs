@@ -14,6 +14,7 @@ use openssl::{
     rand::rand_bytes,
 };
 use plist::{Dictionary, Value};
+use serde::Deserialize;
 use tokio::sync::watch;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -32,6 +33,17 @@ pub(crate) struct PeerPrekey {
 }
 
 impl PeerPrekey {
+    pub(super) fn from_relay(payload: &[u8]) -> Result<Self> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "kebab-case")]
+        struct RelayPrekey {
+            public_prekey: plist::Data,
+            wrap_mode: u32,
+        }
+        let prekey: RelayPrekey = plist::from_bytes(payload)?;
+        Self::parse(prekey.wrap_mode, prekey.public_prekey.as_ref())
+    }
+
     pub(crate) fn parse(mode: u32, bytes: &[u8]) -> Result<Self> {
         ensure!(mode == 1, "Unsupported FaceTime key wrapping mode");
         let encoded: [u8; POINT_LEN] =

@@ -22,7 +22,7 @@ use crate::{
     apple::{
         CallEndpoint, CallKeyOffer, CallMediaDescription, CallMediaExchange, CallMediaHandshake,
         CallPeerKeys, CallRelayAllocation, CallRelayBinding, CallRelayProfile, CallRtpProtection,
-        Identity, Madrid, RelayPeerUpdate,
+        Identity, Madrid, PeerPrekey, RelayPeerUpdate,
     },
     now_ms,
 };
@@ -134,13 +134,18 @@ impl AnsweredCall {
 }
 
 pub(super) struct AnswerAttempt {
-    lease: Arc<()>,
-    handshake: Arc<CallMediaHandshake>,
+    lease: Arc<AnswerLease>,
+    call: IncomingCall,
+    handshake: Option<Arc<CallMediaHandshake>>,
+}
+
+pub(super) struct AnswerLease {
+    id: Uuid,
 }
 
 pub(super) struct JoinAnswer {
     id: Uuid,
-    lease: Arc<()>,
+    lease: Arc<AnswerLease>,
     avc_plist: Vec<u8>,
     mode: CallMode,
 }
@@ -199,24 +204,53 @@ impl Engine {
         let remaining =
             Duration::from_millis(call.expires_ms.saturating_sub(now_ms()).max(0) as u64);
         let setup = async {
-            let attempt = self.wait_for_caller_prekey(id).await?;
+            let AnswerAttempt {
+                call,
+                lease,
+                handshake,
+            } = self.wait_for_caller_offer(id).await?;
             ensure!(
-                config.mode != CallMode::Video
-                    || attempt.handshake.call().mode != Some(CallMode::Audio),
+                config.mode != CallMode::Video || call.mode != Some(CallMode::Audio),
                 "An incoming FaceTime Audio call must be answered with audio"
             );
             let allocation = self.allocate_call_relay(id).await?;
+            let (handshake, early_relay) = if let Some(handshake) = handshake {
+                (handshake, None)
+            } else {
+                // The caller's signed participant update established the endpoint.
+                // Connect so the relay can deliver its signed prekey.
+                let mut relay = allocation
+                    .connect()
+                    .await?
+                    .bind(config.relay_profile)
+                    .await?;
+                relay.subscribe_to_descriptions().await?;
+                let handshake = self.wait_for_answer_media(id, &lease, &mut relay).await?;
+                (handshake, Some(relay))
+            };
             let local_keys = self.publish_call_keys(id).await?;
             let description = local_keys.seal_description(config.avc_plist, config.mode)?;
-            let mut relay = allocation
-                .connect()
-                .await?
-                .bind_with_description(config.relay_profile, &description)
-                .await?;
-            relay.subscribe_to_descriptions().await?;
-            Ok::<_, anyhow::Error>((relay, local_keys, allocation.caller_participant, attempt))
+            let relay = if let Some(mut relay) = early_relay {
+                relay.publish_description(&description).await?;
+                relay
+            } else {
+                let mut relay = allocation
+                    .connect()
+                    .await?
+                    .bind_with_description(config.relay_profile, &description)
+                    .await?;
+                relay.subscribe_to_descriptions().await?;
+                relay
+            };
+            Ok::<_, anyhow::Error>((
+                relay,
+                local_keys,
+                allocation.caller_participant,
+                lease,
+                handshake,
+            ))
         };
-        let (relay, local_keys, caller_participant, AnswerAttempt { lease, handshake }) = tokio::select! {
+        let (relay, local_keys, caller_participant, lease, handshake) = tokio::select! {
             biased;
             error = wait_for_ring_to_end(self.watch_status(), id) => return Err(error),
             result = timeout(remaining, setup) => result.context("The FaceTime call expired during setup")??,
@@ -248,7 +282,7 @@ impl Engine {
         .await
     }
 
-    async fn wait_for_caller_prekey(&self, id: Uuid) -> Result<AnswerAttempt> {
+    async fn wait_for_caller_offer(&self, id: Uuid) -> Result<AnswerAttempt> {
         let mut updates = self.watch_status();
         loop {
             updates.borrow_and_update();
@@ -265,7 +299,43 @@ impl Engine {
             updates
                 .changed()
                 .await
-                .context("The Apple engine stopped while waiting for caller keys")?;
+                .context("The Apple engine stopped while waiting for the caller to join")?;
+        }
+    }
+
+    async fn wait_for_answer_media(
+        &self,
+        id: Uuid,
+        lease: &Arc<AnswerLease>,
+        relay: &mut CallRelayBinding,
+    ) -> Result<Arc<CallMediaHandshake>> {
+        let mut updates = self.watch_status();
+        let mut relay_prekey = None;
+        let mut can_read_relay = true;
+        loop {
+            updates.borrow_and_update();
+            let (reply, result) = oneshot::channel();
+            self.requests
+                .try_send(Request::ResolveAnswerMedia {
+                    id,
+                    lease: lease.clone(),
+                    relay_prekey: relay_prekey.take(),
+                    reply,
+                })
+                .context("The Apple engine is busy or stopped")?;
+            if let Some(handshake) = result
+                .await
+                .context("The Apple engine stopped while preparing the answer")??
+            {
+                return Ok(handshake);
+            }
+            tokio::select! {
+                result = updates.changed() => result.context("The Apple engine stopped while waiting for caller keys")?,
+                result = relay.wait_for_peer_prekey(), if can_read_relay => {
+                    can_read_relay = false;
+                    relay_prekey = result.ok().flatten();
+                }
+            }
         }
     }
 }
@@ -383,21 +453,70 @@ impl IncomingCalls {
             !self.call_in_progress(),
             "A FaceTime call is already in progress"
         );
-        active_call(status, id)?;
+        let call = active_call(status, id)?.clone();
         let details = self
             .details
             .get(&id)
             .context("Missing FaceTime caller details")?;
-        if details.endpoint.participant().is_none()
-            || details.description.is_none()
-            || details.prekey.is_none()
-        {
+        if details.endpoint.participant().is_none() || details.description.is_none() {
             return Ok(None);
         }
-        let handshake = self.prepare_media(status, id)?;
-        let lease = Arc::new(());
+        let handshake = details
+            .prekey
+            .is_some()
+            .then(|| self.prepare_media(status, id))
+            .transpose()?;
+        let lease = Arc::new(AnswerLease { id });
         self.answering = Some(Arc::downgrade(&lease));
-        Ok(Some(AnswerAttempt { lease, handshake }))
+        Ok(Some(AnswerAttempt {
+            lease,
+            call,
+            handshake,
+        }))
+    }
+
+    fn check_answer_lease(&self, id: Uuid, lease: &Arc<AnswerLease>) -> Result<()> {
+        ensure!(
+            lease.id == id
+                && self
+                    .answering
+                    .as_ref()
+                    .and_then(|active| active.upgrade())
+                    .is_some_and(|active| Arc::ptr_eq(&active, lease)),
+            "The FaceTime answer was canceled"
+        );
+        Ok(())
+    }
+
+    pub(super) fn resolve_answer_media(
+        &mut self,
+        status: &Status,
+        id: Uuid,
+        lease: &Arc<AnswerLease>,
+        relay_prekey: Option<PeerPrekey>,
+    ) -> Result<Option<Arc<CallMediaHandshake>>> {
+        self.check_answer_lease(id, lease)?;
+        active_call(status, id)?;
+        let details = self
+            .details
+            .get_mut(&id)
+            .context("The FaceTime caller is unavailable")?;
+        if let Some(prekey) = relay_prekey {
+            ensure!(
+                details
+                    .relay
+                    .as_ref()
+                    .is_some_and(|relay| relay.call_id == id
+                        && details.endpoint.participant() == Some(relay.caller_participant)),
+                "FaceTime relay no longer matches the caller"
+            );
+            details.learn_prekey(prekey);
+        }
+        details
+            .prekey
+            .is_some()
+            .then(|| self.prepare_media(status, id))
+            .transpose()
     }
 
     pub(super) async fn send_join(
@@ -407,14 +526,12 @@ impl IncomingCalls {
         status: &watch::Sender<Status>,
         answer: &JoinAnswer,
     ) -> Result<JoinReceipt> {
-        ensure!(
-            self.answering
-                .as_ref()
-                .and_then(|lease| lease.upgrade())
-                .is_some_and(|lease| Arc::ptr_eq(&lease, &answer.lease)),
-            "The FaceTime answer was canceled"
-        );
+        self.check_answer_lease(answer.id, &answer.lease)?;
         let call = active_call(&status.borrow(), answer.id)?.clone();
+        ensure!(
+            answer.mode != CallMode::Video || call.mode != Some(CallMode::Audio),
+            "An incoming FaceTime Audio call must be answered with audio"
+        );
         let details = self
             .details
             .get(&answer.id)
@@ -586,22 +703,33 @@ mod tests {
         incoming.update(&status, own, ring());
         incoming.details.get_mut(&id).unwrap().prekey = None;
         reader.borrow_and_update();
-        assert!(incoming.begin_answer(&reader.borrow(), id)?.is_none());
-        incoming.update(
-            &status,
-            own,
-            CallSignal::Prekey {
-                id,
-                sender: caller.to_owned(),
-                endpoint: CallEndpoint::new([2; 32], None),
-                key: prekey.clone(),
-            },
-        );
-        assert!(reader.has_changed()?);
         let attempt = incoming
             .begin_answer(&reader.borrow(), id)?
             .context("missing answer reservation")?;
+        assert!(attempt.handshake.is_none());
         assert!(incoming.begin_answer(&reader.borrow(), id).is_err());
+        assert!(
+            incoming
+                .resolve_answer_media(&reader.borrow(), id, &attempt.lease, None)?
+                .is_none()
+        );
+        assert!(
+            incoming
+                .resolve_answer_media(&reader.borrow(), id, &attempt.lease, Some(prekey.clone()))
+                .is_err()
+        );
+        incoming.details.get_mut(&id).unwrap().relay = Some(receipt.relay.clone());
+        let forged_lease = Arc::new(AnswerLease { id });
+        assert!(
+            incoming
+                .resolve_answer_media(&reader.borrow(), id, &forged_lease, Some(prekey.clone()))
+                .is_err()
+        );
+        assert!(
+            incoming
+                .resolve_answer_media(&reader.borrow(), id, &attempt.lease, Some(prekey.clone()))?
+                .is_some()
+        );
         let mut lifetime = incoming.finish_answer(&status, &receipt)?;
         drop(attempt);
         assert!(reader.borrow().incoming_calls.is_empty());

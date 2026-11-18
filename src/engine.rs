@@ -3,7 +3,7 @@ mod calls;
 use calls::outgoing::{DialRequest, OutgoingAnswer, OutgoingAttempt, PendingOutgoing};
 #[cfg(feature = "desktop")]
 pub use calls::video;
-use calls::{AnswerAttempt, AnswerLifetime, ConnectedCall, JoinAnswer};
+use calls::{AnswerAttempt, AnswerLease, AnswerLifetime, ConnectedCall, JoinAnswer};
 pub use calls::{AnsweredCall, CallAnswerConfig};
 
 use std::{
@@ -74,6 +74,12 @@ enum Request {
     BeginCallAnswer {
         id: uuid::Uuid,
         reply: oneshot::Sender<Result<Option<AnswerAttempt>>>,
+    },
+    ResolveAnswerMedia {
+        id: uuid::Uuid,
+        lease: Arc<AnswerLease>,
+        relay_prekey: Option<PeerPrekey>,
+        reply: oneshot::Sender<Result<Option<Arc<CallMediaHandshake>>>>,
     },
     JoinCall {
         answer: JoinAnswer,
@@ -374,6 +380,9 @@ async fn run_apple(
                         Request::BeginCallAnswer { reply, .. } => {
                             let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
                         }
+                        Request::ResolveAnswerMedia { reply, .. } => {
+                            let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
+                        }
                         Request::JoinCall { reply, .. } => {
                             let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
                         }
@@ -505,6 +514,11 @@ async fn online(
                             let _ = reply.send(calls.begin_answer(&status.borrow(), id));
                         }
                     }
+                    Request::ResolveAnswerMedia { id, lease, relay_prekey, reply } => {
+                        if !reply.is_closed() {
+                            let _ = reply.send(calls.resolve_answer_media(&status.borrow(), id, &lease, relay_prekey));
+                        }
+                    }
                     Request::JoinCall { answer, reply } => {
                         for notification in madrid.take_queued() {
                             receive_notification(identity, state, madrid, status, calls, notification).await?;
@@ -603,7 +617,7 @@ fn active_call(status: &Status, id: uuid::Uuid) -> Result<&crate::IncomingCall> 
 struct IncomingCalls {
     details: HashMap<uuid::Uuid, IncomingCallDetails>,
     ended: HashMap<uuid::Uuid, i64>,
-    answering: Option<Weak<()>>,
+    answering: Option<Weak<AnswerLease>>,
     connected: Option<ConnectedCall>,
     outgoing: Option<PendingOutgoing>,
 }

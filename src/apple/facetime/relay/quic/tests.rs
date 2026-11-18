@@ -389,6 +389,19 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
     plist::to_writer_binary(&mut media_key, &payload["rtmkm"])?;
     let mut session_key = Vec::new();
     plist::to_writer_binary(&mut session_key, &payload["rtskm"])?;
+    let encode_prekey = |mode: u32| -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        let wire = plist::Dictionary::from_iter([
+            (
+                "public-prekey",
+                plist::Value::Data(remote.handshake.public_prekey().to_vec()),
+            ),
+            ("wrap-mode", plist::Value::from(mode)),
+            ("creation-date", plist::Value::Real(1_700_000_000.0)),
+        ]);
+        plist::to_writer_binary(&mut bytes, &wire)?;
+        Ok(bytes)
+    };
     let wrong_group = openssl::ec::EcGroup::from_curve_name(openssl::nid::Nid::X9_62_PRIME256V1)?;
     let wrong_signing =
         openssl::pkey::PKey::from_ec_key(openssl::ec::EcKey::generate(&wrong_group)?)?;
@@ -400,6 +413,11 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
     let description_record = |ciphertext| TestAvcMaterial {
         id: vec![7; 20],
         kind: 12,
+        ciphertext,
+    };
+    let prekey_record = |ciphertext| TestAvcMaterial {
+        id: vec![8; 20],
+        kind: 11,
         ciphertext,
     };
     let (started, has_partial_frame) = tokio::sync::oneshot::channel();
@@ -505,17 +523,48 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
         let wrong_identifier =
             indication(description::CALLER, description::LOCAL, wrong_identifier);
         indication_chunk(&mut relay, &mut indications, &wrong_identifier).await?;
+        let prekey = encode_prekey(1)?;
+        let wrong_call = indication(
+            description::CALLER,
+            0,
+            prekey_record(signed_key(&signing, uuid::Uuid::new_v4(), &prekey)?),
+        );
+        indication_chunk(&mut relay, &mut indications, &wrong_call).await?;
+        let wrong_signer = indication(
+            description::CALLER,
+            0,
+            prekey_record(signed_key(&wrong_signing, description::CALL, &prekey)?),
+        );
+        indication_chunk(&mut relay, &mut indications, &wrong_signer).await?;
+        let wrong_owner = indication(
+            description::CALLER + 1,
+            0,
+            prekey_record(signed_key(&signing, description::CALL, &prekey)?),
+        );
+        indication_chunk(&mut relay, &mut indications, &wrong_owner).await?;
+        let wrong_mode = indication(
+            description::CALLER,
+            0,
+            prekey_record(signed_key(&signing, description::CALL, &encode_prekey(8)?)?),
+        );
+        indication_chunk(&mut relay, &mut indications, &wrong_mode).await?;
+        let valid_prekey = indication(
+            description::CALLER,
+            0,
+            prekey_record(signed_key(&signing, description::CALL, &prekey)?),
+        );
         let media = indication(
             description::CALLER,
             description::LOCAL,
             description_record(description::opaque_peer_offer()?),
         );
-        indication_chunk(&mut relay, &mut indications, &media[..3]).await?;
+        indication_chunk(&mut relay, &mut indications, &valid_prekey[..3]).await?;
         started
             .send(())
             .map_err(|_| anyhow::anyhow!("Waiting call ended early"))?;
         continue_indications.await?;
-        indication_chunk(&mut relay, &mut indications, &media[3..]).await?;
+        indication_chunk(&mut relay, &mut indications, &valid_prekey[3..]).await?;
+        indication_chunk(&mut relay, &mut indications, &media).await?;
         let valid_key = indication(
             description::CALLER,
             description::LOCAL,
@@ -573,13 +622,19 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
         );
         has_partial_frame.await?;
         assert!(
-            tokio::time::timeout(Duration::from_millis(40), connection.next_peer_update())
+            tokio::time::timeout(Duration::from_millis(40), connection.wait_for_peer_prekey())
                 .await
                 .is_err()
         );
         paused
             .send(())
             .map_err(|_| anyhow::anyhow!("Relay stopped sending indications"))?;
+        let prekey = connection
+            .wait_for_peer_prekey()
+            .await?
+            .context("Missing relay-signed prekey")?;
+        assert!(prekey.same_as(&PeerPrekey::parse(1, remote.handshake.public_prekey())?));
+
         assert!(matches!(
             connection.next_peer_update().await?,
             Some(RelayPeerUpdate::Description)
