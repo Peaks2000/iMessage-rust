@@ -15,7 +15,11 @@ use linux_imessage::{
 use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 
-use super::chrome::{self, BLUE, DANGER, MUTED};
+use super::{
+    attachments,
+    chrome::{self, BLUE, DANGER, MUTED},
+    session_import::run_file_picker,
+};
 
 pub(super) enum Outcome {
     Open,
@@ -27,6 +31,8 @@ pub(super) enum Outcome {
 pub(super) struct MacSetup {
     purpose: Purpose,
     device_helper: Option<PathBuf>,
+    validation_file: Option<PathBuf>,
+    picking_validation: Option<Receiver<Result<Option<PathBuf>>>>,
     account_seeded: bool,
     remembered: Option<String>,
     remember_password: bool,
@@ -99,6 +105,8 @@ impl MacSetup {
         Self {
             purpose: Purpose::Messages,
             device_helper: None,
+            validation_file: None,
+            picking_validation: None,
             account_seeded: false,
             remembered: None,
             remember_password: true,
@@ -142,6 +150,7 @@ impl MacSetup {
     }
 
     pub(super) fn show(&mut self, context: &egui::Context, root: &Path) -> Outcome {
+        self.poll_validation_file();
         if self.poll() {
             return if self.purpose == Purpose::Contacts {
                 Outcome::ContactsAuthorized
@@ -150,7 +159,7 @@ impl MacSetup {
             };
         }
 
-        let can_cancel = !matches!(self.step, Step::Saving);
+        let can_cancel = !matches!(self.step, Step::Saving) && self.picking_validation.is_none();
         let mut cancel = false;
         let mut submit = false;
         let mut use_sms = false;
@@ -263,6 +272,20 @@ impl MacSetup {
             ui.label(
                 RichText::new("Sign in with the Apple Account you use for iCloud.").color(MUTED),
             );
+        } else if let Some(file) = &self.validation_file {
+            let remove = ui
+                .horizontal(|ui| {
+                    ui.label(
+                        file.file_name()
+                            .unwrap_or(file.as_os_str())
+                            .to_string_lossy(),
+                    );
+                    ui.button("Remove File").clicked()
+                })
+                .inner;
+            if remove {
+                self.validation_file = None;
+            }
         } else if self.device_helper.is_none() {
             ui.label(
                 RichText::new(
@@ -290,6 +313,19 @@ impl MacSetup {
                 RichText::new("Register FaceTime using the local device helper.").color(MUTED),
             );
         }
+        if self.purpose == Purpose::FaceTime && self.validation_file.is_none() {
+            if self.picking_validation.is_some() {
+                progress(ui, "Choosing a validation file…");
+            } else if ui.button("Use Validation File…").clicked() {
+                self.error = None;
+                self.picking_validation = Some(attachments::task(ui.ctx(), || {
+                    run_file_picker(
+                        "Choose FaceTime Validation File",
+                        &["--file-filter=*.plist"],
+                    )
+                }));
+            }
+        }
         edit(
             ui,
             "Apple Account",
@@ -308,10 +344,13 @@ impl MacSetup {
             "Remember Apple Account password",
         );
         let mac_ready = !self.host.trim().is_empty() && self.mac_password.len() <= 1023;
-        let ready =
-            (self.purpose == Purpose::Contacts || self.device_helper.is_some() || mac_ready)
-                && !self.account.trim().is_empty()
-                && (saved || !self.password.is_empty());
+        let ready = self.picking_validation.is_none()
+            && (self.purpose == Purpose::Contacts
+                || self.validation_file.is_some()
+                || self.device_helper.is_some()
+                || mac_ready)
+            && !self.account.trim().is_empty()
+            && (saved || !self.password.is_empty());
         (
             match self.purpose {
                 Purpose::Messages => "Connect",
@@ -326,12 +365,18 @@ impl MacSetup {
         self.error = None;
         match std::mem::replace(&mut self.step, Step::Working("Contacting Apple…")) {
             Step::Form => {
+                let needs_mac = self.purpose != Purpose::Contacts
+                    && self.validation_file.is_none()
+                    && self.device_helper.is_none();
                 let request = Request {
                     purpose: self.purpose,
                     setup: (self.purpose != Purpose::Contacts).then(|| AutomaticSetup {
-                        connection: match &self.device_helper {
-                            Some(path) => DeviceConnection::OnDeviceHelper(path.clone()),
-                            None => DeviceConnection::MacOverSsh(self.host.trim().to_owned()),
+                        connection: match (&self.validation_file, &self.device_helper) {
+                            (Some(file), _) => DeviceConnection::OnDevice(file.clone()),
+                            (None, Some(path)) => DeviceConnection::OnDeviceHelper(path.clone()),
+                            (None, None) => {
+                                DeviceConnection::MacOverSsh(self.host.trim().to_owned())
+                            }
                         },
                         opencore_config: None,
                         address: String::new(),
@@ -341,8 +386,10 @@ impl MacSetup {
                     mac_password: std::mem::take(&mut self.mac_password),
                     remember_password: self.remember_password,
                 };
-                if self.purpose != Purpose::Contacts && self.device_helper.is_none() {
+                if needs_mac {
                     self.step = Step::Working("Connecting to the Mac…");
+                } else if self.validation_file.is_some() {
+                    self.step = Step::Working("Reading the validation file…");
                 }
                 self.worker = Some(Worker::start(context, root.to_owned(), request));
             }
@@ -380,6 +427,26 @@ impl MacSetup {
                 let _ = answer.send(());
             }
             other => self.step = other,
+        }
+    }
+
+    fn poll_validation_file(&mut self) {
+        let Some(picker) = &self.picking_validation else {
+            return;
+        };
+        let chosen = match picker.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err(anyhow::anyhow!("The file chooser closed")),
+        };
+        self.picking_validation = None;
+        match chosen {
+            Ok(Some(file)) => {
+                self.validation_file = Some(file);
+                self.mac_password = Zeroizing::default();
+            }
+            Ok(None) => (),
+            Err(error) => self.error = Some(format!("{error:#}")),
         }
     }
 

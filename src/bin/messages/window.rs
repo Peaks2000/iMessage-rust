@@ -2855,12 +2855,15 @@ mod tests {
         };
         click(&mut frame, "Enable FaceTime…");
         frame(Vec::new());
-        assert!(
-            frame(Vec::new())
-                .shapes
-                .iter()
-                .any(|shape| { label_position(&shape.shape, "Enable FaceTime").is_some() })
-        );
+        let output = frame(Vec::new());
+        for label in ["Enable FaceTime", "Use Validation File…"] {
+            assert!(
+                output
+                    .shapes
+                    .iter()
+                    .any(|shape| label_position(&shape.shape, label).is_some())
+            );
+        }
         Ok(())
     }
 

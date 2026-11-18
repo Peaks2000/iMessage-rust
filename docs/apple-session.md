@@ -20,6 +20,8 @@ Setup requests iMessage and FaceTime registration in the same sign-in. Apple can
 
 If an existing desktop session has iMessage access, **Settings → This Computer → Enable FaceTime** requests the FaceTime certificates for the saved device and iMessage address. It reuses a remembered Apple Account password when available and uses the configured local device helper or a Mac for fresh Apple device validation.
 
+For a Mac you can reach in person, copy the latest [Mac device helper](../tools/macos-device-helper) to that Mac and make it executable. Run it with `export-facetime-validation` and an output path, for example `./macos-device-helper export-facetime-validation ~/Desktop/FaceTime-validation.plist`. Transfer the file privately, keep its permissions at `600`, and choose it with **Use Validation File** in **Enable FaceTime**. The file contains device metadata and fresh validation proofs. Linux uses the saved APNs and iMessage keys throughout the upgrade and contacts Apple directly.
+
 With **Remember Apple Account password** selected, Linux Secret Service keeps the Apple Account credentials for later sign-in. The desktop also requests iCloud Contacts access from the same sign-in. Once authorized, Contacts syncs directly from iCloud whenever the app opens.
 
 For a source build, install the local Anisette library with `bash tools/build-local-adi.sh "$HOME/.local/lib/linux-imessage"`. The script uses Git, CMake, a C++20 compiler and the mbed TLS development libraries.

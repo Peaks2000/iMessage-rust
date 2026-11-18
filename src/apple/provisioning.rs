@@ -187,8 +187,8 @@ pub(super) enum DeviceProvider {
 pub(super) enum Proofs<'a> {
     Provider(&'a DeviceProvider),
     Local {
-        qualification: Data,
-        registration: Data,
+        qualification: &'a Data,
+        registration: &'a Data,
     },
 }
 
@@ -196,14 +196,14 @@ impl Proofs<'_> {
     pub(super) async fn qualification(&self) -> Result<Data> {
         match self {
             Self::Provider(source) => source.validation().await,
-            Self::Local { qualification, .. } => Ok(qualification.clone()),
+            Self::Local { qualification, .. } => Ok((*qualification).clone()),
         }
     }
 
     pub(super) async fn registration(self) -> Result<Data> {
         match self {
             Self::Provider(source) => source.validation().await,
-            Self::Local { registration, .. } => Ok(registration),
+            Self::Local { registration, .. } => Ok(registration.clone()),
         }
     }
 }
@@ -366,6 +366,15 @@ pub(super) struct LocalDevice {
     activation: Option<LocalActivation>,
 }
 
+impl Drop for LocalDevice {
+    fn drop(&mut self) {
+        for proof in [&mut self.qualification_data, &mut self.registration_data] {
+            let mut bytes: Vec<u8> = std::mem::replace(proof, Data::new(Vec::new())).into();
+            bytes.zeroize();
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct LocalActivation {
@@ -399,8 +408,8 @@ impl LocalDevice {
             "The device file needs two separate, fresh Apple validation proofs"
         );
         ensure!(
-            device.push.is_some() != device.activation.is_some(),
-            "The device file needs one set of Apple push or activation credentials"
+            device.push.is_none() || device.activation.is_none(),
+            "The device file contains two sets of Apple push or activation credentials"
         );
         if let Some(push) = &device.push {
             certified_rsa(&push.certificate, &push.key)?;
@@ -432,6 +441,7 @@ impl LocalDevice {
         prompts: &mut impl SmsPrompts,
         existing: Option<&Identity>,
     ) -> Result<Zeroizing<Vec<u8>>> {
+        self.require_push_identity(existing)?;
         let profile = self.computer.profile();
         let _activation_lock = lock_profile(root, &profile)?;
         let mut adi = LocalAdi::new(format!("adi:{}:{profile}", root.display()), &self.computer)?;
@@ -453,8 +463,8 @@ impl LocalDevice {
             &mut device,
             &mut anisette,
             Some(Proofs::Local {
-                qualification: self.qualification_data.clone(),
-                registration: self.registration_data.clone(),
+                qualification: &self.qualification_data,
+                registration: &self.registration_data,
             }),
             account,
             password,
@@ -462,6 +472,14 @@ impl LocalDevice {
             existing,
         )
         .await
+    }
+
+    fn require_push_identity(&self, existing: Option<&Identity>) -> Result<()> {
+        ensure!(
+            existing.is_some() || self.push.is_some() || self.activation.is_some(),
+            "This validation file needs an existing iMessage session. Use Enable FaceTime in Settings."
+        );
+        Ok(())
     }
 }
 
@@ -941,11 +959,50 @@ mod tests {
         assert!(
             verifier.verify_oneshot(&STANDARD.decode(signed.signature)?, b"test push request")?
         );
+        drop(verifier);
         assert_eq!(STANDARD.decode(signed.certificate_chain)?, cert.to_pem()?);
         let DeviceProvider::OnDevice(local) = provider else {
             unreachable!()
         };
         assert_ne!(local.qualification_data, local.registration_data);
+
+        profile.remove("activation");
+        storage::write_private(&path, &plist_xml(&profile)?)?;
+        let file = std::sync::Arc::new(LocalDevice::load(&path)?);
+        assert!(file.require_push_identity(None).is_err());
+        let group = openssl::ec::EcGroup::from_curve_name(openssl::nid::Nid::X9_62_PRIME256V1)?;
+        let signing = openssl::ec::EcKey::generate(&group)?;
+        let identity = Identity {
+            handle: "mailto:fixture@example.org".into(),
+            token: [0x51; 32],
+            push_cert: cert.to_der()?,
+            push_key: key.clone(),
+            ids_cert: cert.to_der()?,
+            ids_key: key,
+            facetime_certificates: Default::default(),
+            facetime_relay_signing: None,
+            message_keys: crate::apple::crypto::KeyPair::private(
+                &signing.private_key_to_der()?,
+                &Rsa::generate(1280)?.private_key_to_der()?,
+            )?,
+            protocol_version: MAC_IDS_PROTOCOL,
+            user_agent: "[macOS,15.7,24G123,Macmini8,1]".into(),
+        };
+        file.require_push_identity(Some(&identity))?;
+        let provider = DeviceProvider::OnDevice(file.clone());
+        let (push, token) = device_push(
+            temp.path(),
+            &file.computer.profile(),
+            &file.computer,
+            &provider,
+            file.push.clone(),
+            Some(&identity),
+        )
+        .await?;
+        assert_eq!(token, identity.token);
+        assert_eq!(push.certificate.as_ref(), identity.push_cert);
+        assert!(PKey::private_key_from_der(push.key.as_ref())?.public_eq(&identity.push_key));
+
         profile.insert(
             "registration-data".into(),
             profile["qualification-data"].clone(),

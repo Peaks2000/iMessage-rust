@@ -464,22 +464,27 @@ static NSData *validationProof(void) {
     return validationProofWith(certificate, validationSession);
 }
 
-static void exportLocal(NSString *output) {
-    NSString *key = nil;
-    NSData *certificates = nil;
-    NSString *error = activationCredentials(&key, &certificates);
-    if (error) fail(error);
-    NSData *privateKey = run(@"/usr/bin/openssl", @[@"pkey", @"-in", key, @"-outform", @"DER"], nil);
+static void exportLocal(NSString *output, BOOL includeActivation) {
+    NSMutableDictionary *profile = [NSMutableDictionary dictionary];
+    if (includeActivation) {
+        NSString *key = nil;
+        NSData *certificates = nil;
+        NSString *error = activationCredentials(&key, &certificates);
+        if (error) fail(error);
+        NSData *privateKey = run(@"/usr/bin/openssl", @[@"pkey", @"-in", key, @"-outform", @"DER"], nil);
+        profile[@"activation"] = @{@"key": privateKey, @"chain": certificates};
+    }
     NSData *qualification = validationProof();
     NSData *registration = validationProof();
     if ([qualification isEqualToData:registration]) fail(@"Apple returned duplicate validation proofs");
-    NSData *document = [NSPropertyListSerialization dataWithPropertyList:@{
+    [profile addEntriesFromDictionary:@{
         @"version": @1,
         @"computer": hardware(),
         @"qualification-data": qualification,
         @"registration-data": registration,
-        @"activation": @{@"key": privateKey, @"chain": certificates},
-    } format:NSPropertyListBinaryFormat_v1_0 options:0 error:NULL];
+    }];
+    NSData *document = [NSPropertyListSerialization dataWithPropertyList:profile
+        format:NSPropertyListBinaryFormat_v1_0 options:0 error:NULL];
     if (!document.length) fail(@"Could not create a local device profile");
     int fd = open(output.fileSystemRepresentation, O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (fd < 0) fail(@"The destination exists or could not be created");
@@ -497,8 +502,8 @@ static void exportLocal(NSString *output) {
 int main(int argc, char *argv[]) {
     @autoreleasepool {
         NSString *operation = argc >= 2 ? [NSString stringWithUTF8String:argv[1]] : @"";
-        if (argc == 3 && [operation isEqual:@"export-local"]) {
-            exportLocal([NSString stringWithUTF8String:argv[2]]);
+        if (argc == 3 && ([operation isEqual:@"export-local"] || [operation isEqual:@"export-facetime-validation"])) {
+            exportLocal([NSString stringWithUTF8String:argv[2]], [operation isEqual:@"export-local"]);
             return 0;
         }
         if (argc != 2) fail(@"Expected a device operation");
@@ -512,7 +517,7 @@ int main(int argc, char *argv[]) {
         else if ([operation isEqual:@"validation-exchange"])
             writeValidationFrame(validationProofWith(readValidationFrame(), exchangeValidationSession));
         else if ([operation isEqual:@"validation"]) emit([validationProof() base64EncodedDataWithOptions:0]);
-        else fail(@"Expected describe, anisette, activation-sign, validation, or export-local FILE");
+        else fail(@"Expected describe, anisette, activation-sign, validation, export-local FILE, or export-facetime-validation FILE");
     }
     return 0;
 }
