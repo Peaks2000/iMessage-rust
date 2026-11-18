@@ -12,7 +12,7 @@ pub use media::{CallKey, CallKeyOffer, CallMediaHandshake, CallMediaKey, CallPee
 pub(crate) use media::{CallMediaExchange, PeerKeyOffer, PeerMediaOffer, PeerPrekey};
 pub use relay::{
     CallRelayAllocation, CallRelayBinding, CallRelayConnection, CallRelayKeys, CallRelayProfile,
-    CallRelayStream, RelayChannel, RelayStreamDirection,
+    CallRelayStream, RelayChannel, RelayDatagramChannel, RelayStreamDirection,
 };
 
 pub(super) const SIGNALING: &str = "com.apple.private.alloy.facetime.multi";

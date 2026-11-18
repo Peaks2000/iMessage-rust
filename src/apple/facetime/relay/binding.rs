@@ -1,8 +1,13 @@
 use anyhow::{Context, Result, ensure};
 use openssl::rand::rand_bytes;
 use prost::Message;
+use zeroize::Zeroizing;
 
-use super::{CallRelayConnection, http3::RelayHttp3};
+use super::{
+    CallRelayConnection,
+    http3::RelayHttp3,
+    pod::{Pod, RelayDatagramChannel},
+};
 
 const SERVICE_ID: u32 = 4096;
 const WILDCARD_CHANNEL_BINDING: u32 = 512;
@@ -24,6 +29,8 @@ pub struct RelayChannel {
 
 pub struct CallRelayBinding {
     control: RelayHttp3,
+    media: Pod,
+    signaling: Pod,
     pub channel_id: u16,
     pub link_id: u32,
     pub avc: RelayChannel,
@@ -35,11 +42,38 @@ impl CallRelayBinding {
     pub fn export_keying_material(&self, output: &mut [u8], label: &str) -> Result<()> {
         self.control.transport.export_keying_material(output, label)
     }
+
+    /// Send a call-protocol datagram over the relay. The call layer encrypts peer payloads.
+    pub async fn send_datagram(
+        &mut self,
+        channel: RelayDatagramChannel,
+        data: &[u8],
+    ) -> Result<()> {
+        let packet = self.pod(channel).seal(data)?;
+        self.control.transport.send_datagram(&packet).await
+    }
+
+    /// Receive a datagram authenticated by the relay. The call layer authenticates the peer.
+    pub async fn receive_datagram(&mut self) -> Result<(RelayDatagramChannel, Zeroizing<Vec<u8>>)> {
+        loop {
+            let (channel, packet) = self.control.transport.receive_datagram().await?;
+            if let Some(data) = self.pod(channel).open(packet)? {
+                return Ok((channel, data));
+            }
+        }
+    }
+
+    fn pod(&mut self, channel: RelayDatagramChannel) -> &mut Pod {
+        match channel {
+            RelayDatagramChannel::Media => &mut self.media,
+            RelayDatagramChannel::Signaling => &mut self.signaling,
+        }
+    }
 }
 
 impl CallRelayConnection {
     /// Bind one authenticated connection to the relay's audio/video and signaling channels.
-    pub async fn bind(self, profile: CallRelayProfile<'_>) -> Result<CallRelayBinding> {
+    pub async fn bind(mut self, profile: CallRelayProfile<'_>) -> Result<CallRelayBinding> {
         ensure!(
             !profile.os_version.is_empty()
                 && profile.os_version.len() <= 128
@@ -49,6 +83,9 @@ impl CallRelayConnection {
         );
         let avc = new_connection_id(AVC)?;
         let ids = new_connection_id(IDS)?;
+        // The relay may send its first datagram as soon as it writes the binding
+        // response. Keep a bounded queue until its channel keys have been derived.
+        self.route_datagrams(avc, ids)?;
         let request = BindEnvelope {
             request: Some(BindRequest {
                 service_id: SERVICE_ID,
@@ -92,8 +129,12 @@ impl CallRelayConnection {
             .context("Invalid FaceTime relay channel")?;
         let link_id = binding.link_id.context("Missing FaceTime relay link ID")?;
         let (avc, ids) = bound_channels(&binding.connections, avc, ids)?;
+        let media = Pod::new(&control.transport, avc, RelayDatagramChannel::Media)?;
+        let signaling = Pod::new(&control.transport, ids, RelayDatagramChannel::Signaling)?;
         Ok(CallRelayBinding {
             control,
+            media,
+            signaling,
             channel_id,
             link_id,
             avc,

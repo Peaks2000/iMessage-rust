@@ -13,7 +13,10 @@ use reqwest::{
 use tokio::time::timeout;
 use zeroize::Zeroizing;
 
-use super::{CallRelayConnection, CallRelayStream, RelayStreamDirection};
+use super::{
+    CallRelayConnection, CallRelayStream, RelayStreamDirection,
+    wire::{take_varint, write_varint},
+};
 
 const HEADERS: u64 = 1;
 const DATA: u64 = 0;
@@ -262,31 +265,6 @@ fn write_frame(output: &mut Vec<u8>, kind: u8, payload: &[u8]) {
     output.push(kind);
     write_varint(output, payload.len());
     output.extend_from_slice(payload);
-}
-
-fn write_varint(output: &mut Vec<u8>, value: usize) {
-    if value < 64 {
-        output.push(value as u8);
-    } else if value < 1 << 14 {
-        output.extend_from_slice(&((value as u16) | 0x4000).to_be_bytes());
-    } else {
-        debug_assert!(value < 1 << 30);
-        output.extend_from_slice(&((value as u32) | 0x8000_0000).to_be_bytes());
-    }
-}
-
-fn take_varint(input: &mut &[u8]) -> Result<u64> {
-    let first = *input.first().context("Truncated HTTP/3 variable integer")?;
-    let size = 1 << (first >> 6);
-    let (encoded, rest) = input
-        .split_at_checked(size)
-        .context("Truncated HTTP/3 variable integer")?;
-    *input = rest;
-    Ok(encoded[1..]
-        .iter()
-        .fold(u64::from(first & 0x3f), |number, byte| {
-            (number << 8) | u64::from(*byte)
-        }))
 }
 
 async fn read_varint(

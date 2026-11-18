@@ -32,7 +32,7 @@ pub(crate) use facetime::{
 pub use facetime::{
     CallKey, CallKeyOffer, CallMediaHandshake, CallMediaKey, CallPeerKeys, CallRelayAllocation,
     CallRelayBinding, CallRelayConnection, CallRelayKeys, CallRelayProfile, CallRelayStream,
-    RelayChannel, RelayStreamDirection,
+    RelayChannel, RelayDatagramChannel, RelayStreamDirection,
 };
 pub(crate) use madrid::{Incoming, Madrid, Notification};
 use openssl::{

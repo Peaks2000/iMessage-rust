@@ -1,7 +1,8 @@
+mod datagram;
+
 use std::{
     ffi::{c_int, c_uint, c_void},
-    net::{IpAddr, SocketAddr, UdpSocket},
-    os::fd::AsRawFd,
+    net::{SocketAddr, UdpSocket},
     ptr,
     sync::{Arc, OnceLock},
     time::Duration,
@@ -20,12 +21,13 @@ use openssl::{
 };
 use openssl_sys as ffi;
 use tokio::{
-    io::unix::AsyncFd,
+    io::{Interest, unix::AsyncFd},
     time::{Instant, sleep, timeout_at},
 };
 use zeroize::Zeroizing;
 
-use super::{CallRelayAllocation, CallRelayKeys};
+use self::datagram::DatagramBridge;
+use super::{CallRelayAllocation, CallRelayKeys, pod::RelayDatagramChannel};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 const STREAM_TIMEOUT: Duration = Duration::from_secs(8);
@@ -34,7 +36,6 @@ const SSL_DEFAULT_STREAM_MODE_NONE: c_uint = 0;
 const SSL_STREAM_FLAG_UNI: u64 = 1;
 const SSL_STREAM_FLAG_NO_BLOCK: u64 = 2;
 const SSL_ACCEPT_STREAM_NO_BLOCK: u64 = 1;
-const BIO_CTRL_DGRAM_SET_CONNECTED: c_int = 32;
 
 type SslPtr = *mut ffi::SSL;
 type SessionPtr = *mut ffi::SSL_SESSION;
@@ -60,7 +61,17 @@ struct QuicApi {
     stream_id: unsafe extern "C" fn(SslPtr) -> u64,
     conclude: unsafe extern "C" fn(SslPtr, u64) -> c_int,
     handle_events: unsafe extern "C" fn(SslPtr) -> c_int,
+    #[cfg(test)]
     udp_bio: unsafe extern "C" fn(c_int, c_int) -> *mut ffi::BIO,
+    datagram_pair:
+        unsafe extern "C" fn(*mut *mut ffi::BIO, usize, *mut *mut ffi::BIO, usize) -> c_int,
+    inject: unsafe extern "C" fn(
+        SslPtr,
+        *const u8,
+        usize,
+        *const BioAddress,
+        *const BioAddress,
+    ) -> c_int,
     address_new: unsafe extern "C" fn() -> *mut BioAddress,
     address_free: unsafe extern "C" fn(*mut BioAddress),
     address_make: unsafe extern "C" fn(*mut BioAddress, c_int, *const c_void, usize, u16) -> c_int,
@@ -96,7 +107,10 @@ fn quic_api() -> Result<&'static QuicApi> {
                     stream_id: *library.get(b"SSL_get_stream_id\0")?,
                     conclude: *library.get(b"SSL_stream_conclude\0")?,
                     handle_events: *library.get(b"SSL_handle_events\0")?,
+                    #[cfg(test)]
                     udp_bio: *library.get(b"BIO_new_dgram\0")?,
+                    datagram_pair: *library.get(b"BIO_new_bio_dgram_pair\0")?,
+                    inject: *library.get(b"SSL_inject_net_dgram\0")?,
                     address_new: *library.get(b"BIO_ADDR_new\0")?,
                     address_free: *library.get(b"BIO_ADDR_free\0")?,
                     address_make: *library.get(b"BIO_ADDR_rawmake\0")?,
@@ -187,8 +201,9 @@ pub enum RelayStreamDirection {
 }
 
 pub struct CallRelayConnection {
-    // Release the SSL object before the UDP socket whose file descriptor its BIO borrows.
+    // Release the SSL object before its bridge and the socket.
     ssl: Ssl,
+    bridge: Option<DatagramBridge>,
     socket: Arc<AsyncFd<UdpSocket>>,
     api: &'static QuicApi,
     keys: CallRelayKeys,
@@ -243,38 +258,9 @@ impl CallRelayConnection {
         socket.connect(peer)?;
         let socket = register_socket(socket)?;
 
-        // SAFETY: SSL owns the BIO after SSL_set_bio. BIO_NOCLOSE preserves ownership of the
-        // descriptor in socket, which outlives SSL and any of its streams.
+        let bridge = DatagramBridge::attach(api, &ssl, peer)?;
+        // SAFETY: The client SSL object is live and already owns its BIO.
         unsafe {
-            let bio = (api.udp_bio)(socket.get_ref().as_raw_fd(), 0);
-            ensure!(!bio.is_null(), "Could not create the relay UDP BIO");
-            ffi::SSL_set_bio(ssl.as_ptr(), bio, bio);
-            let address = (api.address_new)();
-            ensure!(
-                !address.is_null(),
-                "Could not create the relay peer address"
-            );
-            let ok = match peer.ip() {
-                IpAddr::V4(ip) => (api.address_make)(
-                    address,
-                    libc::AF_INET,
-                    ip.octets().as_ptr().cast(),
-                    4,
-                    peer.port().to_be(),
-                ),
-                IpAddr::V6(ip) => (api.address_make)(
-                    address,
-                    libc::AF_INET6,
-                    ip.octets().as_ptr().cast(),
-                    16,
-                    peer.port().to_be(),
-                ),
-            };
-            let set = ok == 1
-                && (api.set_peer)(ssl.as_ptr(), address) == 1
-                && ffi::BIO_ctrl(bio, BIO_CTRL_DGRAM_SET_CONNECTED, 0, address.cast()) == 1;
-            (api.address_free)(address);
-            ensure!(set, "Could not configure the relay peer address");
             ensure!(
                 (api.blocking_mode)(ssl.as_ptr(), 0) == 1,
                 "Could not enable nonblocking QUIC"
@@ -287,6 +273,7 @@ impl CallRelayConnection {
 
         let mut connection = Self {
             ssl,
+            bridge: Some(bridge),
             socket,
             api,
             keys,
@@ -315,6 +302,50 @@ impl CallRelayConnection {
 
     pub(super) fn peer_addr(&self) -> Result<SocketAddr> {
         Ok(self.socket.get_ref().peer_addr()?)
+    }
+
+    pub(super) fn route_datagrams(&mut self, media: [u8; 4], signaling: [u8; 4]) -> Result<()> {
+        self.bridge
+            .as_mut()
+            .context("Missing FaceTime datagram bridge")?
+            .route(media, signaling);
+        Ok(())
+    }
+
+    pub(super) async fn send_datagram(&mut self, packet: &[u8]) -> Result<()> {
+        self.flush()?;
+        ensure!(
+            unsafe { ffi::SSL_get_shutdown(self.ssl.as_ptr()) } == 0,
+            "FaceTime relay connection closed"
+        );
+        let sent = tokio::time::timeout(
+            STREAM_TIMEOUT,
+            self.socket
+                .async_io(Interest::WRITABLE, |socket| socket.send(packet)),
+        )
+        .await
+        .context("Timed out sending a FaceTime relay packet")??;
+        ensure!(sent == packet.len(), "Incomplete FaceTime relay packet");
+        Ok(())
+    }
+
+    pub(super) async fn receive_datagram(&mut self) -> Result<(RelayDatagramChannel, Vec<u8>)> {
+        loop {
+            self.flush()?;
+            ensure!(
+                unsafe { ffi::SSL_get_shutdown(self.ssl.as_ptr()) } == 0,
+                "FaceTime relay connection closed"
+            );
+            if let Some(packet) = self
+                .bridge
+                .as_mut()
+                .context("Missing FaceTime datagram bridge")?
+                .pop()
+            {
+                return Ok(packet);
+            }
+            self.wait_for_progress().await?;
+        }
     }
 
     pub fn export_keying_material(&self, output: &mut [u8], label: &str) -> Result<()> {
@@ -450,8 +481,22 @@ impl CallRelayConnection {
     }
 
     fn flush(&mut self) -> Result<()> {
+        if let Some(bridge) = &mut self.bridge {
+            bridge.receive(&self.socket, &self.ssl)?;
+        }
         let ok = unsafe { (self.api.handle_events)(self.ssl.as_ptr()) };
-        ensure!(ok == 1, "Relay connection failed: {}", ErrorStack::get());
+        let error = (ok != 1).then(ErrorStack::get);
+        self.send_pending()?;
+        if let Some(error) = error {
+            anyhow::bail!("Relay connection failed: {error}");
+        }
+        Ok(())
+    }
+
+    fn send_pending(&mut self) -> Result<()> {
+        if let Some(bridge) = &mut self.bridge {
+            bridge.send(&self.socket)?;
+        }
         Ok(())
     }
 
@@ -463,7 +508,9 @@ impl CallRelayConnection {
         let deadline = Instant::now() + limit;
         loop {
             let _ = ErrorStack::get();
-            if let Some(value) = attempt(self.ssl.as_ptr())? {
+            let result = attempt(self.ssl.as_ptr());
+            self.send_pending()?;
+            if let Some(value) = result? {
                 return Ok(value);
             }
             timeout_at(deadline, self.wait_for_progress())
@@ -477,14 +524,14 @@ impl CallRelayConnection {
         }
     }
 
-    async fn wait_for_progress(&self) -> Result<()> {
+    async fn wait_for_progress(&mut self) -> Result<()> {
         let mut timeout = libc::timeval {
             tv_sec: 0,
             tv_usec: 0,
         };
         let mut infinite = 0;
         // SAFETY: The socket, SSL and output storage are live. No other future operates on them.
-        let (read, write) = unsafe {
+        let (mut read, mut write) = unsafe {
             let connection = self.ssl.as_ptr();
             let ok = (self.api.event_timeout)(connection, &mut timeout, &mut infinite);
             ensure!(ok == 1, "Could not read the relay's QUIC timer");
@@ -493,15 +540,30 @@ impl CallRelayConnection {
                 (self.api.write_desired)(connection) == 1,
             )
         };
+        if let Some(bridge) = &self.bridge {
+            read = true;
+            write = bridge.pending();
+        }
         let delay = Duration::from_secs(timeout.tv_sec.max(0) as u64)
             + Duration::from_micros(timeout.tv_usec.max(0) as u64);
         ensure!(
             read || write || infinite == 0,
             "FaceTime relay connection stopped"
         );
+        let direct_bio = self.bridge.is_none();
         tokio::select! {
-            readable = self.socket.readable(), if read => readable?.clear_ready(),
-            writable = self.socket.writable(), if write => writable?.clear_ready(),
+            readable = self.socket.readable(), if read => {
+                let mut ready = readable?;
+                if direct_bio {
+                    ready.clear_ready();
+                }
+            },
+            writable = self.socket.writable(), if write => {
+                let mut ready = writable?;
+                if direct_bio {
+                    ready.clear_ready();
+                }
+            },
             _ = sleep(delay), if infinite == 0 => (),
         }
         Ok(())

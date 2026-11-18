@@ -1,4 +1,4 @@
-use super::super::CallRelayProfile;
+use super::super::{CallRelayProfile, pod::Pod};
 use super::*;
 use compcol::qpack::QpackDecoder;
 use openssl::{
@@ -6,6 +6,7 @@ use openssl::{
     ssl::{AlpnError, select_next_proto},
 };
 use prost::Message;
+use std::os::fd::AsRawFd;
 
 type ServerPsk = unsafe extern "C" fn(SslPtr, *const u8, usize, *mut SessionPtr) -> c_int;
 type Method = unsafe extern "C" fn() -> *const ffi::SSL_METHOD;
@@ -117,6 +118,7 @@ fn loopback_listener() -> Result<Option<(SocketAddr, CallRelayConnection, Listen
         endpoint,
         CallRelayConnection {
             ssl: listener,
+            bridge: None,
             socket,
             api,
             keys,
@@ -212,12 +214,14 @@ async fn read_fixture_frame(
 }
 
 #[tokio::test]
-async fn binds_authenticated_http3_and_exports_the_same_channel_key_material() -> Result<()> {
+async fn exchanges_media_and_signaling_on_the_bound_http3_socket() -> Result<()> {
     let Some((endpoint, mut relay, accept_connection)) = loopback_listener()? else {
         return Ok(());
     };
     const CLIENT_SETTINGS: &[u8] = &[0, 4, 3, 6, 0x60, 0];
     const SERVER_SETTINGS: &[u8] = &[0, 4, 0];
+    const SERVER_AVC: [u8; 4] = [0, 0x90, 0, 1];
+    const SERVER_IDS: [u8; 4] = [0x10, 0x90, 0, 2];
     // Static QPACK :status 200, then a protobuf QuickRelay H3 envelope with the channel
     // number, link ID, and four-byte server identifiers for AVC and IDS.
     const RESPONSE: &[u8] = &[
@@ -225,6 +229,7 @@ async fn binds_authenticated_http3_and_exports_the_same_channel_key_material() -
         0, 1, 0x5a, 8, 8, 1, 0x12, 4, 0x10, 0x90, 0, 2,
     ];
 
+    let (local_address, received_address) = tokio::sync::oneshot::channel();
     let server = async {
         let _listener = accept_relay(&mut relay, accept_connection).await?;
         let mut control = relay
@@ -284,34 +289,97 @@ async fn binds_authenticated_http3_and_exports_the_same_channel_key_material() -
         assert_eq!(u32::from_be_bytes(ids) & 0xf080_0000, 0x1080_0000);
         let mut end = [0; 1];
         assert_eq!(relay.read(&mut request, &mut end).await?, 0);
+
+        let peer = received_address.await?;
+        let mut avc_client_secret = Zeroizing::new([0; 32]);
+        let mut avc_server_secret = Zeroizing::new([0; 32]);
+        let mut ids_client_secret = Zeroizing::new([0; 32]);
+        let mut ids_server_secret = Zeroizing::new([0; 32]);
+        relay.export_keying_material(avc_client_secret.as_mut(), "AVC client")?;
+        relay.export_keying_material(avc_server_secret.as_mut(), "AVC server")?;
+        relay.export_keying_material(ids_client_secret.as_mut(), "IDS client")?;
+        relay.export_keying_material(ids_server_secret.as_mut(), "IDS server")?;
+        let mut avc_pod = Pod::from_keys(avc, SERVER_AVC, &avc_server_secret, &avc_client_secret)?;
+        let mut ids_pod = Pod::from_keys(ids, SERVER_IDS, &ids_server_secret, &ids_client_secret)?;
+        let media = avc_pod.seal(b"relay media")?;
+        let control = ids_pod.seal(b"relay signaling")?;
+        let mut damaged = ids_pod.seal(b"tampered")?;
+        damaged[15] ^= 1;
+        for data in [&media, &damaged, &control, &control] {
+            // The first channel packets can already be queued while the bind is completing.
+            let sent = relay
+                .socket
+                .async_io(Interest::WRITABLE, |socket| socket.send_to(data, peer))
+                .await?;
+            assert_eq!(sent, data.len());
+        }
         require_send(relay.write_all(&mut request, RESPONSE)).await?;
         relay.finish_stream(&mut request)?;
-        let mut material = Zeroizing::new([0; 32]);
-        relay.export_keying_material(material.as_mut(), "AVC client")?;
-        Ok::<_, anyhow::Error>((material, avc, ids))
+
+        let mut buffer = [0; 2048];
+        let mut got_media = false;
+        let mut got_signal = false;
+        while !got_media || !got_signal {
+            let (size, source) = relay
+                .socket
+                .async_io(Interest::READABLE, |socket| socket.recv_from(&mut buffer))
+                .await?;
+            assert_eq!(source, peer);
+            let packet = &buffer[..size];
+            // OpenSSL already queued the bind response. In this fixture the
+            // remaining socket traffic can include the client's QUIC ACKs.
+            match super::super::pod::destination_id(packet) {
+                Some(SERVER_AVC) => {
+                    let data = avc_pod
+                        .open(packet.to_vec())?
+                        .context("Invalid fixture media packet")?;
+                    assert_eq!(data.as_slice(), b"client media");
+                    got_media = true;
+                }
+                Some(SERVER_IDS) => {
+                    let data = ids_pod
+                        .open(packet.to_vec())?
+                        .context("Invalid fixture signaling packet")?;
+                    assert_eq!(data.as_slice(), b"client signaling");
+                    got_signal = true;
+                }
+                _ => {}
+            }
+        }
+        Ok::<_, anyhow::Error>(())
     };
 
     let client = async {
         let conn = require_send(CallRelayConnection::connect(endpoint, test_keys())).await?;
+        local_address
+            .send(conn.socket.get_ref().local_addr()?)
+            .map_err(|_| anyhow::anyhow!("Fixture relay dropped the address channel"))?;
         let profile = CallRelayProfile {
             os_version: "testOS,0.0,fixture",
             hardware_version: "fixture",
             capabilities: 0x1234,
         };
-        let binding = require_send(conn.bind(profile)).await?;
+        let mut binding = require_send(conn.bind(profile)).await?;
         assert_eq!(binding.channel_id, 0x4008);
         assert_eq!(binding.link_id, 1);
-        assert_eq!(binding.avc.server_connection_id, [0, 0x90, 0, 1]);
-        assert_eq!(binding.ids.server_connection_id, [0x10, 0x90, 0, 2]);
-        let mut material = Zeroizing::new([0; 32]);
-        binding.export_keying_material(material.as_mut(), "AVC client")?;
-        Ok::<_, anyhow::Error>((material, binding.avc, binding.ids))
+        assert_eq!(binding.avc.server_connection_id, SERVER_AVC);
+        assert_eq!(binding.ids.server_connection_id, SERVER_IDS);
+        let (kind, data) = require_send(binding.receive_datagram()).await?;
+        assert_eq!(kind, RelayDatagramChannel::Signaling);
+        assert_eq!(data.as_slice(), b"relay signaling");
+        let (kind, data) = binding.receive_datagram().await?;
+        assert_eq!(kind, RelayDatagramChannel::Media);
+        assert_eq!(data.as_slice(), b"relay media");
+        require_send(binding.send_datagram(RelayDatagramChannel::Media, b"client media")).await?;
+        binding
+            .send_datagram(RelayDatagramChannel::Signaling, b"client signaling")
+            .await?;
+        Ok::<_, anyhow::Error>(())
     };
-    let ((server_export, avc, ids), (client_export, client_avc, client_ids)) =
-        tokio::try_join!(server, client)?;
-    assert!(memcmp::eq(server_export.as_ref(), client_export.as_ref()));
-    assert_eq!(client_avc.client_connection_id, avc);
-    assert_eq!(client_ids.client_connection_id, ids);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::try_join!(server, client)
+    })
+    .await??;
     Ok(())
 }
 

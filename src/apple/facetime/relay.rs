@@ -1,6 +1,8 @@
 mod binding;
 mod http3;
+mod pod;
 mod quic;
+mod wire;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -15,6 +17,7 @@ use crate::address;
 use super::{CallEndpoint, SIGNALING, media::hkdf, participant_id};
 
 pub use binding::{CallRelayBinding, CallRelayProfile, RelayChannel};
+pub use pod::RelayDatagramChannel;
 pub use quic::{CallRelayConnection, CallRelayStream, RelayStreamDirection};
 
 pub(in crate::apple) const RELAY_TOPIC: &str = "com.apple.private.alloy.quickrelay";
