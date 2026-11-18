@@ -621,6 +621,7 @@ impl Madrid {
                         | facetime::JOIN_COMMAND
                         | facetime::LEAVE_COMMAND
                         | facetime::PREKEY_COMMAND
+                        | facetime::KEY_MATERIAL_COMMAND
                 )
                 && encryption == Some("pair")
         });

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result, ensure};
 use openssl::{
     bn::BigNumContext,
@@ -11,6 +13,8 @@ use openssl::{
     pkey_ctx::PkeyCtx,
     rand::rand_bytes,
 };
+use plist::{Dictionary, Value};
+use tokio::sync::watch;
 use zeroize::Zeroizing;
 
 use crate::IncomingCall;
@@ -53,31 +57,210 @@ pub(crate) struct PeerMediaOffer {
     pub(crate) prekey: Option<PeerPrekey>,
 }
 
-/// Ephemeral key exchange for the signed caller attached to this ringing session.
-pub struct CallMediaHandshake {
-    call: IncomingCall,
-    peer: PeerPrekey,
-    description: Vec<u8>,
-    local: PKey<Private>,
-    local_public: [u8; POINT_LEN],
+struct WrappedCallKey {
+    participant: u64,
+    generation: u32,
+    identifier: [u8; 16],
+    short_identifier_len: u8,
+    bytes: [u8; WRAPPED_LEN],
+    salt: [u8; 16],
 }
 
-impl CallMediaHandshake {
+pub(crate) struct PeerKeyOffer {
+    session: Option<WrappedCallKey>,
+    media: Option<WrappedCallKey>,
+    pub(crate) participant: u64,
+}
+
+impl PeerKeyOffer {
+    pub(super) fn parse(
+        session: Option<&plist::Dictionary>,
+        media: Option<&plist::Dictionary>,
+    ) -> Option<Self> {
+        let session = match session {
+            Some(fields) => Some(WrappedCallKey::parse(fields, false)?),
+            None => None,
+        };
+        let media = match media {
+            Some(fields) => Some(WrappedCallKey::parse(fields, true)?),
+            None => None,
+        };
+        let participant = session.as_ref().or(media.as_ref())?.participant;
+        if media
+            .as_ref()
+            .is_some_and(|key| key.participant != participant)
+        {
+            return None;
+        }
+        Some(Self {
+            session,
+            media,
+            participant,
+        })
+    }
+}
+
+impl WrappedCallKey {
+    fn parse(fields: &plist::Dictionary, media: bool) -> Option<Self> {
+        let number = |key| fields.get(key)?.as_unsigned_integer();
+        let data = |key| fields.get(key)?.as_data();
+        let participant = super::participant_id(fields.get("participantID")?)?;
+        if number("rtmpwm")? != 1 {
+            return None;
+        }
+        let (generation, identifier, bytes, salt, short_identifier_len) = if media {
+            (
+                number("mkgc")?,
+                data("mki")?,
+                data("mkm")?,
+                data("mks")?,
+                match fields.get("smkil") {
+                    Some(value) => value.as_unsigned_integer()?,
+                    None => 0,
+                },
+            )
+        } else {
+            (number("skgc")?, data("ski")?, data("skm")?, data("sks")?, 0)
+        };
+        if generation == 0 || short_identifier_len > 16 {
+            return None;
+        }
+        let bytes: [u8; WRAPPED_LEN] = bytes.try_into().ok()?;
+        if bytes[0] != 4 {
+            return None;
+        }
+        Some(Self {
+            participant,
+            generation: generation.try_into().ok()?,
+            identifier: identifier.try_into().ok()?,
+            short_identifier_len: short_identifier_len.try_into().ok()?,
+            bytes,
+            salt: salt.try_into().ok()?,
+        })
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct CallPeerKeys {
+    pub session: Option<Arc<CallKey>>,
+    pub media: Option<Arc<CallKey>>,
+}
+
+pub struct CallKey {
+    pub generation: u32,
+    pub identifier: [u8; 16],
+    pub short_identifier_len: u8,
+    pub key: CallMediaKey,
+}
+
+pub struct CallKeyOffer {
+    /// Wrapped material ready to be sent in an authenticated IDS key packet.
+    pub payload: Vec<u8>,
+    pub session: CallKey,
+    pub media: CallKey,
+}
+
+pub(crate) struct CallMediaExchange {
+    pub(crate) handshake: Arc<CallMediaHandshake>,
+    local: PKey<Private>,
+    received: watch::Sender<CallPeerKeys>,
+}
+
+impl CallMediaExchange {
     pub(crate) fn prepare(
         call: IncomingCall,
         description: &[u8],
         peer: &PeerPrekey,
     ) -> Result<Self> {
         let (local, local_public) = new_key()?;
-        Ok(Self {
+        let (received, keys) = watch::channel(CallPeerKeys::default());
+        let handshake = Arc::new(CallMediaHandshake {
             call,
-            peer: peer.clone(),
             description: description.to_vec(),
-            local,
+            peer: peer.clone(),
             local_public,
+            peer_keys: keys,
+        });
+        Ok(Self {
+            handshake,
+            local,
+            received,
         })
     }
 
+    /// Install newer keys only after the engine matches the IDS sender to the call.
+    pub(crate) fn receive(&self, offer: PeerKeyOffer) -> Result<()> {
+        let current = self.received.borrow().clone();
+        let session = self.open_newer(offer.session, current.session.as_deref())?;
+        let media = self.open_newer(offer.media, current.media.as_deref())?;
+        if session.is_some() || media.is_some() {
+            self.received.send_replace(CallPeerKeys {
+                session: session.or(current.session),
+                media: media.or(current.media),
+            });
+        }
+        Ok(())
+    }
+
+    fn open_newer(
+        &self,
+        wrapped: Option<WrappedCallKey>,
+        current: Option<&CallKey>,
+    ) -> Result<Option<Arc<CallKey>>> {
+        let Some(wrapped) = wrapped.filter(|wrapped| {
+            current.is_none_or(|current| wrapped.generation > current.generation)
+        }) else {
+            return Ok(None);
+        };
+        let key = self.open_inbound_key(&wrapped.bytes, &wrapped.salt)?;
+        Ok(Some(Arc::new(CallKey {
+            generation: wrapped.generation,
+            identifier: wrapped.identifier,
+            short_identifier_len: wrapped.short_identifier_len,
+            key,
+        })))
+    }
+
+    fn open_inbound_key(&self, wrapped: &[u8], salt: &[u8]) -> Result<CallMediaKey> {
+        let wrapped: &[u8; WRAPPED_LEN] = wrapped
+            .try_into()
+            .context("Invalid FaceTime wrapped key length")?;
+        let salt = salt
+            .try_into()
+            .context("Invalid FaceTime media salt length")?;
+        let sender = PeerPrekey::parse(1, &wrapped[..POINT_LEN])?;
+        let wrapping_key = wrap_key(
+            &self.local,
+            &sender,
+            &self.handshake.local_public,
+            &sender.encoded,
+        )?;
+        let mut output = Zeroizing::new([0; SECRET_LEN + 24]);
+        let size = aes_wrap(&wrapping_key, &wrapped[POINT_LEN..], &mut *output, false)
+            .context("FaceTime key integrity check failed")?;
+        ensure!(size == SECRET_LEN, "Invalid FaceTime unwrapped key length");
+        let mut secret = Zeroizing::new([0; SECRET_LEN]);
+        secret.copy_from_slice(&output[..size]);
+        Ok(CallMediaKey { secret, salt })
+    }
+}
+
+impl Drop for CallMediaExchange {
+    fn drop(&mut self) {
+        self.received.send_replace(CallPeerKeys::default());
+    }
+}
+
+/// Ephemeral key exchange for the signed caller attached to this ringing session.
+pub struct CallMediaHandshake {
+    call: IncomingCall,
+    peer: PeerPrekey,
+    description: Vec<u8>,
+    local_public: [u8; POINT_LEN],
+    peer_keys: watch::Receiver<CallPeerKeys>,
+}
+
+impl CallMediaHandshake {
     pub fn call(&self) -> &IncomingCall {
         &self.call
     }
@@ -91,8 +274,79 @@ impl CallMediaHandshake {
         &self.local_public
     }
 
-    /// Generate a fresh local session or media master key and wrap it for the caller.
-    pub fn new_outbound_key(&self) -> Result<(CallMediaKey, [u8; WRAPPED_LEN])> {
+    /// Receive the keys recovered from authenticated packets for this call.
+    pub fn watch_peer_keys(&self) -> watch::Receiver<CallPeerKeys> {
+        self.peer_keys.clone()
+    }
+
+    /// Build an initial key offer using the local participant ID assigned by the relay.
+    /// Keep the returned offer for retries so the peer can deduplicate its generation.
+    pub fn build_key_offer(&self, local_participant: u64) -> Result<CallKeyOffer> {
+        ensure!(
+            local_participant != 0,
+            "Missing local FaceTime participant ID"
+        );
+        let mut session_id = [0; 16];
+        rand_bytes(&mut session_id)?;
+        let participant = local_participant.to_be_bytes();
+        let mut media_id = [0; 16];
+        media_id[1] = 0x10;
+        media_id[2..6].copy_from_slice(&participant[..4]);
+        media_id[7..11].copy_from_slice(&participant[4..]);
+        let (session, wrapped_session) = self.new_outbound_key()?;
+        let (media, wrapped_media) = self.new_outbound_key()?;
+        let session = CallKey {
+            generation: 1,
+            identifier: session_id,
+            short_identifier_len: 0,
+            key: session,
+        };
+        let media = CallKey {
+            generation: 1,
+            identifier: media_id,
+            short_identifier_len: 2,
+            key: media,
+        };
+        let common = || {
+            Dictionary::from_iter([
+                ("participantID", Value::from(local_participant)),
+                ("rtmpwm", Value::from(1)),
+            ])
+        };
+        let mut session_fields = common();
+        session_fields.extend(Dictionary::from_iter([
+            ("skgc", Value::from(session.generation)),
+            ("ski", Value::Data(session.identifier.to_vec())),
+            ("skm", Value::Data(wrapped_session.into())),
+            ("sks", Value::Data(session.key.salt().to_vec())),
+        ]));
+        let mut media_fields = common();
+        media_fields.extend(Dictionary::from_iter([
+            ("mkgc", Value::from(media.generation)),
+            ("mki", Value::Data(media.identifier.to_vec())),
+            ("mkm", Value::Data(wrapped_media.into())),
+            ("mks", Value::Data(media.key.salt().to_vec())),
+            ("smkil", Value::from(u32::from(media.short_identifier_len))),
+        ]));
+        let group = self.call.id.to_string().to_ascii_uppercase();
+        let mut payload = Vec::new();
+        plist::to_writer_binary(
+            &mut payload,
+            &Dictionary::from_iter([
+                ("s", Value::from(group.as_str())),
+                ("fanout-groupID-key", Value::from(group.as_str())),
+                ("rtskm", Value::Dictionary(session_fields)),
+                ("rtmkm", Value::Dictionary(media_fields)),
+            ]),
+        )?;
+        Ok(CallKeyOffer {
+            payload,
+            session,
+            media,
+        })
+    }
+
+    fn new_outbound_key(&self) -> Result<(CallMediaKey, [u8; WRAPPED_LEN])> {
         let mut key = CallMediaKey {
             secret: Zeroizing::new([0; SECRET_LEN]),
             salt: [0; 16],
@@ -111,25 +365,6 @@ impl CallMediaHandshake {
         );
         wrapped[POINT_LEN..].copy_from_slice(&output[..size]);
         Ok((key, wrapped))
-    }
-
-    /// The material must already be authenticated as coming from this call's peer by IDS.
-    pub fn open_inbound_key(&self, wrapped: &[u8], salt: &[u8]) -> Result<CallMediaKey> {
-        let wrapped: &[u8; WRAPPED_LEN] = wrapped
-            .try_into()
-            .context("Invalid FaceTime wrapped key length")?;
-        let salt = salt
-            .try_into()
-            .context("Invalid FaceTime media salt length")?;
-        let sender = PeerPrekey::parse(1, &wrapped[..POINT_LEN])?;
-        let wrapping_key = wrap_key(&self.local, &sender, &self.local_public, &sender.encoded)?;
-        let mut output = Zeroizing::new([0; SECRET_LEN + 24]);
-        let size = aes_wrap(&wrapping_key, &wrapped[POINT_LEN..], &mut *output, false)
-            .context("FaceTime key integrity check failed")?;
-        ensure!(size == SECRET_LEN, "Invalid FaceTime unwrapped key length");
-        let mut secret = Zeroizing::new([0; SECRET_LEN]);
-        secret.copy_from_slice(&output[..size]);
-        Ok(CallMediaKey { secret, salt })
     }
 }
 
@@ -236,6 +471,26 @@ mod tests {
         }
     }
 
+    fn exchange_with_key(
+        call: IncomingCall,
+        peer: PeerPrekey,
+        local: PKey<Private>,
+        local_public: [u8; POINT_LEN],
+    ) -> CallMediaExchange {
+        let (received, peer_keys) = watch::channel(CallPeerKeys::default());
+        CallMediaExchange {
+            received,
+            local,
+            handshake: Arc::new(CallMediaHandshake {
+                call,
+                description: Vec::new(),
+                peer,
+                local_public,
+                peer_keys,
+            }),
+        }
+    }
+
     #[test]
     fn opens_an_independent_ecdh_and_aes_wrap_vector() -> Result<()> {
         // Synthetic P-256 scalars 11 and 17, generated independently with Python cryptography.
@@ -256,13 +511,12 @@ mod tests {
         let key = EcKey::from_private_components(&group, &private, &point)?;
         key.check_key()?;
         let peer = PeerPrekey::parse(1, &wrapped[..POINT_LEN])?;
-        let call = CallMediaHandshake {
-            call: synthetic_call(),
-            description: Vec::new(),
-            local_public: receiver.try_into().unwrap(),
-            local: PKey::from_ec_key(key)?,
+        let call = exchange_with_key(
+            synthetic_call(),
             peer,
-        };
+            PKey::from_ec_key(key)?,
+            receiver.try_into().unwrap(),
+        );
         let key = call.open_inbound_key(&wrapped, &salt)?;
         assert_eq!(
             hex::encode(key.srtp_key(0x1234_5678)?.as_ref()),
@@ -277,7 +531,7 @@ mod tests {
         let mut tampered = wrapped;
         tampered[WRAPPED_LEN - 1] ^= 1;
         assert!(call.open_inbound_key(&tampered, &salt).is_err());
-        assert!(PeerPrekey::parse(2, &call.local_public).is_err());
+        assert!(PeerPrekey::parse(2, call.handshake.public_prekey()).is_err());
         let mut invalid_point = [0; POINT_LEN];
         invalid_point[0] = 4;
         assert!(PeerPrekey::parse(1, &invalid_point).is_err());
@@ -289,21 +543,83 @@ mod tests {
         let (receiver_private, receiver_public) = new_key()?;
         let receiver_prekey = PeerPrekey::parse(1, &receiver_public)?;
         let sender =
-            CallMediaHandshake::prepare(synthetic_call(), b"signed description", &receiver_prekey)?;
-        let receiver = CallMediaHandshake {
-            call: sender.call().clone(),
-            peer: PeerPrekey::parse(1, sender.public_prekey())?,
-            description: Vec::new(),
-            local: receiver_private,
-            local_public: receiver_public,
-        };
-        let (tx, wrapped) = sender.new_outbound_key()?;
+            CallMediaExchange::prepare(synthetic_call(), b"signed description", &receiver_prekey)?;
+        let receiver = exchange_with_key(
+            sender.handshake.call().clone(),
+            PeerPrekey::parse(1, sender.handshake.public_prekey())?,
+            receiver_private,
+            receiver_public,
+        );
+        let (tx, wrapped) = sender.handshake.new_outbound_key()?;
         let rx = receiver.open_inbound_key(&wrapped, tx.salt())?;
-        assert_eq!(sender.peer_description(), b"signed description");
+        assert_eq!(sender.handshake.peer_description(), b"signed description");
         assert_eq!(*rx.srtp_key(1)?, *tx.srtp_key(1)?);
         assert_ne!(*rx.srtp_key(1)?, *tx.srtp_key(2)?);
         assert!(sender.open_inbound_key(&wrapped, tx.salt()).is_err());
-        assert_ne!(wrapped, sender.new_outbound_key()?.1);
+        assert_ne!(wrapped, sender.handshake.new_outbound_key()?.1);
+        Ok(())
+    }
+
+    #[test]
+    fn key_offers_install_atomically_and_ignore_an_older_generation() -> Result<()> {
+        let (private, public) = new_key()?;
+        let peer = PeerPrekey::parse(1, &public)?;
+        let call = synthetic_call();
+        let sender = CallMediaExchange::prepare(call.clone(), b"fixture", &peer)?;
+        let receiver = exchange_with_key(
+            call,
+            PeerPrekey::parse(1, sender.handshake.public_prekey())?,
+            private,
+            public,
+        );
+        let key_updates = receiver.handshake.watch_peer_keys();
+        let initial = sender.handshake.build_key_offer(7)?;
+        let second = sender.handshake.build_key_offer(7)?;
+        let parse = |body: &Dictionary| {
+            PeerKeyOffer::parse(
+                body.get("rtskm").and_then(Value::as_dictionary),
+                body.get("rtmkm").and_then(Value::as_dictionary),
+            )
+            .context("Missing key offer")
+        };
+        let initial: Dictionary = plist::from_bytes(&initial.payload)?;
+        receiver.receive(parse(&initial)?)?;
+        let first_media = key_updates.borrow().media.as_ref().unwrap().clone();
+        assert_eq!(first_media.generation, 1);
+        let mut next: Dictionary = plist::from_bytes(&second.payload)?;
+        next.get_mut("rtskm")
+            .unwrap()
+            .as_dictionary_mut()
+            .unwrap()
+            .insert("skgc".into(), Value::from(2));
+        next.get_mut("rtmkm")
+            .unwrap()
+            .as_dictionary_mut()
+            .unwrap()
+            .insert("mkgc".into(), Value::from(2));
+
+        let mut corrupt = next.clone();
+        let session = corrupt
+            .get_mut("rtskm")
+            .unwrap()
+            .as_dictionary_mut()
+            .unwrap();
+        let mut cipher = session["skm"].as_data().unwrap().to_vec();
+        cipher[WRAPPED_LEN - 1] ^= 1;
+        session.insert("skm".into(), Value::Data(cipher));
+        assert!(receiver.receive(parse(&corrupt)?).is_err());
+        assert!(Arc::ptr_eq(
+            &first_media,
+            key_updates.borrow().media.as_ref().unwrap()
+        ));
+
+        receiver.receive(parse(&next)?)?;
+        receiver.receive(parse(&initial)?)?;
+        let latest = key_updates.borrow();
+        let media = latest.media.as_ref().unwrap();
+        assert_eq!(media.generation, 2);
+        assert_eq!(*media.key.srtp_key(28)?, *second.media.key.srtp_key(28)?);
+        assert_eq!(latest.session.as_ref().unwrap().generation, 2);
         Ok(())
     }
 }

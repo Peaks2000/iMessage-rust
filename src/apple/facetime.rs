@@ -7,8 +7,8 @@ use uuid::Uuid;
 
 use crate::{CallMode, IncomingCall, address, now_ms};
 
-pub use media::{CallMediaHandshake, CallMediaKey};
-pub(crate) use media::{PeerMediaOffer, PeerPrekey};
+pub use media::{CallKey, CallKeyOffer, CallMediaHandshake, CallMediaKey, CallPeerKeys};
+pub(crate) use media::{CallMediaExchange, PeerKeyOffer, PeerMediaOffer, PeerPrekey};
 
 pub(super) const SIGNALING: &str = "com.apple.private.alloy.facetime.multi";
 pub(super) const VIDEO: &str = "com.apple.private.alloy.facetime.video";
@@ -17,6 +17,7 @@ pub(super) const INVITATION_COMMAND: u64 = 242;
 pub(super) const JOIN_COMMAND: u64 = 207;
 pub(super) const LEAVE_COMMAND: u64 = 208;
 pub(super) const PREKEY_COMMAND: u64 = 210;
+pub(super) const KEY_MATERIAL_COMMAND: u64 = 211;
 pub(super) const DECLINE: u64 = 9;
 const RING_TIMEOUT_MS: i64 = 45_000;
 
@@ -57,6 +58,12 @@ pub(crate) enum CallSignal {
         sender: String,
         endpoint: CallEndpoint,
         key: PeerPrekey,
+    },
+    MediaKeys {
+        id: Uuid,
+        sender: String,
+        endpoint: CallEndpoint,
+        offer: Box<PeerKeyOffer>,
     },
     End {
         id: Uuid,
@@ -101,6 +108,10 @@ struct ParticipantSignal {
     prekey: Option<plist::Data>,
     #[serde(rename = "rtmpwm")]
     wrap_mode: Option<u32>,
+    #[serde(rename = "rtskm")]
+    session_key: Option<plist::Dictionary>,
+    #[serde(rename = "rtmkm")]
+    media_key: Option<plist::Dictionary>,
 }
 
 impl ParticipantSignal {
@@ -163,7 +174,7 @@ pub(super) fn decline(id: Uuid) -> Vec<u8> {
 }
 
 /// Interpret call signaling after IDS has authenticated and decrypted its sender.
-pub(super) fn decode(
+pub(crate) fn decode(
     command: u64,
     payload: &[u8],
     sender: String,
@@ -237,13 +248,19 @@ pub(super) fn decode(
             key: participant.media_prekey()?,
         });
     }
-    let field = participant.participant_id_key.as_ref()?;
-    let participant_id = field
-        .as_unsigned_integer()
-        .or_else(|| field.as_signed_integer().map(|id| id as u64))?;
-    if participant_id == 0 {
-        return None;
+    if command == KEY_MATERIAL_COMMAND {
+        let offer = PeerKeyOffer::parse(
+            participant.session_key.as_ref(),
+            participant.media_key.as_ref(),
+        )?;
+        return Some(CallSignal::MediaKeys {
+            id,
+            sender,
+            endpoint: CallEndpoint::new(push_token, Some(offer.participant)),
+            offer: Box::new(offer),
+        });
     }
+    let participant_id = participant_id(participant.participant_id_key.as_ref()?)?;
     let endpoint = CallEndpoint::new(push_token, Some(participant_id));
     match command {
         JOIN_COMMAND => {
@@ -302,6 +319,13 @@ pub(super) fn decode(
         }),
         _ => None,
     }
+}
+
+fn participant_id(value: &Value) -> Option<u64> {
+    value
+        .as_unsigned_integer()
+        .or_else(|| value.as_signed_integer().map(|id| id as u64))
+        .filter(|id| *id != 0)
 }
 
 impl ConversationSignal {

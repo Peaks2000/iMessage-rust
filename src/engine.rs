@@ -20,8 +20,8 @@ use crate::{
 };
 use crate::{
     apple::{
-        CallEndpoint, CallMediaHandshake, CallSignal, Identity, Incoming, Madrid, PeerMediaOffer,
-        PeerPrekey,
+        CallEndpoint, CallMediaExchange, CallMediaHandshake, CallSignal, Identity, Incoming,
+        Madrid, PeerMediaOffer, PeerPrekey,
     },
     history::History,
 };
@@ -51,7 +51,7 @@ enum Request {
     },
     PrepareCallMedia {
         id: uuid::Uuid,
-        reply: oneshot::Sender<Result<CallMediaHandshake>>,
+        reply: oneshot::Sender<Result<Arc<CallMediaHandshake>>>,
     },
     Download {
         id: uuid::Uuid,
@@ -162,7 +162,7 @@ impl Engine {
 
     /// Prepare ephemeral key material for a verified, still-ringing call.
     /// Callers should invoke this after an explicit local answer action.
-    pub async fn prepare_call_media(&self, id: uuid::Uuid) -> Result<CallMediaHandshake> {
+    pub async fn prepare_call_media(&self, id: uuid::Uuid) -> Result<Arc<CallMediaHandshake>> {
         let (reply, answer) = oneshot::channel();
         self.requests
             .try_send(Request::PrepareCallMedia { id, reply })
@@ -376,6 +376,7 @@ struct IncomingCallDetails {
     endpoint: CallEndpoint,
     description: Option<Vec<u8>>,
     prekey: Option<PeerPrekey>,
+    exchange: Option<CallMediaExchange>,
 }
 
 impl IncomingCallDetails {
@@ -416,13 +417,23 @@ impl IncomingCalls {
         self.ended.insert(id, now + 120_000);
     }
 
-    fn prepare_media(&self, status: &Status, id: uuid::Uuid) -> Result<CallMediaHandshake> {
+    fn prepare_media(
+        &mut self,
+        status: &Status,
+        id: uuid::Uuid,
+    ) -> Result<Arc<CallMediaHandshake>> {
         let call = status
             .incoming_calls
             .iter()
             .find(|call| call.id == id && call.expires_ms > now_ms())
             .context("This FaceTime call has ended")?;
-        let details = self.details.get(&id).context("Missing caller details")?;
+        let details = self
+            .details
+            .get_mut(&id)
+            .context("Missing caller details")?;
+        if let Some(exchange) = &details.exchange {
+            return Ok(exchange.handshake.clone());
+        }
         let description = details
             .description
             .as_deref()
@@ -431,7 +442,10 @@ impl IncomingCalls {
             .prekey
             .as_ref()
             .context("The caller has not sent a supported media prekey")?;
-        CallMediaHandshake::prepare(call.clone(), description, prekey)
+        let exchange = CallMediaExchange::prepare(call.clone(), description, prekey)?;
+        let handshake = exchange.handshake.clone();
+        details.exchange = Some(exchange);
+        Ok(handshake)
     }
 
     fn update(&mut self, status: &watch::Sender<Status>, own: &str, signal: CallSignal) {
@@ -467,6 +481,7 @@ impl IncomingCalls {
                         endpoint,
                         description: None,
                         prekey: None,
+                        exchange: None,
                     };
                     details.learn_media(media);
                     self.details.insert(offer.id, details);
@@ -486,6 +501,24 @@ impl IncomingCalls {
                         && details.endpoint.same_device(endpoint)
                     {
                         details.learn_prekey(key);
+                    }
+                    expired
+                }
+                CallSignal::MediaKeys {
+                    id,
+                    sender,
+                    endpoint,
+                    offer,
+                } => {
+                    if calls
+                        .iter()
+                        .any(|call| call.id == id && call.caller == sender)
+                        && let Some(details) = self.details.get(&id)
+                        && details.endpoint.matches(endpoint)
+                        && let Some(exchange) = &details.exchange
+                    {
+                        // Malformed key offers cannot interrupt iMessage or replace a valid key.
+                        let _ = exchange.receive(*offer);
                     }
                     expired
                 }
@@ -831,6 +864,35 @@ mod tests {
         let handshake = incoming.prepare_media(&reader.borrow(), id)?;
         assert_eq!(handshake.call().id, id);
         assert_eq!(handshake.peer_description(), b"signed media description");
+        assert!(Arc::ptr_eq(
+            &handshake,
+            &incoming.prepare_media(&reader.borrow(), id)?
+        ));
+        let peer_keys = handshake.watch_peer_keys();
+        let receiver = PeerPrekey::parse(1, handshake.public_prekey())?;
+        let simulated_peer =
+            CallMediaExchange::prepare(handshake.call().clone(), b"fixture", &receiver)?;
+        let offer = simulated_peer.handshake.build_key_offer(7)?;
+        let wrong_participant = simulated_peer.handshake.build_key_offer(8)?;
+        let parse = |payload: &[u8], token: u8| {
+            crate::apple::decode_call_fixture(211, payload, caller.into(), own, [token; 32], now)
+                .context("Expected an IDS media key packet")
+        };
+        incoming.update(&status, own, parse(&offer.payload, 2)?);
+        incoming.update(&status, own, parse(&wrong_participant.payload, 1)?);
+        assert!(peer_keys.borrow().media.is_none());
+        incoming.update(&status, own, parse(&offer.payload, 1)?);
+        {
+            let received = peer_keys.borrow();
+            let session = received.session.as_ref().context("Expected session keys")?;
+            let media = received.media.as_ref().context("Expected media keys")?;
+            assert_eq!(session.identifier, offer.session.identifier);
+            assert_eq!(media.short_identifier_len, 2);
+            assert_eq!(
+                *media.key.srtp_key(0x1234)?,
+                *offer.media.key.srtp_key(0x1234)?
+            );
+        }
         incoming.update(
             &status,
             own,
@@ -841,6 +903,9 @@ mod tests {
                 endpoint: None,
             },
         );
+        incoming.update(&status, own, parse(&offer.payload, 1)?);
+        assert!(peer_keys.borrow().media.is_none());
+        assert!(peer_keys.borrow().session.is_none());
         assert!(incoming.prepare_media(&reader.borrow(), id).is_err());
         Ok(())
     }
