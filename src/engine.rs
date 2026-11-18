@@ -36,6 +36,8 @@ pub struct Engine {
     state: Arc<State>,
     requests: mpsc::Sender<Request>,
     status: watch::Receiver<Status>,
+    #[cfg(feature = "desktop")]
+    call_device: Option<Arc<crate::apple::CallDevice>>,
 }
 
 struct State {
@@ -105,11 +107,15 @@ impl Engine {
             incoming_calls: Vec::new(),
         });
         let (requests, receiver) = mpsc::channel(16);
+        #[cfg(feature = "desktop")]
+        let call_device = identity.call_device().map(Arc::new);
         tokio::spawn(run_apple(identity, state.clone(), receiver, updates));
         Ok(Self {
             state,
             requests,
             status,
+            #[cfg(feature = "desktop")]
+            call_device,
         })
     }
 
@@ -1288,6 +1294,8 @@ mod tests {
                 _lock: File::open(folder.path())?,
             }),
             requests: mpsc::channel(1).0,
+            #[cfg(feature = "desktop")]
+            call_device: None,
             status: watch::channel(Status {
                 connected: false,
                 detail: String::new(),

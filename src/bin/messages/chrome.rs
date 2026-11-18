@@ -131,6 +131,7 @@ pub(super) fn attachment_item(ui: &mut Ui, symbol: Icon, label: &str, tint: Colo
 pub(super) enum Icon {
     Compose,
     Search,
+    Phone,
     Video,
     Info,
     Plus,
@@ -165,6 +166,26 @@ pub(super) fn icon(painter: &egui::Painter, at: Pos2, which: Icon, color: Color3
         Icon::Search => {
             painter.circle_stroke(p(-1., -1.), 3.55, edge);
             line(p(1.7, 1.7), p(4.7, 4.7));
+        }
+        Icon::Phone => {
+            painter.add(Shape::closed_line(
+                vec![
+                    p(-6.5, -5.3),
+                    p(-3.5, -7.),
+                    p(-1.1, -3.2),
+                    p(-3., -1.2),
+                    p(-1.2, 1.1),
+                    p(1.3, 3.),
+                    p(3.3, 1.1),
+                    p(7., 3.6),
+                    p(5.4, 6.6),
+                    p(2.7, 6.5),
+                    p(-1.8, 4.),
+                    p(-4.1, 1.7),
+                    p(-6.5, -2.8),
+                ],
+                edge,
+            ));
         }
         Icon::Video => {
             painter.rect_stroke(

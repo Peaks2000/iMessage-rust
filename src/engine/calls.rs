@@ -148,6 +148,29 @@ pub(super) struct JoinReceipt {
 }
 
 impl Engine {
+    /// Generate the local audio offer from the registered Apple device and answer a ring.
+    #[cfg(feature = "desktop")]
+    pub async fn answer_audio_call(&self, id: Uuid) -> Result<AnsweredCall> {
+        let device = self
+            .call_device
+            .as_ref()
+            .context("The local Apple session has no FaceTime device profile")?;
+        let avc_plist = device.audio_description()?;
+        self.answer_call(
+            id,
+            CallAnswerConfig {
+                mode: CallMode::Audio,
+                avc_plist: &avc_plist,
+                relay_profile: CallRelayProfile {
+                    os_version: &device.relay_os_version,
+                    hardware_version: &device.model,
+                    capabilities: 9_271_791, // QuickRelay one-to-one channel binding.
+                },
+            },
+        )
+        .await
+    }
+
     /// Answer the identified incoming call using the provided, locally supported media description.
     pub async fn answer_call(
         &self,

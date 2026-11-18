@@ -9,15 +9,16 @@ use tokio::{
 };
 use zeroize::Zeroizing;
 
-use crate::{CallMode, apple::CallRtpHeader};
+use crate::{
+    CallMode,
+    apple::{AAC_ELD_PT, AUDIO_RED_PT, CallRtpHeader},
+};
 
 use super::{
     AnsweredCall,
     aac::{self, Decoder, FRAME_SAMPLES, SAMPLE_RATE},
 };
 
-const AAC_ELD_PAYLOAD: u8 = 104;
-const RED_PAYLOAD: u8 = 20;
 const PCM_BYTES: usize = FRAME_SAMPLES * size_of::<i16>();
 const MAX_ACCESS_UNITS: usize = 8;
 const MAX_CONCEALED_PACKETS: u16 = 3;
@@ -25,7 +26,11 @@ const MAX_CONCEALED_PACKETS: u16 = 3;
 impl AnsweredCall {
     /// Run an accepted audio call on the default Linux microphone and speakers.
     /// Dropping the future or receiving a hangup releases both devices.
-    pub async fn run_audio(mut self, mut muted: watch::Receiver<bool>) -> Result<()> {
+    pub async fn run_audio(
+        mut self,
+        mut muted: watch::Receiver<bool>,
+        audio_ready: impl FnOnce(),
+    ) -> Result<()> {
         ensure!(
             self.local_description.mode == Some(CallMode::Audio),
             "An audio-only session is required by this FaceTime device driver"
@@ -34,12 +39,12 @@ impl AnsweredCall {
             self.local_description
                 .audio
                 .payload_types
-                .contains(&AAC_ELD_PAYLOAD)
+                .contains(&AAC_ELD_PT)
                 && self
                     .remote_description
                     .audio
                     .payload_types
-                    .contains(&AAC_ELD_PAYLOAD),
+                    .contains(&AAC_ELD_PT),
             "The call did not negotiate the supported FaceTime audio codec"
         );
         let mut ended = self.watch_end();
@@ -66,6 +71,7 @@ impl AnsweredCall {
         let incoming_ssrc = self.remote_description.audio.ssrc;
         let playback = play_audio(output, decoder, pending, incoming_ssrc);
         tokio::pin!(playback);
+        audio_ready();
 
         let result = async {
             loop {
@@ -232,7 +238,7 @@ impl AudioSender {
         }
         let length = u8::try_from(access_unit.len()).ok()?;
         let mut packet = Zeroizing::new(Vec::with_capacity(29 + access_unit.len()));
-        packet.extend_from_slice(&[0x90, (u8::from(self.marker) << 7) | AAC_ELD_PAYLOAD]);
+        packet.extend_from_slice(&[0x90, (u8::from(self.marker) << 7) | AAC_ELD_PT]);
         packet.extend_from_slice(&self.sequence.to_be_bytes());
         packet.extend_from_slice(&timestamp.to_be_bytes());
         packet.extend_from_slice(&self.ssrc.to_be_bytes());
@@ -287,12 +293,12 @@ impl AudioFeedback {
 }
 
 fn access_units(payload_type: u8, payload: &[u8]) -> Option<Vec<&[u8]>> {
-    let (payload_type, mut payload) = if payload_type == RED_PAYLOAD {
+    let (payload_type, mut payload) = if payload_type == AUDIO_RED_PT {
         red_primary(payload)?
     } else {
         (payload_type, payload)
     };
-    if payload_type != AAC_ELD_PAYLOAD || payload.is_empty() {
+    if payload_type != AAC_ELD_PT || payload.is_empty() {
         return None;
     }
     let mut units = Vec::new();
@@ -390,7 +396,7 @@ mod tests {
         let first = sender.frame(&[9, 10], false, &feedback).unwrap();
         let header = CallRtpHeader::parse(&first).unwrap();
         assert_eq!(header.ssrc, 0xffab0011);
-        assert_eq!(header.payload_type, AAC_ELD_PAYLOAD);
+        assert_eq!(header.payload_type, AAC_ELD_PT);
         assert_eq!(header.extension(&first).unwrap().0, 0x8100);
         assert_eq!(header.payload(&first), Some(&[2, 9, 10][..]));
         assert_eq!(first[1] >> 7, 1);

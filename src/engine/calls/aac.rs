@@ -9,7 +9,7 @@ use anyhow::{Context, Result, ensure};
 use fdk_aac_sys as fdk;
 use zeroize::Zeroizing;
 
-pub(super) const SAMPLE_RATE: u32 = 24_000;
+pub(super) use crate::apple::AAC_ELD_SAMPLE_RATE as SAMPLE_RATE;
 pub(super) const FRAME_SAMPLES: usize = 480;
 const MAX_ACCESS_UNIT: usize = u8::MAX as usize;
 

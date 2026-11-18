@@ -27,6 +27,14 @@ pub(super) struct Clipboard {
 }
 
 impl Clipboard {
+    #[cfg(test)]
+    pub(super) fn empty() -> Rc<Self> {
+        Rc::new(Self {
+            requested: Cell::new(false),
+            wayland: RefCell::new(None),
+        })
+    }
+
     pub(super) fn restore_wayland_text_paste(&self, input: &mut egui::RawInput) {
         // Some compositors expose the text offer to our Wayland device before egui's paste succeeds.
         if self.requested.get()

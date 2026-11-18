@@ -1,7 +1,13 @@
 use std::io::Read;
+#[cfg(feature = "desktop")]
+use std::io::Write;
+#[cfg(feature = "desktop")]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 use flate2::read::ZlibDecoder;
+#[cfg(feature = "desktop")]
+use flate2::{Compression, write::ZlibEncoder};
 use openssl::{
     memcmp,
     rand::rand_bytes,
@@ -22,6 +28,118 @@ const VERSION: u8 = 1;
 const HEADER_LEN: usize = 16 + 1 + 12;
 const TAG_LEN: usize = 16;
 const AAD: [u8; 9] = [VERSION, 0, 0, 0, 0, 0, 0, 0, 0];
+
+pub(crate) const AAC_ELD_PT: u8 = 104;
+pub(crate) const AUDIO_RED_PT: u8 = 20;
+#[cfg(feature = "desktop")]
+pub(crate) const AAC_ELD_SAMPLE_RATE: u32 = 24_000;
+
+#[cfg(feature = "desktop")]
+pub(crate) struct CallDevice {
+    pub(crate) relay_os_version: String,
+    pub(crate) model: String,
+    build: String,
+}
+
+#[cfg(feature = "desktop")]
+impl CallDevice {
+    pub(crate) fn from_ids_user_agent(agent: &str) -> Option<Self> {
+        let mut fields = agent.strip_prefix('[')?.strip_suffix(']')?.splitn(4, ',');
+        let os = fields.next()?;
+        let version = fields.next()?;
+        let build = fields.next()?;
+        let model = fields.next()?;
+        if !matches!(os, "macOS" | "Mac OS X" | "iPhone OS" | "iOS" | "iPadOS")
+            || [version, build, model]
+                .iter()
+                .any(|part| part.trim().is_empty())
+        {
+            return None;
+        }
+        Some(Self {
+            relay_os_version: format!("{os},{version},{build}"),
+            model: model.into(),
+            build: build.into(),
+        })
+    }
+
+    pub(crate) fn audio_description(&self) -> Result<Vec<u8>> {
+        let mut identifiers = [0u8; 8];
+        rand_bytes(&mut identifiers)?;
+        let [a, b, c, d, e, f, g, h] = identifiers;
+        let audio_ssrc = u32::from_be_bytes([a, b, c, d]).max(1);
+        let call_id = u32::from_be_bytes([e, f, g, h]).max(1);
+        let encodable = 1; // AAC-ELD.
+        let receivable = encodable | 8; // RED can carry AAC-ELD in the primary block.
+        let time = SystemTime::now().duration_since(UNIX_EPOCH)?;
+        let ntp_seconds = time.as_secs().wrapping_add(2_208_988_800) as u32;
+        let ntp_fraction = (u64::from(time.subsec_nanos()) << 32) / 1_000_000_000;
+        let ntp_time = (u64::from(ntp_seconds) << 32) | ntp_fraction;
+        let v2 = V2Description {
+            general: Some(V2General { ntp_time }),
+            microphone: Some(Microphone {
+                ssrc: audio_ssrc,
+                payloads: receivable,
+                cipher_suites: 5,
+            }),
+            groups: vec![StreamGroup {
+                id: 2,
+                direct: Some(StreamSsrc { ssrc: audio_ssrc }),
+                payloads: [AAC_ELD_PT, AUDIO_RED_PT]
+                    .into_iter()
+                    .map(|pt| Payload {
+                        rtp: u32::from(pt),
+                        packet_time_ms: (pt == AAC_ELD_PT).then_some(20),
+                        sample_rate: Some(AAC_ELD_SAMPLE_RATE),
+                    })
+                    .collect(),
+            }],
+            camera: None,
+        };
+        let v1 = V1Description {
+            microphone: Some(V1Microphone {
+                ssrc: audio_ssrc,
+                support_flags: 1,
+                payloads: receivable,
+                use_sbr: Some(false),
+            }),
+            camera: None,
+            user_agent: Some("Viceroy 1.7.0".into()),
+            ntp_time: Some(ntp_time),
+            blob_version: Some(2),
+            media_control_version: Some(2),
+            facetime: Some(V1FaceTime { one_to_one: true }),
+        };
+        let info = CallInfo {
+            call_id,
+            client_version: 1,
+            device_type: self.model.clone(),
+            os_build: self.build.clone(),
+        };
+        let mut compress = ZlibEncoder::new(Vec::new(), Compression::fast());
+        compress.write_all(&v1.encode_to_vec())?;
+        let mut avc = Vec::new();
+        plist::to_writer_binary(
+            &mut avc,
+            &plist::Dictionary::from_iter([
+                (
+                    "vcSessionParticipantKeyUUID",
+                    plist::Value::from(Uuid::new_v4().to_string().to_ascii_uppercase()),
+                ),
+                ("b2n", plist::Value::Data(v2.encode_to_vec())),
+                (
+                    "vcSessionParticipantKeyMediaBlob",
+                    plist::Value::Data(compress.finish()?),
+                ),
+                (
+                    "vcSessionParticipantKeyCallInfoBlob",
+                    plist::Value::Data(info.encode_to_vec()),
+                ),
+            ]),
+        )?;
+        Ok(avc)
+    }
+}
 
 /// An encrypted audio/video description for a specific participant and call.
 pub struct CallAvcMaterial {
@@ -231,12 +349,20 @@ struct AvcPlist {
 
 #[derive(Message)]
 struct V2Description {
+    #[prost(message, optional, tag = "1")]
+    general: Option<V2General>,
     #[prost(message, optional, tag = "4")]
     microphone: Option<Microphone>,
     #[prost(message, optional, tag = "5")]
     camera: Option<Camera>,
     #[prost(message, repeated, tag = "7")]
     groups: Vec<StreamGroup>,
+}
+
+#[derive(Message)]
+struct V2General {
+    #[prost(uint64, tag = "1")]
+    ntp_time: u64,
 }
 
 impl V2Description {
@@ -281,6 +407,8 @@ struct Microphone {
     ssrc: u32,
     #[prost(uint32, tag = "2")]
     payloads: u32,
+    #[prost(int32, tag = "3")]
+    cipher_suites: i32,
 }
 
 impl Microphone {
@@ -328,6 +456,10 @@ struct StreamGroup {
 struct Payload {
     #[prost(uint32, tag = "2")]
     rtp: u32,
+    #[prost(uint32, optional, tag = "3")]
+    packet_time_ms: Option<u32>,
+    #[prost(uint32, optional, tag = "7")]
+    sample_rate: Option<u32>,
 }
 
 #[derive(Message)]
@@ -342,14 +474,47 @@ struct V1Description {
     microphone: Option<V1Microphone>,
     #[prost(message, optional, tag = "4")]
     camera: Option<V1Camera>,
+    #[prost(string, optional, tag = "6")]
+    user_agent: Option<String>,
+    #[prost(uint64, optional, tag = "13")]
+    ntp_time: Option<u64>,
+    #[prost(uint32, optional, tag = "14")]
+    blob_version: Option<u32>,
+    #[prost(uint32, optional, tag = "16")]
+    media_control_version: Option<u32>,
+    #[prost(message, optional, tag = "17")]
+    facetime: Option<V1FaceTime>,
+}
+
+#[derive(Message)]
+struct V1FaceTime {
+    #[prost(bool, tag = "3")]
+    one_to_one: bool,
+}
+
+#[cfg(feature = "desktop")]
+#[derive(Message)]
+struct CallInfo {
+    #[prost(uint32, tag = "1")]
+    call_id: u32,
+    #[prost(uint32, tag = "2")]
+    client_version: u32,
+    #[prost(string, tag = "3")]
+    device_type: String,
+    #[prost(string, tag = "5")]
+    os_build: String,
 }
 
 #[derive(Message)]
 struct V1Microphone {
     #[prost(uint32, tag = "1")]
     ssrc: u32,
+    #[prost(uint32, tag = "3")]
+    support_flags: u32,
     #[prost(uint32, tag = "4")]
     payloads: u32,
+    #[prost(bool, optional, tag = "6")]
+    use_sbr: Option<bool>,
 }
 
 impl V1Microphone {
@@ -378,9 +543,15 @@ impl V1Camera {
 }
 
 fn audio_payloads(flags: u32) -> impl Iterator<Item = u8> {
-    [(1, 104), (2, 108), (4, 13), (8, 20), (64, 101)]
-        .into_iter()
-        .filter_map(move |(flag, number)| (flags & flag != 0).then_some(number))
+    [
+        (1, AAC_ELD_PT),
+        (2, 108),
+        (4, 13),
+        (8, AUDIO_RED_PT),
+        (64, 101),
+    ]
+    .into_iter()
+    .filter_map(move |(flag, number)| (flags & flag != 0).then_some(number))
 }
 
 fn video_payload(kind: u32) -> Option<u8> {
@@ -511,8 +682,9 @@ pub(super) mod tests {
             microphone: Some(V1Microphone {
                 ssrc: 0x1020_3040,
                 payloads: 1,
+                ..Default::default()
             }),
-            camera: None,
+            ..Default::default()
         };
         let encode = |raw: &[u8]| -> Result<Vec<u8>> {
             let mut compressor = ZlibEncoder::new(Vec::new(), Compression::fast());
@@ -538,6 +710,48 @@ pub(super) mod tests {
         assert_eq!(decoded.audio.payload_types, [104]);
         assert!(decoded.video.is_none());
         assert!(CallMediaDescription::parse(&encode(&vec![0; LIMIT + 1])?, None).is_err());
+        Ok(())
+    }
+
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn creates_matching_modern_and_legacy_audio_offers_from_the_registered_device() -> Result<()> {
+        let device = CallDevice::from_ids_user_agent("[macOS,15.7.5,24G624,Mac14,2]").unwrap();
+        assert_eq!(device.relay_os_version, "macOS,15.7.5,24G624");
+        assert_eq!(device.model, "Mac14,2");
+        assert!(CallDevice::from_ids_user_agent("[macOS,15.7.5,24G624,]").is_none());
+        assert!(CallDevice::from_ids_user_agent("local").is_none());
+        let offer = device.audio_description()?;
+        let modern = CallMediaDescription::parse(&offer, Some(CallMode::Audio))?;
+        assert_ne!(modern.audio.ssrc, 0);
+        assert_eq!(modern.audio.payload_types, [AUDIO_RED_PT, AAC_ELD_PT]);
+        assert!(modern.video.is_none());
+
+        let mut plist: plist::Dictionary = plist::from_bytes(&offer)?;
+        let b2n = plist.remove("b2n").unwrap();
+        let streams = V2Description::decode(b2n.as_data().unwrap())?;
+        let mic = streams.microphone.unwrap();
+        assert_eq!(mic.cipher_suites, 5);
+        let group = &streams.groups[0];
+        assert_eq!(group.id, 2);
+        assert_eq!(group.payloads[0].packet_time_ms, Some(20));
+        assert_eq!(group.payloads[0].sample_rate, Some(AAC_ELD_SAMPLE_RATE));
+
+        let info = CallInfo::decode(
+            plist["vcSessionParticipantKeyCallInfoBlob"]
+                .as_data()
+                .unwrap(),
+        )?;
+        assert_eq!(info.device_type, device.model);
+        assert_eq!(info.os_build, "24G624");
+        let mut legacy_avc = Vec::new();
+        plist::to_writer_binary(&mut legacy_avc, &plist)?;
+        let legacy = CallMediaDescription::parse(&legacy_avc, Some(CallMode::Audio))?;
+        assert_eq!(legacy.session_id, modern.session_id);
+        assert_eq!(legacy.audio.ssrc, modern.audio.ssrc);
+        assert_eq!(legacy.audio.payload_types, modern.audio.payload_types);
+        let second = CallMediaDescription::parse(&device.audio_description()?, None)?;
+        assert_ne!(second.session_id, modern.session_id);
         Ok(())
     }
 }

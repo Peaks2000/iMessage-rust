@@ -22,7 +22,7 @@ use zeroize::{Zeroize, Zeroizing};
 use super::{
     attachments::{self, AttachmentId, DraftFile, LoadedFile, Preview, TranscriptMedia},
     clipboard::Clipboard,
-    connection::{Action, Connection, Event, Mode, OlderRefresh, Settings},
+    connection::{Action, AudioCallControls, Connection, Event, Mode, OlderRefresh, Settings},
     contacts::Contacts,
     links::MessageText,
     mac_setup::{MacSetup, Outcome as MacOutcome},
@@ -36,6 +36,7 @@ use super::chrome::{
 const POLL: Duration = Duration::from_secs(4);
 const MOTION: f32 = 0.30;
 const LOCAL_UNREGISTERED: &str = "Open Settings → This Computer to set up iMessage with your Mac.";
+const CALL_GREEN: Color32 = Color32::from_rgb(37, 158, 67);
 
 pub struct MessagesApp {
     root: PathBuf,
@@ -77,8 +78,15 @@ pub struct MessagesApp {
     retry: Option<SendText>,
     tapback_pending: Option<Uuid>,
     incoming_calls: Vec<IncomingCall>,
+    active_call: Option<DesktopCall>,
     declining_call: Option<Uuid>,
-    call_error: Option<String>,
+    call_error: Option<(Uuid, String)>,
+}
+
+struct DesktopCall {
+    offer: IncomingCall,
+    connected_at: Option<Instant>,
+    controls: AudioCallControls,
 }
 
 #[derive(Default)]
@@ -169,6 +177,7 @@ impl MessagesApp {
             retry: None,
             tapback_pending: None,
             incoming_calls: Vec::new(),
+            active_call: None,
             declining_call: None,
             call_error: None,
         }
@@ -193,6 +202,7 @@ impl MessagesApp {
                         self.local_unregistered = false;
                     }
                     self.incoming_calls = std::mem::take(&mut status.incoming_calls);
+                    self.active_call = None;
                     self.status = Some(status);
                     self.pins = self.read_pins();
                     self.chats.clear();
@@ -357,6 +367,34 @@ impl MessagesApp {
                     self.refresh_at = Instant::now();
                 }
                 Event::IncomingCalls(calls) => self.incoming_calls = calls,
+                Event::CallConnected(id) => {
+                    if let Some(call) = &mut self.active_call
+                        && call.offer.id == id
+                    {
+                        call.connected_at = Some(Instant::now());
+                    }
+                }
+                Event::CallFinished { id, result } => {
+                    if self
+                        .active_call
+                        .as_ref()
+                        .is_some_and(|call| call.offer.id == id)
+                    {
+                        self.active_call = None;
+                        if let Err(error) = result {
+                            let error = format!("{error:#}");
+                            if self
+                                .incoming_calls
+                                .iter()
+                                .any(|call| call.id == id && call.expires_ms > now_ms())
+                            {
+                                self.call_error = Some((id, error));
+                            } else {
+                                self.error = Some(error);
+                            }
+                        }
+                    }
+                }
                 Event::CallDeclined { id, result } => {
                     self.declining_call = None;
                     match result {
@@ -364,7 +402,7 @@ impl MessagesApp {
                             self.incoming_calls.retain(|call| call.id != id);
                             self.call_error = None;
                         }
-                        Err(error) => self.call_error = Some(format!("{error:#}")),
+                        Err(error) => self.call_error = Some((id, format!("{error:#}"))),
                     }
                     self.refresh_at = Instant::now();
                 }
@@ -380,6 +418,8 @@ impl MessagesApp {
                 Event::ConnectionError(error) => {
                     self.connection = None;
                     self.status = None;
+                    self.active_call = None;
+                    self.incoming_calls.clear();
                     self.error = Some(error);
                 }
                 Event::Ready(_) | Event::LocalUnregistered => {}
@@ -1542,7 +1582,56 @@ impl MessagesApp {
         }
     }
 
-    fn incoming_call_panel(&mut self, ctx: &egui::Context) {
+    fn call_panel(&mut self, ctx: &egui::Context) {
+        if let Some(call) = &mut self.active_call {
+            let name = self.contacts.name(&call.offer.caller);
+            let (detail, end_label) = if call.controls.ending() {
+                ("Ending…".to_owned(), "End")
+            } else if let Some(start) = call.connected_at {
+                let elapsed = start.elapsed();
+                let elapsed_seconds = elapsed.as_secs();
+                ctx.request_repaint_after(Duration::from_millis(
+                    1000 - u64::from(elapsed.subsec_millis()),
+                ));
+                (
+                    format!(
+                        "FaceTime Audio · {}:{:02}",
+                        elapsed_seconds / 60,
+                        elapsed_seconds % 60
+                    ),
+                    "End",
+                )
+            } else {
+                ("Connecting…".to_owned(), "Cancel")
+            };
+            call_card(ctx, name, &detail, Icon::Phone, |ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add_enabled(!call.controls.ending(), call_button(end_label, DANGER))
+                        .clicked()
+                    {
+                        call.controls.hang_up();
+                    }
+                    if call.connected_at.is_some()
+                        && ui
+                            .add_enabled(
+                                !call.controls.ending(),
+                                egui::Button::new(if call.controls.muted() {
+                                    "Unmute"
+                                } else {
+                                    "Mute"
+                                })
+                                .min_size(vec2(72., 27.)),
+                            )
+                            .clicked()
+                    {
+                        call.controls.toggle_mute();
+                    }
+                });
+            });
+            return;
+        }
+
         let now = now_ms();
         let Some(call) = self
             .incoming_calls
@@ -1553,56 +1642,68 @@ impl MessagesApp {
             return;
         };
         let name = self.contacts.name(&call.caller);
-        let heading = match call.mode {
-            Some(CallMode::Audio) => "FaceTime Audio",
-            Some(CallMode::Video) => "FaceTime Video",
-            None => "FaceTime",
+        let (heading, icon) = match call.mode {
+            Some(CallMode::Audio) => ("FaceTime Audio", Icon::Phone),
+            Some(CallMode::Video) => ("FaceTime Video", Icon::Video),
+            None => ("FaceTime", Icon::Video),
         };
+        let call = call.clone();
         ctx.request_repaint_after(Duration::from_millis((call.expires_ms - now) as u64));
-        egui::Area::new(egui::Id::new("incoming-facetime"))
-            .anchor(Align2::RIGHT_TOP, vec2(-18., 60.))
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                chrome::sheet().show(ui, |ui| {
-                    ui.set_width(245.);
-                    ui.horizontal(|ui| {
-                        let (rect, _) = ui.allocate_exact_size(vec2(36., 36.), Sense::hover());
-                        ui.painter().circle_filled(
-                            rect.center(),
-                            17.,
-                            Color32::from_rgb(45, 176, 78),
-                        );
-                        chrome::icon(ui.painter(), rect.center(), Icon::Video, Color32::WHITE);
-                        ui.vertical(|ui| {
-                            ui.add(egui::Label::new(chrome::bold(name, 15.)).truncate());
-                            ui.label(RichText::new(heading).size(12.).color(MUTED));
-                        });
-                    });
-                    if let Some(error) = &self.call_error {
-                        ui.label(RichText::new(error).size(11.).color(DANGER));
-                    }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add_enabled(
-                                self.declining_call.is_none(),
-                                egui::Button::new(RichText::new("Decline").color(Color32::WHITE))
-                                    .fill(DANGER)
-                                    .corner_radius(5)
-                                    .min_size(vec2(72., 27.)),
-                            )
-                            .clicked()
-                            && let Some(connection) = &self.connection
-                            && connection
-                                .actions
-                                .send(Action::DeclineCall(call.id))
-                                .is_ok()
-                        {
-                            self.declining_call = Some(call.id);
+        let can_answer = self.config.mode == Mode::Local
+            && self
+                .status
+                .as_ref()
+                .is_some_and(|status| status.connected && status.facetime_registered);
+        call_card(ctx, name, heading, icon, |ui| {
+            if let Some((id, error)) = &self.call_error
+                && *id == call.id
+            {
+                ui.label(RichText::new(error).size(11.).color(DANGER));
+            }
+            let available = self.declining_call.is_none() && self.connection.is_some();
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if can_answer
+                    && ui
+                        .add_enabled(
+                            available,
+                            call_button(
+                                if call.mode == Some(CallMode::Audio) {
+                                    "Answer"
+                                } else {
+                                    "Answer as Audio"
+                                },
+                                CALL_GREEN,
+                            ),
+                        )
+                        .clicked()
+                    && let Some(connection) = &self.connection
+                {
+                    match connection.answer_audio(call.id) {
+                        Ok(controls) => {
+                            self.active_call = Some(DesktopCall {
+                                offer: call.clone(),
+                                connected_at: None,
+                                controls,
+                            });
                             self.call_error = None;
                         }
-                    });
-                });
+                        Err(error) => self.call_error = Some((call.id, error.to_string())),
+                    }
+                }
+                if ui
+                    .add_enabled(available, call_button("Decline", DANGER))
+                    .clicked()
+                    && let Some(connection) = &self.connection
+                    && connection
+                        .actions
+                        .send(Action::DeclineCall(call.id))
+                        .is_ok()
+                {
+                    self.declining_call = Some(call.id);
+                    self.call_error = None;
+                }
             });
+        });
     }
 
     fn conversation_deleted(&mut self, chat: &str) {
@@ -1931,7 +2032,7 @@ impl eframe::App for MessagesApp {
         }
         self.sidebar(ctx);
         self.right_panel(ctx, paste);
-        self.incoming_call_panel(ctx);
+        self.call_panel(ctx);
         if self.delete_conversation.is_some() {
             self.delete_dialog(ctx);
         } else if self.mac_setup.is_some() {
@@ -1950,6 +2051,40 @@ impl eframe::App for MessagesApp {
         self.media.show(ctx);
         window_edge(ctx);
     }
+}
+
+fn call_card(
+    ctx: &egui::Context,
+    name: &str,
+    detail: &str,
+    icon: Icon,
+    controls: impl FnOnce(&mut Ui),
+) {
+    egui::Area::new(egui::Id::new("facetime-call"))
+        .anchor(Align2::RIGHT_TOP, vec2(-18., 60.))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            chrome::sheet().show(ui, |ui| {
+                ui.set_width(245.);
+                ui.horizontal(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(vec2(36., 36.), Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 17., CALL_GREEN);
+                    chrome::icon(ui.painter(), rect.center(), icon, Color32::WHITE);
+                    ui.vertical(|ui| {
+                        ui.add(egui::Label::new(chrome::bold(name, 15.)).truncate());
+                        ui.label(RichText::new(detail).size(12.).color(MUTED));
+                    });
+                });
+                controls(ui);
+            });
+        });
+}
+
+fn call_button(label: &str, fill: Color32) -> egui::Button<'_> {
+    egui::Button::new(RichText::new(label).color(Color32::WHITE))
+        .fill(fill)
+        .corner_radius(6)
+        .min_size(vec2(72., 27.))
 }
 
 fn transcript_slot(ui: &mut Ui, size: egui::Vec2, outgoing: bool) -> Rect {
@@ -2423,5 +2558,100 @@ fn window_edge(ctx: &egui::Context) {
                     ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
                 }
             });
+    }
+}
+
+#[cfg(test)]
+mod call_panel_tests {
+    use super::*;
+
+    #[test]
+    fn ringing_audio_can_be_answered_muted_and_ended_in_the_desktop_card() -> anyhow::Result<()> {
+        let ctx = egui::Context::default();
+        let root = tempfile::tempdir()?;
+        // Bypass starting a real session. All incoming status and action events use test channels.
+        let mut app = MessagesApp::new(&ctx, root.path().to_owned(), true, Clipboard::empty());
+        let (connection, mut actions, report) = Connection::test_channels();
+        app.connection = Some(connection);
+        app.status = Some(Status {
+            connected: true,
+            detail: String::new(),
+            tapback_revision: None,
+            facetime_registered: true,
+            incoming_calls: Vec::new(),
+        });
+        app.refresh_at = Instant::now() + Duration::from_secs(120);
+        let id = Uuid::new_v4();
+        let now = now_ms();
+        let ring = IncomingCall {
+            id,
+            caller: "mailto:peer@example.org".into(),
+            mode: Some(CallMode::Audio),
+            received_ms: now,
+            expires_ms: now + 45_000,
+        };
+        assert!(report.send(Event::IncomingCalls(vec![ring])).is_ok());
+
+        let mut frame = |events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(932., 700.))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.process(ctx);
+                    app.call_panel(ctx);
+                },
+            )
+        };
+        let mut click = |label| {
+            frame(Vec::new()); // The area's first frame measures its content.
+            let shapes = frame(Vec::new()).shapes;
+            let position = shapes
+                .iter()
+                .find_map(|shape| label_position(&shape.shape, label))
+                .unwrap_or_else(|| panic!("Missing FaceTime button {label}"));
+            for pressed in [true, false] {
+                frame(vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]);
+            }
+        };
+
+        click("Answer");
+        let Action::AnswerAudio {
+            id: accepted,
+            muted,
+            mut hang_up,
+        } = actions.try_recv()?
+        else {
+            panic!("Expected an audio answer");
+        };
+        assert_eq!(accepted, id);
+        assert!(!*muted.borrow());
+        assert!(report.send(Event::CallConnected(id)).is_ok());
+        assert!(report.send(Event::IncomingCalls(Vec::new())).is_ok());
+        click("Mute");
+        assert!(*muted.borrow());
+        click("End");
+        hang_up.try_recv()?;
+        Ok(())
+    }
+
+    fn label_position(shape: &egui::Shape, label: &str) -> Option<egui::Pos2> {
+        match shape {
+            egui::Shape::Text(shape) if shape.galley.text() == label => {
+                Some(shape.pos + shape.galley.size() / 2.)
+            }
+            egui::Shape::Vec(items) => items.iter().find_map(|shape| label_position(shape, label)),
+            _ => None,
+        }
     }
 }

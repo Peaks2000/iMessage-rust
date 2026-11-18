@@ -15,7 +15,11 @@ use linux_imessage::{
 };
 use reqwest::{Client, Method, RequestBuilder, StatusCode, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::{
+    mpsc::{UnboundedReceiver, UnboundedSender},
+    oneshot, watch,
+};
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use super::attachments::{AttachmentId, Contents, Purpose};
@@ -82,6 +86,11 @@ pub enum Action {
         request: SetTapback,
     },
     DeclineCall(uuid::Uuid),
+    AnswerAudio {
+        id: Uuid,
+        muted: watch::Receiver<bool>,
+        hang_up: oneshot::Receiver<()>,
+    },
     DeleteConversation(String),
     Attachment {
         id: AttachmentId,
@@ -119,6 +128,11 @@ pub enum Event {
         id: uuid::Uuid,
         result: Result<()>,
     },
+    CallConnected(Uuid),
+    CallFinished {
+        id: Uuid,
+        result: Result<()>,
+    },
     IncomingCalls(Vec<IncomingCall>),
     ConversationDeleted {
         chat: String,
@@ -138,7 +152,47 @@ pub struct Connection {
     worker: std::thread::JoinHandle<()>,
 }
 
+pub struct AudioCallControls {
+    mute: watch::Sender<bool>,
+    end: Option<oneshot::Sender<()>>,
+}
+
+impl AudioCallControls {
+    pub fn muted(&self) -> bool {
+        *self.mute.borrow()
+    }
+
+    pub fn toggle_mute(&self) {
+        self.mute.send_modify(|muted| *muted = !*muted);
+    }
+
+    pub fn ending(&self) -> bool {
+        self.end.is_none()
+    }
+
+    pub fn hang_up(&mut self) {
+        if let Some(end) = self.end.take() {
+            let _ = end.send(());
+        }
+    }
+}
+
 impl Connection {
+    #[cfg(test)]
+    pub(super) fn test_channels() -> (Self, UnboundedReceiver<Action>, Sender<Event>) {
+        let (actions, requests) = tokio::sync::mpsc::unbounded_channel();
+        let (report, events) = mpsc::channel();
+        (
+            Self {
+                actions,
+                events,
+                worker: std::thread::spawn(|| {}),
+            },
+            requests,
+            report,
+        )
+    }
+
     pub fn start(
         context: &egui::Context,
         root: PathBuf,
@@ -171,6 +225,18 @@ impl Connection {
             events,
             worker,
         }
+    }
+
+    pub fn answer_audio(&self, id: Uuid) -> Result<AudioCallControls> {
+        let (mute, muted) = watch::channel(false);
+        let (end, hang_up) = oneshot::channel();
+        self.actions
+            .send(Action::AnswerAudio { id, muted, hang_up })
+            .map_err(|_| anyhow::anyhow!("The connection is closed"))?;
+        Ok(AudioCallControls {
+            mute,
+            end: Some(end),
+        })
     }
 }
 
@@ -339,6 +405,33 @@ async fn work(
             Action::DeclineCall(id) => {
                 let result = backend.decline_call(id).await;
                 Event::CallDeclined { id, result }
+            }
+            Action::AnswerAudio {
+                id,
+                muted,
+                mut hang_up,
+            } => {
+                let backend = backend.clone();
+                let events = events.clone();
+                let context = context.clone();
+                tokio::spawn(async move {
+                    let call = async {
+                        let Backend::Local(engine) = backend.as_ref() else {
+                            anyhow::bail!("FaceTime audio uses the Apple session on this computer");
+                        };
+                        let accepted = engine.answer_audio_call(id).await?;
+                        accepted
+                            .run_audio(muted, || emit(&events, &context, Event::CallConnected(id)))
+                            .await
+                    };
+                    let result = tokio::select! {
+                        biased;
+                        _ = &mut hang_up => Ok(()),
+                        result = call => result,
+                    };
+                    emit(&events, &context, Event::CallFinished { id, result });
+                });
+                continue;
             }
             Action::DeleteConversation(chat) => {
                 let result = backend.delete_conversation(&chat).await;
@@ -625,11 +718,41 @@ impl Remote {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use axum::{Json, Router, extract::Query, routing::get};
     use linux_imessage::{Delivery, TapbackKind};
-    use uuid::Uuid;
 
-    use super::*;
+    #[tokio::test]
+    async fn desktop_call_controls_are_scoped_to_the_answer_and_close_on_drop() -> Result<()> {
+        let (connection, mut requests, _report) = Connection::test_channels();
+        let id = Uuid::new_v4();
+        let mut controls = connection.answer_audio(id)?;
+        let Some(Action::AnswerAudio {
+            id: answered,
+            mut muted,
+            hang_up,
+        }) = requests.recv().await
+        else {
+            panic!("Expected a call answer");
+        };
+        assert_eq!(answered, id);
+        assert!(!*muted.borrow());
+        controls.toggle_mute();
+        muted.changed().await?;
+        assert!(*muted.borrow());
+        assert!(!controls.ending());
+        controls.hang_up();
+        hang_up.await?;
+        assert!(controls.ending());
+
+        let controls = connection.answer_audio(Uuid::new_v4())?;
+        let Some(Action::AnswerAudio { hang_up, .. }) = requests.recv().await else {
+            panic!("Expected a call answer");
+        };
+        drop(controls);
+        assert!(hang_up.await.is_err());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn reaction_changes_refresh_loaded_older_messages() -> Result<()> {

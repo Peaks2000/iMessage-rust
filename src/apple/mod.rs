@@ -30,6 +30,8 @@ pub(crate) use facetime::RtpHeader as CallRtpHeader;
 pub(crate) use facetime::decode as decode_call_fixture;
 #[cfg(test)]
 pub(crate) use facetime::relay::tests::parsed_allocation as call_relay_fixture;
+#[cfg(feature = "desktop")]
+pub(crate) use facetime::{AAC_ELD_PT, AAC_ELD_SAMPLE_RATE, AUDIO_RED_PT, CallDevice};
 pub use facetime::{
     CallAvcMaterial, CallKey, CallKeyOffer, CallMediaDescription, CallMediaHandshake, CallMediaKey,
     CallPeerKeys, CallRelayAllocation, CallRelayBinding, CallRelayConnection, CallRelayKeys,
@@ -106,6 +108,13 @@ impl Drop for Session {
 impl Identity {
     pub(crate) fn facetime_registered(&self) -> bool {
         self.ids_certificate(facetime::SIGNALING).is_some()
+    }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn call_device(&self) -> Option<CallDevice> {
+        self.facetime_registered()
+            .then(|| CallDevice::from_ids_user_agent(&self.user_agent))
+            .flatten()
     }
 
     pub fn handle(&self) -> &str {
