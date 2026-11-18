@@ -455,12 +455,15 @@ async fn download(
     id: uuid::Uuid,
     index: usize,
 ) -> Result<bytes::Bytes> {
-    let (info, source) = state.history()?.attachment(id, index)?;
+    let (mut info, source) = state.history()?.attachment(id, index)?;
     match source {
         MediaSource::Local(bytes) => Ok(bytes),
         MediaSource::Apple(media) => {
-            let bytes = madrid.download(identity, &media, info.size).await?;
-            state.history()?.cache_attachment(id, index, &bytes)?;
+            let bytes = madrid.download(identity, &media).await?;
+            info.size = bytes.len();
+            state
+                .history()?
+                .cache_attachment(id, index, &info, &bytes)?;
             Ok(bytes)
         }
     }
