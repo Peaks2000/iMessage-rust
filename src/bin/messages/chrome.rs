@@ -133,6 +133,8 @@ pub(super) enum Icon {
     Search,
     Phone,
     Video,
+    Microphone,
+    EndCall,
     Info,
     Plus,
     Emoji,
@@ -196,6 +198,49 @@ pub(super) fn icon(painter: &egui::Painter, at: Pos2, which: Icon, color: Color3
             );
             painter.add(Shape::line(
                 vec![p(2.8, -1.4), p(8.5, -4.4), p(8.5, 4.4), p(2.8, 1.4)],
+                edge,
+            ));
+        }
+        Icon::Microphone => {
+            painter.rect_stroke(
+                Rect::from_center_size(p(0., -2.1), vec2(5.6, 10.)),
+                3,
+                edge,
+                StrokeKind::Middle,
+            );
+            painter.add(Shape::line(
+                vec![
+                    p(-5.2, -1.2),
+                    p(-5.2, 0.5),
+                    p(-3.6, 3.5),
+                    p(0., 4.8),
+                    p(3.6, 3.5),
+                    p(5.2, 0.5),
+                    p(5.2, -1.2),
+                ],
+                edge,
+            ));
+            line(p(0., 4.8), p(0., 7.));
+            line(p(-2.7, 7.), p(2.7, 7.));
+        }
+        Icon::EndCall => {
+            painter.add(Shape::closed_line(
+                vec![
+                    p(-8.2, 1.8),
+                    p(-7.7, -0.7),
+                    p(-5.8, -2.2),
+                    p(-2.8, -3.3),
+                    p(2.8, -3.3),
+                    p(5.8, -2.2),
+                    p(7.7, -0.7),
+                    p(8.2, 1.8),
+                    p(6.9, 2.9),
+                    p(3.5, 2.9),
+                    p(3.1, 0.9),
+                    p(-3.1, 0.9),
+                    p(-3.5, 2.9),
+                    p(-6.9, 2.9),
+                ],
                 edge,
             ));
         }
