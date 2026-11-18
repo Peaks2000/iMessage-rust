@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::{Read, Write},
+    sync::Arc,
     time::Duration,
 };
 
@@ -58,7 +59,7 @@ struct Destination {
 }
 
 pub(crate) struct OutgoingCallTargets {
-    pub(crate) relay: facetime::OutgoingRelay,
+    pub(crate) relay: Arc<facetime::OutgoingRelay>,
     targets: HashMap<String, Vec<Destination>>,
 }
 
@@ -723,7 +724,10 @@ impl Madrid {
                 .iter()
                 .any(|endpoint| endpoint.push_token() == device.push.as_slice())
         });
-        Ok(OutgoingCallTargets { relay, targets })
+        Ok(OutgoingCallTargets {
+            relay: Arc::new(relay),
+            targets,
+        })
     }
 
     pub(crate) async fn send_outgoing_call(

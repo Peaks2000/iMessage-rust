@@ -17,6 +17,7 @@ use crate::address;
 
 use super::{CallEndpoint, SIGNALING, media::hkdf, participant_id};
 
+pub(crate) use binding::RingingRelay;
 pub use binding::{CallRelayBinding, CallRelayProfile, RelayChannel};
 pub use pod::RelayDatagramChannel;
 pub use quic::{CallRelayConnection, CallRelayStream, RelayStreamDirection};
@@ -248,6 +249,14 @@ impl OutgoingRelay {
 
     pub(crate) fn endpoints(&self) -> &[CallEndpoint] {
         &self.endpoints
+    }
+
+    pub(crate) async fn bind_for_ringing(
+        &self,
+        profile: CallRelayProfile<'_>,
+    ) -> Result<RingingRelay> {
+        let connection = self.grant.for_peer(0).connect().await?;
+        RingingRelay::bind(connection, profile, self.endpoints.clone()).await
     }
 
     pub(crate) fn for_peer(&self, endpoint: CallEndpoint) -> Result<CallRelayAllocation> {

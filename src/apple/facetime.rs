@@ -22,11 +22,11 @@ pub use media::{CallKey, CallKeyOffer, CallMediaHandshake, CallMediaKey, CallPee
 pub(crate) use media::{
     CallMediaExchange, LocalCallPrekey, PeerKeyOffer, PeerMediaOffer, PeerPrekey,
 };
-pub(crate) use relay::OutgoingRelay;
 pub use relay::{
     CallRelayAllocation, CallRelayBinding, CallRelayConnection, CallRelayKeys, CallRelayProfile,
     CallRelayStream, RelayChannel, RelayDatagramChannel, RelayStreamDirection,
 };
+pub(crate) use relay::{OutgoingRelay, RingingRelay};
 pub(crate) use srtp::CallRtpProtection;
 #[cfg(feature = "desktop")]
 pub(crate) use srtp::RtpHeader;

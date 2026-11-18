@@ -375,6 +375,15 @@ impl CallRelayConnection {
         }
     }
 
+    pub(super) async fn service_during_ring(&mut self) -> Result<()> {
+        self.flush()?;
+        ensure!(
+            unsafe { ffi::SSL_get_shutdown(self.ssl.as_ptr()) } == 0,
+            "FaceTime relay connection closed"
+        );
+        self.wait_for_progress().await
+    }
+
     pub fn export_keying_material(&self, output: &mut [u8], label: &str) -> Result<()> {
         self.ssl.export_keying_material(output, label, None)?;
         Ok(())

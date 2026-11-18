@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, ensure};
 use openssl::rand::rand_bytes;
@@ -6,7 +6,7 @@ use prost::Message;
 use zeroize::Zeroizing;
 
 use crate::apple::facetime::{
-    CallAvcMaterial, CallMediaDescription, CallPeerKeys,
+    CallAvcMaterial, CallEndpoint, CallMediaDescription, CallPeerKeys,
     description::{open_description, valid_ciphertext},
 };
 
@@ -48,6 +48,95 @@ pub struct CallRelayBinding {
     pub link_id: u32,
     pub avc: RelayChannel,
     pub ids: RelayChannel,
+}
+
+/// An authenticated local relay binding that has no peer or media keys yet.
+pub(crate) struct RingingRelay {
+    binding: CallRelayBinding,
+    eligible: Vec<CallEndpoint>,
+}
+
+impl RingingRelay {
+    pub(super) async fn bind(
+        connection: CallRelayConnection,
+        profile: CallRelayProfile<'_>,
+        eligible: Vec<CallEndpoint>,
+    ) -> Result<Self> {
+        ensure!(
+            connection.call.peer == 0,
+            "FaceTime relay already has a peer"
+        );
+        Ok(Self {
+            binding: connection.bind_channels(profile, Vec::new()).await?,
+            eligible,
+        })
+    }
+
+    pub(crate) async fn keepalive(&mut self) -> Result<()> {
+        // QuickRelay uses the middle 32 bits of an NTP timestamp.
+        let unix = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?;
+        let seconds = (unix.as_secs() + 2_208_988_800) as u32;
+        let fraction = ((u64::from(unix.subsec_nanos()) << 16) / 1_000_000_000) as u32;
+        let request = StatsEnvelope {
+            request: Some(StatsRequest {
+                timestamp: (seconds << 16) | fraction,
+            }),
+        };
+        self.binding
+            .control
+            .put("/QR/Stats", &request.encode_to_vec())
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn service_during_ring(&mut self) -> Result<()> {
+        // The transport queues datagrams until IDS authenticates the selected participant.
+        self.binding.control.transport.service_during_ring().await
+    }
+
+    pub(crate) async fn unbind(self) -> Result<()> {
+        self.binding.unbind().await
+    }
+
+    pub(crate) async fn join(
+        mut self,
+        selected: CallEndpoint,
+        offer: &CallAvcMaterial,
+    ) -> Result<CallRelayBinding> {
+        ensure!(
+            self.eligible.contains(&selected),
+            "Unexpected FaceTime answering device"
+        );
+        let peer = selected
+            .participant()
+            .context("Missing FaceTime answering participant")?;
+        let call = self.binding.control.transport.call;
+        ensure!(
+            call.peer == 0
+                && call.local != peer
+                && call.id == offer.call_id
+                && call.local == offer.participant,
+            "FaceTime relay and answering device belong to different calls"
+        );
+        let request = PutMaterialEnvelope {
+            request: Some(PutMaterialRequest {
+                materials: vec![avc_material(offer, peer)],
+            }),
+        };
+        let response = self
+            .binding
+            .control
+            .put("/QR/Material", &request.encode_to_vec())
+            .await?;
+        let response = PutMaterialResponseEnvelope::decode(response.as_slice())
+            .context("Invalid FaceTime relay material response")?;
+        ensure!(
+            response.response.is_some(),
+            "Missing FaceTime relay material acknowledgement"
+        );
+        self.binding.control.transport.call.peer = peer;
+        Ok(self.binding)
+    }
 }
 
 impl CallRelayBinding {
@@ -214,6 +303,10 @@ impl CallRelayBinding {
 impl CallRelayConnection {
     /// Bind one authenticated connection to the relay's audio/video and signaling channels.
     pub async fn bind(self, profile: CallRelayProfile<'_>) -> Result<CallRelayBinding> {
+        ensure!(
+            self.call.peer != 0,
+            "FaceTime relay has no authenticated peer"
+        );
         self.bind_channels(profile, Vec::new()).await
     }
 
@@ -224,22 +317,13 @@ impl CallRelayConnection {
         offer: &CallAvcMaterial,
     ) -> Result<CallRelayBinding> {
         ensure!(
-            self.call.id == offer.call_id && self.call.local == offer.participant,
+            self.call.peer != 0
+                && self.call.id == offer.call_id
+                && self.call.local == offer.participant,
             "FaceTime relay and media description belong to different calls"
         );
-        self.bind_channels(
-            profile,
-            vec![Material {
-                owner: Some(0),    // Apple resolves zero to this connection's participant ID.
-                receiver: Some(0), // Visible to the call, encrypted to the authenticated peer.
-                entries: vec![MaterialInfo {
-                    id: offer.material_id.to_vec(),
-                    kind: AVC_MATERIAL,
-                    content: offer.ciphertext.clone(),
-                }],
-            }],
-        )
-        .await
+        self.bind_channels(profile, vec![avc_material(offer, 0)])
+            .await
     }
 
     async fn bind_channels(
@@ -304,8 +388,11 @@ impl CallRelayConnection {
         let link_id = binding.link_id.context("Missing FaceTime relay link ID")?;
         let (avc, ids) = bound_channels(&binding.connections, avc, ids)?;
         let call = control.transport.call;
-        let peer_descriptions =
-            collect_peer_descriptions(binding.materials, call.peer, call.local)?;
+        let peer_descriptions = if call.peer == 0 {
+            Vec::new()
+        } else {
+            collect_peer_descriptions(binding.materials, call.peer, call.local)?
+        };
         let media = Pod::new(&control.transport, avc, RelayDatagramChannel::Media)?;
         let signaling = Pod::new(&control.transport, ids, RelayDatagramChannel::Signaling)?;
         Ok(CallRelayBinding {
@@ -319,6 +406,18 @@ impl CallRelayConnection {
             avc,
             ids,
         })
+    }
+}
+
+fn avc_material(offer: &CallAvcMaterial, receiver: u64) -> Material {
+    Material {
+        owner: Some(0), // The relay resolves zero to this connection's participant ID.
+        receiver: Some(receiver),
+        entries: vec![MaterialInfo {
+            id: offer.material_id.to_vec(),
+            kind: AVC_MATERIAL,
+            content: offer.ciphertext.clone(),
+        }],
     }
 }
 
@@ -429,6 +528,39 @@ struct UnbindResponseEnvelope {
 
 #[derive(Message)]
 struct UnbindResponse {}
+
+#[derive(Message)]
+struct StatsEnvelope {
+    #[prost(message, optional, tag = "18")]
+    request: Option<StatsRequest>,
+}
+
+#[derive(Message)]
+struct StatsRequest {
+    #[prost(uint32, tag = "1")]
+    timestamp: u32,
+}
+
+#[derive(Message)]
+struct PutMaterialEnvelope {
+    #[prost(message, optional, tag = "24")]
+    request: Option<PutMaterialRequest>,
+}
+
+#[derive(Message)]
+struct PutMaterialRequest {
+    #[prost(message, repeated, tag = "1")]
+    materials: Vec<Material>,
+}
+
+#[derive(Message)]
+struct PutMaterialResponseEnvelope {
+    #[prost(message, optional, tag = "25")]
+    response: Option<PutMaterialResponse>,
+}
+
+#[derive(Message)]
+struct PutMaterialResponse {}
 
 #[derive(Message)]
 struct BindRequest {

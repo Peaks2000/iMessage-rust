@@ -83,6 +83,10 @@ enum Request {
         dial: DialRequest,
         reply: oneshot::Sender<Result<OutgoingAttempt>>,
     },
+    RingOutgoing {
+        id: uuid::Uuid,
+        reply: oneshot::Sender<Result<()>>,
+    },
     FinishOutgoing {
         id: uuid::Uuid,
         reply: oneshot::Sender<Result<OutgoingAnswer>>,
@@ -372,6 +376,9 @@ async fn run_apple(
                         Request::DialCall { reply, .. } => {
                             let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
                         }
+                        Request::RingOutgoing { reply, .. } => {
+                            let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
+                        }
                         Request::FinishOutgoing { reply, .. } => {
                             let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
                         }
@@ -520,6 +527,11 @@ async fn online(
                     }
                     Request::DialCall { dial, reply } => {
                         calls.begin_outgoing(identity, madrid, status, dial, reply).await;
+                    }
+                    Request::RingOutgoing { id, reply } => {
+                        if !reply.is_closed() {
+                            let _ = reply.send(calls.ring_outgoing(identity, madrid, id).await);
+                        }
                     }
                     Request::FinishOutgoing { id, reply } => {
                         for notification in madrid.take_queued() {

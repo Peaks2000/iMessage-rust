@@ -44,8 +44,8 @@ pub use facetime::{
     RelayStreamDirection,
 };
 pub(crate) use facetime::{
-    CallEndpoint, CallMediaExchange, CallRtpProtection, CallSignal, LocalCallPrekey, PeerKeyOffer,
-    PeerMediaOffer, PeerPrekey, RING_TIMEOUT_MS,
+    CallEndpoint, CallMediaExchange, CallRtpProtection, CallSignal, LocalCallPrekey, OutgoingRelay,
+    PeerKeyOffer, PeerMediaOffer, PeerPrekey, RING_TIMEOUT_MS, RingingRelay,
 };
 pub(crate) use madrid::{Incoming, Madrid, Notification, OutgoingCallTargets};
 use openssl::{

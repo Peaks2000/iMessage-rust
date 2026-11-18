@@ -263,6 +263,154 @@ async fn read_fixture_frame(
     Ok(payload)
 }
 
+async fn fixture_request(
+    relay: &mut CallRelayConnection,
+    path: &[u8],
+) -> Result<(CallRelayStream, Vec<u8>)> {
+    let mut stream = relay.accept_stream().await?;
+    let qpack = read_fixture_frame(relay, &mut stream, 1).await?;
+    let fields = QpackDecoder::new()
+        .decode_field_section(&qpack)
+        .expect("valid fixture request");
+    assert!(
+        fields
+            .iter()
+            .any(|field| field.name == b":method" && field.value == b"PUT")
+    );
+    assert!(
+        fields
+            .iter()
+            .any(|field| field.name == b":path" && field.value == path)
+    );
+    let body = read_fixture_frame(relay, &mut stream, 0).await?;
+    let mut end = [0];
+    assert_eq!(relay.read(&mut stream, &mut end).await?, 0);
+    Ok((stream, body))
+}
+
+async fn fixture_response(
+    relay: &mut CallRelayConnection,
+    mut stream: CallRelayStream,
+    body: &[u8],
+) -> Result<()> {
+    let mut response = vec![1, 3, 0, 0, 0xd9, 0];
+    super::super::wire::write_varint(&mut response, body.len());
+    response.extend_from_slice(body);
+    relay.write_all(&mut stream, &response).await?;
+    relay.finish_stream(&mut stream)
+}
+
+#[tokio::test]
+async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answering_device()
+-> Result<()> {
+    use super::super::RingingRelay;
+    use crate::apple::CallEndpoint;
+
+    #[derive(Message)]
+    struct TestMaterialEnvelope {
+        #[prost(message, optional, tag = "24")]
+        request: Option<TestPutMaterial>,
+    }
+    #[derive(Message)]
+    struct TestPutMaterial {
+        #[prost(message, repeated, tag = "1")]
+        materials: Vec<TestParticipantMaterial>,
+    }
+
+    let Some((endpoint, mut relay, accept_connection)) = loopback_listener()? else {
+        return Ok(());
+    };
+    let answered = CallEndpoint::new([7; 32], Some(description::CALLER));
+    let other = CallEndpoint::new([8; 32], Some(description::CALLER + 1));
+    let offer = description::local_offer()?;
+    let server = async {
+        let _listener = accept_relay(&mut relay, accept_connection).await?;
+        let mut client_settings = relay.accept_stream().await?;
+        let mut bytes = [0; 6];
+        read_exact(&mut relay, &mut client_settings, &mut bytes).await?;
+        assert_eq!(bytes, [0, 4, 3, 6, 0x60, 0]);
+        let mut server_settings = relay
+            .open_stream(RelayStreamDirection::Unidirectional)
+            .await?;
+        relay.write_all(&mut server_settings, &[0, 4, 0]).await?;
+        let (bind, body) = fixture_request(&mut relay, b"/QR/AllocBind").await?;
+        let request = TestBindEnvelope::decode(body.as_slice())?
+            .request
+            .context("Missing AllocBind request")?;
+        assert!(request.materials.is_empty());
+        assert_eq!(request.connections.len(), 2);
+        let response = TestBindEnvelope {
+            request: None,
+            response: Some(TestBindResponse {
+                channel: 0x4008,
+                link: 1,
+                connections: vec![
+                    TestBindConnection {
+                        kind: 0,
+                        id: vec![0, 0x90, 0, 1],
+                    },
+                    TestBindConnection {
+                        kind: 1,
+                        id: vec![0x10, 0x90, 0, 2],
+                    },
+                ],
+                materials: Vec::new(),
+            }),
+        };
+        fixture_response(&mut relay, bind, &response.encode_to_vec()).await?;
+
+        let (stats, body) = fixture_request(&mut relay, b"/QR/Stats").await?;
+        assert_eq!(body[..2], [0x92, 1]); // QuickRelay envelope field 18.
+        fixture_response(&mut relay, stats, &[0x9a, 1, 0]).await?;
+
+        let (publish, body) = fixture_request(&mut relay, b"/QR/Material").await?;
+        let submitted = TestMaterialEnvelope::decode(body.as_slice())?
+            .request
+            .context("Missing PutMaterial")?;
+        let [material] = submitted.materials.as_slice() else {
+            anyhow::bail!("Expected one encrypted media offer");
+        };
+        let [entry] = material.entries.as_slice() else {
+            anyhow::bail!("Expected one encrypted AVC description");
+        };
+        assert_eq!(material.owner, Some(0));
+        assert_eq!(material.receiver, Some(description::CALLER));
+        assert_eq!(entry.id, offer.material_id);
+        assert_eq!(entry.kind, 12);
+        assert_eq!(entry.ciphertext, offer.ciphertext);
+        fixture_response(&mut relay, publish, &[0xca, 1, 0]).await?;
+
+        let (release, _) = fixture_request(&mut relay, b"/QR/UnAllocBind").await?;
+        fixture_response(&mut relay, release, &[0xba, 1, 0]).await
+    };
+    let client = async {
+        let wire = CallRelayConnection::connect(
+            endpoint,
+            test_keys(),
+            RelayCall {
+                peer: 0,
+                ..test_call()
+            },
+        )
+        .await?;
+        let profile = CallRelayProfile {
+            os_version: "testOS,0.0,fixture",
+            hardware_version: "fixture",
+            capabilities: 0x1234,
+        };
+        let mut waiting = RingingRelay::bind(wire, profile, vec![answered, other]).await?;
+        waiting.keepalive().await?;
+        let connection = waiting.join(answered, &offer).await?;
+        assert_eq!(connection.channel_id, 0x4008);
+        connection.unbind().await
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::try_join!(server, client)
+    })
+    .await??;
+    Ok(())
+}
+
 #[tokio::test]
 async fn exchanges_media_and_signaling_on_the_bound_http3_socket() -> Result<()> {
     let Some((endpoint, mut relay, accept_connection)) = loopback_listener()? else {

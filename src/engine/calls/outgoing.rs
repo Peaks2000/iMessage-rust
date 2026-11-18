@@ -8,7 +8,8 @@ use super::*;
 use crate::{
     address,
     apple::{
-        CallSignal, LocalCallPrekey, OutgoingCallTargets, PeerKeyOffer, PeerPrekey, RING_TIMEOUT_MS,
+        CallSignal, LocalCallPrekey, OutgoingCallTargets, OutgoingRelay, PeerKeyOffer, PeerPrekey,
+        RING_TIMEOUT_MS, RingingRelay,
     },
 };
 
@@ -22,11 +23,12 @@ pub(in crate::engine) struct OutgoingAttempt {
     id: Uuid,
     _cancel: oneshot::Sender<()>,
     answered: oneshot::Receiver<Result<()>>,
+    relay: Arc<OutgoingRelay>,
 }
 
 pub(in crate::engine) struct OutgoingAnswer {
     handshake: Arc<CallMediaHandshake>,
-    relay: Arc<CallRelayAllocation>,
+    endpoint: CallEndpoint,
     local_keys: Arc<CallKeyOffer>,
     lifetime: AnswerLifetime,
 }
@@ -35,6 +37,8 @@ pub(in crate::engine) struct PendingOutgoing {
     pub(in crate::engine) call: IncomingCall,
     targets: OutgoingCallTargets,
     local: LocalCallPrekey,
+    avc: Vec<u8>,
+    invited: bool,
     responses: RingResponses,
     cancel: oneshot::Receiver<()>,
     answered: Option<oneshot::Sender<Result<()>>>,
@@ -171,7 +175,21 @@ impl RingResponses {
 }
 
 impl PendingOutgoing {
+    fn check_live(&mut self) -> Result<()> {
+        ensure!(
+            matches!(
+                self.cancel.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ) && self.call.expires_ms > now_ms(),
+            "The FaceTime call has ended"
+        );
+        Ok(())
+    }
+
     pub(in crate::engine) fn receive(&mut self, signal: CallSignal) {
+        if !self.invited {
+            return;
+        }
         self.responses.receive(&self.call, signal);
         if let Some(result) = self.responses.outcome()
             && let Some(reply) = self.answered.take()
@@ -184,6 +202,9 @@ impl PendingOutgoing {
     }
 
     pub(in crate::engine) async fn wait_to_cancel(&mut self) {
+        if self.cancel.is_terminated() {
+            return;
+        }
         let remaining =
             Duration::from_millis(self.call.expires_ms.saturating_sub(now_ms()).max(0) as u64);
         tokio::select! {
@@ -196,9 +217,11 @@ impl PendingOutgoing {
         if let Some(answered) = self.answered.take() {
             let _ = answered.send(Err(anyhow::anyhow!("The FaceTime call was not answered")));
         }
-        let _ = madrid
-            .send_outgoing_call(identity, &self.call, &self.targets, None)
-            .await;
+        if self.invited {
+            let _ = madrid
+                .send_outgoing_call(identity, &self.call, &self.targets, None)
+                .await;
+        }
     }
 }
 
@@ -212,12 +235,12 @@ impl IncomingCalls {
         mut reply: oneshot::Sender<Result<OutgoingAttempt>>,
     ) {
         let result = self
-            .ring_outgoing(identity, madrid, status, dial, &mut reply)
+            .prepare_outgoing(identity, madrid, status, dial, &mut reply)
             .await;
         let _ = reply.send(result);
     }
 
-    async fn ring_outgoing(
+    async fn prepare_outgoing(
         &mut self,
         identity: &Identity,
         madrid: &mut Madrid,
@@ -234,7 +257,7 @@ impl IncomingCalls {
             "A FaceTime call is already in progress"
         );
         let received_ms = now_ms();
-        let mut call = IncomingCall {
+        let call = IncomingCall {
             id: Uuid::new_v4(),
             caller: dial.recipient,
             mode: Some(dial.mode),
@@ -248,31 +271,17 @@ impl IncomingCalls {
             result = madrid.outgoing_call_targets(identity, &call) => result?,
         };
         ensure!(!reply.is_closed(), "The FaceTime call was canceled");
-        call.received_ms = now_ms();
-        call.expires_ms = call.received_ms + RING_TIMEOUT_MS;
-        let ring = madrid
-            .send_outgoing_call(
-                identity,
-                &call,
-                &targets,
-                Some((&dial.avc, local.public(), dial.mode)),
-            )
-            .await;
-        if ring.is_err() || reply.is_closed() {
-            let _ = madrid
-                .send_outgoing_call(identity, &call, &targets, None)
-                .await;
-            ring?;
-            anyhow::bail!("The FaceTime call was canceled");
-        }
         let (hangup, cancel) = oneshot::channel();
         let (answer, answered) = oneshot::channel();
         let id = call.id;
+        let relay = targets.relay.clone();
         self.outgoing = Some(PendingOutgoing {
             call,
             responses: RingResponses::new(targets.relay.endpoints()),
             targets,
             local,
+            avc: dial.avc,
+            invited: false,
             cancel,
             answered: Some(answer),
         });
@@ -280,7 +289,35 @@ impl IncomingCalls {
             id,
             _cancel: hangup,
             answered,
+            relay,
         })
+    }
+
+    pub(in crate::engine) async fn ring_outgoing(
+        &mut self,
+        identity: &Identity,
+        madrid: &mut Madrid,
+        id: Uuid,
+    ) -> Result<()> {
+        let pending = self
+            .outgoing
+            .as_mut()
+            .filter(|outgoing| !outgoing.invited && outgoing.call.id == id)
+            .context("The FaceTime invitation is unavailable")?;
+        pending.check_live()?;
+        let mode = pending.call.mode.context("Missing FaceTime call mode")?;
+        pending.call.received_ms = now_ms();
+        pending.call.expires_ms = pending.call.received_ms + RING_TIMEOUT_MS;
+        // A rejected send can still have reached a recipient if delivery stopped partway.
+        pending.invited = true;
+        madrid
+            .send_outgoing_call(
+                identity,
+                &pending.call,
+                &pending.targets,
+                Some((&pending.avc, pending.local.public(), mode)),
+            )
+            .await
     }
 
     pub(in crate::engine) async fn finish_outgoing(
@@ -292,15 +329,9 @@ impl IncomingCalls {
         let pending = self
             .outgoing
             .as_mut()
-            .filter(|outgoing| outgoing.call.id == id)
+            .filter(|outgoing| outgoing.invited && outgoing.call.id == id)
             .context("The FaceTime call has ended")?;
-        ensure!(
-            matches!(
-                pending.cancel.try_recv(),
-                Err(oneshot::error::TryRecvError::Empty)
-            ) && pending.call.expires_ms > now_ms(),
-            "The FaceTime call has ended"
-        );
+        pending.check_live()?;
         let selected = pending
             .responses
             .selected
@@ -339,7 +370,7 @@ impl IncomingCalls {
             .await?;
         Ok(OutgoingAnswer {
             handshake,
-            relay,
+            endpoint: device.endpoint,
             local_keys,
             lifetime,
         })
@@ -385,50 +416,91 @@ impl Engine {
             id,
             _cancel,
             answered,
+            relay,
         } = attempt
             .await
             .context("The Apple engine stopped while placing the call")??;
-        answered.await.context("The FaceTime call has ended")??;
-        let (reply, result) = oneshot::channel();
-        self.requests
-            .try_send(Request::FinishOutgoing { id, reply })
-            .context("The Apple engine is busy or stopped")?;
+        let mut pending_relay = timeout(
+            MEDIA_SETUP_TIMEOUT,
+            relay.bind_for_ringing(config.relay_profile),
+        )
+        .await
+        .context("The FaceTime relay did not bind before ringing")??;
+        let answer = self.ring_and_wait(id, answered, &mut pending_relay).await;
+        drop(_cancel);
         let OutgoingAnswer {
             handshake,
-            relay,
+            endpoint,
             local_keys,
             mut lifetime,
-        } = result
-            .await
-            .context("The Apple engine stopped while joining the call")??;
-        drop(_cancel);
+        } = match answer {
+            Ok(answer) => answer,
+            Err(error) => {
+                let _ = pending_relay.unbind().await;
+                return Err(error);
+            }
+        };
         let mode = handshake
             .call()
             .mode
             .context("The other device did not select a call mode")?;
         local_description.mode = Some(mode);
         let description = local_keys.seal_description(config.avc_plist, mode)?;
-        let connect = async {
-            relay
-                .connect()
-                .await?
-                .bind_with_description(config.relay_profile, &description)
-                .await
-        };
         let bound = tokio::select! {
             biased;
             _ = lifetime.ended.changed() => anyhow::bail!("The FaceTime call has ended"),
-            result = timeout(MEDIA_SETUP_TIMEOUT, connect) => result.context("The FaceTime relay did not connect")??,
+            result = timeout(MEDIA_SETUP_TIMEOUT, pending_relay.join(endpoint, &description)) =>
+                result.context("The FaceTime relay did not confirm the media offer")??,
         };
         complete_media(
             handshake,
             bound,
             local_keys,
             local_description,
-            relay.caller_participant,
+            endpoint
+                .participant()
+                .context("Missing FaceTime peer participant")?,
             lifetime,
         )
         .await
+    }
+
+    async fn ring_and_wait(
+        &self,
+        id: Uuid,
+        mut answered: oneshot::Receiver<Result<()>>,
+        relay: &mut RingingRelay,
+    ) -> Result<OutgoingAnswer> {
+        let (reply, result) = oneshot::channel();
+        self.requests
+            .try_send(Request::RingOutgoing { id, reply })
+            .context("The Apple engine is busy or stopped")?;
+        result
+            .await
+            .context("The Apple engine stopped while ringing")??;
+
+        let interval = Duration::from_secs(15);
+        let mut keepalive =
+            tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut answered => {
+                    result.context("The FaceTime call has ended")??;
+                    break;
+                }
+                _ = keepalive.tick() => relay.keepalive().await?,
+                result = relay.service_during_ring() => result?,
+            }
+        }
+        let (reply, result) = oneshot::channel();
+        self.requests
+            .try_send(Request::FinishOutgoing { id, reply })
+            .context("The Apple engine is busy or stopped")?;
+        result
+            .await
+            .context("The Apple engine stopped while joining the call")?
     }
 }
 
