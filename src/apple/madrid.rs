@@ -32,11 +32,13 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(12);
 const MAX_PLIST: usize = 1024 * 1024;
 const MAX_QUEUE: usize = 64;
 const MAX_BATCH: usize = 10_000;
+const DIRECTORY_CACHE_TTL: Duration = Duration::from_secs(120);
+const CALL_DIRECTORY_CACHE_TTL: Duration = Duration::from_secs(45);
 
 pub(crate) struct Madrid {
     courier: Courier,
     queued: VecDeque<Notification>,
-    cached: HashMap<(&'static str, String), (Instant, Vec<Destination>)>,
+    cached: HashMap<(&'static str, String), DirectoryEntry>,
     keepalive: Instant,
 }
 
@@ -52,11 +54,18 @@ pub(crate) enum Incoming {
     Call(facetime::CallSignal),
 }
 
+#[derive(Clone)]
 struct Destination {
     push: Vec<u8>,
     session: Vec<u8>,
-    public_key: KeyPair<Public>,
+    public_key: Arc<KeyPair<Public>>,
     device_key: Option<facetime::PeerDeviceKey>,
+}
+
+struct DirectoryEntry {
+    fetched: Instant,
+    devices: Vec<Destination>,
+    for_delivery: bool,
 }
 
 pub(crate) struct MessageDestinations(HashMap<String, Vec<Destination>>);
@@ -396,7 +405,7 @@ impl Madrid {
                     destinations.push(Destination {
                         push: device.push_token.into(),
                         session: device.session_token.into(),
-                        public_key,
+                        public_key: Arc::new(public_key),
                         device_key,
                     });
                 }
@@ -637,18 +646,36 @@ impl Madrid {
             *endpoint.push_token() != identity.token,
             "Invalid FaceTime recipient"
         );
-        let mut targets = self
-            .query(identity, facetime::SIGNALING, &[caller], true)
-            .await?;
-        let devices = targets
-            .get_mut(caller)
-            .context("The FaceTime caller device is no longer in the IDS directory")?;
-        devices.retain(|device| device.push == endpoint.push_token());
-        ensure!(
-            devices.len() == 1,
-            "The FaceTime caller device could not be identified"
-        );
-        Ok(targets)
+        let cache_key = (facetime::SIGNALING, caller.to_owned());
+        let matching_device = |devices: &[Destination]| {
+            let mut matching = devices
+                .iter()
+                .filter(|device| device.push == endpoint.push_token());
+            let device = matching.next()?;
+            matching.next().is_none().then(|| device.clone())
+        };
+        let cached = self
+            .cached
+            .get(&cache_key)
+            .filter(|entry| {
+                entry.for_delivery && entry.fetched.elapsed() < CALL_DIRECTORY_CACHE_TTL
+            })
+            .and_then(|entry| matching_device(&entry.devices));
+        let device = if let Some(device) = cached {
+            device
+        } else {
+            let mut targets = self
+                .query(identity, facetime::SIGNALING, &[caller], true)
+                .await?;
+            let devices = targets
+                .remove(caller)
+                .context("The FaceTime caller device is no longer in the IDS directory")?;
+            let device = matching_device(&devices)
+                .context("The FaceTime caller device could not be identified")?;
+            self.cache_destinations(cache_key, devices, true);
+            device
+        };
+        Ok(HashMap::from([(caller.to_owned(), vec![device])]))
     }
 
     pub(crate) async fn update_call_participant(
@@ -1039,6 +1066,25 @@ impl Madrid {
         mmcs::authorize_upload(self, identity, input).await
     }
 
+    fn cache_destinations(
+        &mut self,
+        key: (&'static str, String),
+        devices: Vec<Destination>,
+        for_delivery: bool,
+    ) {
+        if self.cached.len() >= 128 {
+            self.cached.clear();
+        }
+        self.cached.insert(
+            key,
+            DirectoryEntry {
+                fetched: Instant::now(),
+                devices,
+                for_delivery,
+            },
+        );
+    }
+
     pub(super) async fn media_request<const N: usize>(
         &mut self,
         identity: &Identity,
@@ -1119,30 +1165,25 @@ impl Madrid {
 
         let cache_key = (notice.topic, sender.clone());
         self.cached
-            .retain(|_, (deadline, _)| *deadline > Instant::now());
+            .retain(|_, entry| entry.fetched.elapsed() < DIRECTORY_CACHE_TTL);
         if !self
             .cached
             .get(&cache_key)
-            .is_some_and(|(_, keys)| keys.iter().any(|key| key.push == token))
+            .is_some_and(|entry| entry.devices.iter().any(|key| key.push == token))
         {
             let mut keys = self
                 .query(identity, notice.topic, &[&sender], false)
                 .await?;
-            if self.cached.len() >= 128 {
-                self.cached.clear();
-            }
-            self.cached.insert(
+            self.cache_destinations(
                 cache_key.clone(),
-                (
-                    Instant::now() + Duration::from_secs(120),
-                    keys.remove(&sender).unwrap_or_default(),
-                ),
+                keys.remove(&sender).unwrap_or_default(),
+                false,
             );
         }
-        let Some((_, devices)) = self.cached.get(&cache_key) else {
+        let Some(entry) = self.cached.get(&cache_key) else {
             return Ok(None);
         };
-        let Some(device) = devices.iter().find(|entry| entry.push == token) else {
+        let Some(device) = entry.devices.iter().find(|entry| entry.push == token) else {
             return Ok(None);
         };
         let decoded = (|| -> Result<Option<Incoming>> {
@@ -1651,7 +1692,6 @@ mod tests {
         )?;
         let key_offer = local.handshake.build_key_offer(relay.local_participant)?;
         let simulate_keys = async {
-            answer_directory_lookup(&mut mock, &recipient_key, CALLER, &[3, 2]).await?;
             for command in [facetime::PREKEY_COMMAND, facetime::KEY_MATERIAL_COMMAND] {
                 let frame = Frame::read(&mut mock).await?;
                 assert_eq!(
@@ -1737,9 +1777,18 @@ mod tests {
             simulate_keys
         )?;
         for joined in [true, false] {
+            if !joined {
+                madrid
+                    .cached
+                    .get_mut(&(facetime::SIGNALING, CALLER.to_owned()))
+                    .context("Missing verified caller directory lookup")?
+                    .fetched -= CALL_DIRECTORY_CACHE_TTL;
+            }
             let description = b"local media description";
             let simulate_update = async {
-                answer_directory_lookup(&mut mock, &recipient_key, CALLER, &[3, 2]).await?;
+                if !joined {
+                    answer_directory_lookup(&mut mock, &recipient_key, CALLER, &[3, 2]).await?;
+                }
                 let frame = Frame::read(&mut mock).await?;
                 let wire: Dictionary =
                     plist::from_bytes(frame.field(3).context("Missing call update")?)?;
@@ -2053,7 +2102,6 @@ mod tests {
                 ],
             )
             .await?;
-            answer_directory_lookup(&mut mock, &recipient_key, CALLER, &[2]).await?;
             Ok::<_, anyhow::Error>(())
         };
         let listen_while_download_is_pending = async {
