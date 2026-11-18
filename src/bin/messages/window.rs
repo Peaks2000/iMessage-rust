@@ -1904,28 +1904,29 @@ impl MessagesApp {
         }
     }
 
-    fn quit(&mut self, ctx: &egui::Context) {
+    pub(super) fn quit(&mut self, ctx: &egui::Context) {
         self.quitting = true;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        if let Some(mut call) = self.active_call.take() {
+            call.controls.hang_up();
+        }
+        self.mac_setup = None;
+        self.session_import = None;
+        self.candidate = None;
+        self.connection = None;
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+    }
+
+    pub(super) fn is_quitting(&self) -> bool {
+        self.quitting
     }
 
     fn handle_window_actions(&mut self, ctx: &egui::Context) {
-        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Q)) {
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Q))
+            || ctx.input(|input| input.viewport().close_requested())
+        {
             self.quit(ctx);
         } else if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::W)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-
-        if !self.quitting
-            && ctx.input(|input| input.viewport().close_requested())
-            && self.connection.is_some()
-            && self
-                .status
-                .as_ref()
-                .is_some_and(|status| status.facetime_registered)
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
     }
 
@@ -2288,6 +2289,9 @@ impl eframe::App for MessagesApp {
         self.clipboard.remember_window(frame);
         self.process_notification_action(ctx);
         self.handle_window_actions(ctx);
+        if self.quitting {
+            return;
+        }
         let paste = self.clipboard.take_paste_request(ctx);
         if self.settings.is_none()
             && self.delete_conversation.is_none()
@@ -3242,7 +3246,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn closing_the_window_keeps_a_face_time_session_available_until_quit() -> anyhow::Result<()> {
+    fn quitting_from_a_child_window_ends_the_call_and_closes_the_application() -> anyhow::Result<()>
+    {
+        let ctx = egui::Context::default();
+        let root = tempfile::tempdir()?;
+        let mut app = MessagesApp::new(&ctx, root.path().to_owned(), true, Clipboard::empty());
+        let (connection, mut actions, _report) = Connection::test_channels();
+        app.connection = Some(connection);
+        app.start_outgoing_call("mailto:fixture@example.org", CallMode::Video);
+        let Action::StartCall {
+            mut hang_up,
+            video: Some(video),
+            ..
+        } = actions.try_recv()?
+        else {
+            anyhow::bail!("Expected the fixture video call");
+        };
+        let child = egui::ViewportId::from_hash_of("facetime-video");
+        let mut input = egui::RawInput {
+            viewport_id: child,
+            ..Default::default()
+        };
+        input.viewports.insert(
+            child,
+            egui::ViewportInfo {
+                parent: Some(egui::ViewportId::ROOT),
+                ..Default::default()
+            },
+        );
+        let output = ctx.run(input, |ctx| app.quit(ctx));
+        assert!(app.is_quitting());
+        assert!(app.connection.is_none() && app.active_call.is_none() && app.mac_setup.is_none());
+        hang_up.try_recv()?;
+        assert!(video.camera_enabled.has_changed().is_err());
+        assert_eq!(
+            output.viewport_output[&egui::ViewportId::ROOT].commands,
+            [egui::ViewportCommand::Close]
+        );
+        assert!(output.viewport_output[&child].commands.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn closing_the_window_exits_with_or_without_face_time_registration() -> anyhow::Result<()> {
         let ctx = egui::Context::default();
         let root = tempfile::tempdir()?;
         let mut app = MessagesApp::new(&ctx, root.path().to_owned(), true, Clipboard::empty());
@@ -3283,14 +3329,8 @@ mod tests {
                 .commands
                 .clone()
         };
-        assert!(frame(false, false).is_empty());
-        assert_eq!(
-            frame(true, false),
-            [
-                egui::ViewportCommand::CancelClose,
-                egui::ViewportCommand::Minimized(true)
-            ]
-        );
+        assert_eq!(frame(false, false), [egui::ViewportCommand::Close]);
+        assert_eq!(frame(true, false), [egui::ViewportCommand::Close]);
         assert_eq!(frame(true, true), [egui::ViewportCommand::Close]);
         Ok(())
     }

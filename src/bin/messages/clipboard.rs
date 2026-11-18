@@ -125,7 +125,11 @@ pub(super) fn run(
     mut options: NativeOptions,
     create: impl FnOnce(&CreationContext<'_>, Rc<Clipboard>) -> MessagesApp,
 ) -> Result<()> {
-    let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
+    let mut builder = EventLoop::<UserEvent>::with_user_event();
+    if let Some(configure) = options.event_loop_builder.take() {
+        configure(&mut builder);
+    }
+    let event_loop = builder.build()?;
     let proxy = event_loop.create_proxy();
     let wayland = match event_loop
         .display_handle()
@@ -240,6 +244,17 @@ impl ApplicationHandler<UserEvent> for NativeApp<'_> {
                 event,
                 is_synthetic: false,
                 ..
+            } if is_quit(event, self.modifiers) => {
+                if let Some((ctx, app)) = self.state.get() {
+                    app.borrow_mut().quit(ctx);
+                    event_loop.exit();
+                    return;
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic: false,
+                ..
             } if is_paste(event, self.modifiers) => {
                 self.clipboard.requested.set(true);
             }
@@ -277,7 +292,15 @@ impl ApplicationHandler<UserEvent> for NativeApp<'_> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        self.app.about_to_wait(event_loop);
+        if self
+            .state
+            .get()
+            .is_some_and(|(_, app)| app.borrow().is_quitting())
+        {
+            event_loop.exit();
+        } else {
+            self.app.about_to_wait(event_loop);
+        }
     }
 
     fn suspended(&mut self, event_loop: &ActiveEventLoop) {
@@ -286,6 +309,9 @@ impl ApplicationHandler<UserEvent> for NativeApp<'_> {
     }
 
     fn exiting(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some((ctx, app)) = self.state.get() {
+            app.borrow_mut().quit(ctx);
+        }
         self.clipboard.wayland.borrow_mut().take();
         self.app.exiting(event_loop);
     }
@@ -293,6 +319,15 @@ impl ApplicationHandler<UserEvent> for NativeApp<'_> {
     fn memory_warning(&mut self, event_loop: &ActiveEventLoop) {
         self.app.memory_warning(event_loop);
     }
+}
+
+fn is_quit(event: &KeyEvent, modifiers: ModifiersState) -> bool {
+    event.state == ElementState::Pressed
+        && !event.repeat
+        && modifiers.control_key()
+        && !modifiers.alt_key()
+        && !modifiers.super_key()
+        && matches!(event.logical_key.as_ref(), Key::Character(key) if key.eq_ignore_ascii_case("q"))
 }
 
 fn is_paste(event: &KeyEvent, modifiers: ModifiersState) -> bool {
