@@ -143,10 +143,16 @@ struct JoinContext {
     message: Option<ConversationSignal>,
     #[prost(bool, optional, tag = "8")]
     video: Option<bool>,
+    #[prost(string, tag = "10")]
+    provider: String,
     #[prost(message, repeated, tag = "11")]
     other_invited_handles: Vec<Handle>,
     #[prost(bool, optional, tag = "16")]
     video_enabled: Option<bool>,
+    #[prost(bool, optional, tag = "18")]
+    supports_one_to_one: Option<bool>,
+    #[prost(bool, optional, tag = "22")]
+    supports_leave: Option<bool>,
 }
 
 #[derive(prost::Message)]
@@ -166,6 +172,19 @@ struct Handle {
 }
 
 impl Handle {
+    fn from_address(uri: &str) -> Self {
+        let (kind, value) = if let Some(phone) = uri.strip_prefix("tel:") {
+            (2, phone)
+        } else {
+            (3, uri.strip_prefix("mailto:").unwrap_or(uri))
+        };
+        Self {
+            kind,
+            value: value.to_owned(),
+            normalized_value: value.to_owned(),
+        }
+    }
+
     fn matches(&self, expected: &str) -> bool {
         let matches_kind = match self.kind {
             2 => expected.starts_with("tel:"),
@@ -177,6 +196,80 @@ impl Handle {
                 .iter()
                 .any(|value| address(value).is_ok_and(|handle| handle == expected))
     }
+}
+
+pub(super) fn participant_update(
+    allocation: &CallRelayAllocation,
+    own: &str,
+    caller: &str,
+    join: Option<(&[u8], &[u8; 65], CallMode)>,
+) -> plist::Dictionary {
+    let call = allocation.call_id.to_string().to_ascii_uppercase();
+    let members = [own, caller];
+    let participants = plist::Dictionary::from_iter([
+        (
+            own,
+            Value::Array(vec![Value::from(allocation.local_participant)]),
+        ),
+        (
+            caller,
+            Value::Array(vec![Value::from(allocation.caller_participant)]),
+        ),
+    ]);
+    let mut update = plist::Dictionary::from_iter([
+        ("s", Value::from(call.as_str())),
+        ("fanout-groupID-key", Value::from(call.as_str())),
+        ("is-initiator-key", Value::Boolean(false)),
+        ("is-u-plus-one-key", Value::Boolean(join.is_none())),
+        (
+            "join-notification-key",
+            Value::from(if join.is_some() { 1 } else { 2 }),
+        ),
+        (
+            "participant-id-key",
+            Value::from(allocation.local_participant),
+        ),
+        (
+            "fanout-groupMembers-key",
+            Value::Array(members.into_iter().map(Value::from).collect()),
+        ),
+        ("uri-to-participant-id-key", Value::Dictionary(participants)),
+    ]);
+    let client_context = if let Some((description, prekey, mode)) = join {
+        let video = mode == CallMode::Video;
+        let context = JoinContext {
+            members: members
+                .into_iter()
+                .map(|uri| ConversationMember {
+                    handle: Some(Handle::from_address(uri)),
+                })
+                .collect(),
+            message: Some(ConversationSignal {
+                mode: Some(if video { 2 } else { 1 }),
+                ..Default::default()
+            }),
+            video: Some(video),
+            provider: "com.apple.telephonyutilities.callservicesd.FaceTimeProvider".to_owned(),
+            other_invited_handles: Vec::new(),
+            video_enabled: Some(video),
+            supports_one_to_one: Some(true),
+            supports_leave: Some(true),
+        };
+        update.insert(
+            "participant-data-key".to_owned(),
+            Value::Data(description.to_vec()),
+        );
+        update.insert("rtmpk".to_owned(), Value::Data(prekey.to_vec()));
+        update.insert("rtmpwm".to_owned(), Value::from(1));
+        context.encode_to_vec()
+    } else {
+        vec![16, 0]
+    };
+    update.insert(
+        "client-context-data-key".to_owned(),
+        Value::Data(client_context),
+    );
+    update
 }
 
 pub(super) fn decline(id: Uuid) -> Vec<u8> {

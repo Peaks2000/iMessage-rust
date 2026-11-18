@@ -14,7 +14,7 @@ use tokio::time::{Instant, timeout};
 use uuid::Uuid;
 
 use crate::media::{MediaReference, MediaSource};
-use crate::{Delivery, IncomingCall, Message, SendText, TapbackEvent, address, now_ms};
+use crate::{CallMode, Delivery, IncomingCall, Message, SendText, TapbackEvent, address, now_ms};
 
 use super::{
     Identity,
@@ -69,6 +69,9 @@ struct DeliveryPayload<'a> {
 enum DeliveryKind {
     Message,
     CallInvitation(u64),
+    CallParticipant {
+        joined: bool,
+    },
     CallMaterial {
         command: u64,
         expires_at: Option<u64>,
@@ -475,26 +478,10 @@ impl Madrid {
         let call = handshake.call();
         let remaining = call.expires_ms.saturating_sub(now_ms());
         ensure!(remaining > 0, "This FaceTime call has ended");
-        ensure!(
-            endpoint.participant().is_some(),
-            "The caller has not joined FaceTime yet"
-        );
-        ensure!(
-            *endpoint.push_token() != identity.token,
-            "Invalid FaceTime key recipient"
-        );
         timeout(Duration::from_millis(remaining as u64), async {
-            let mut targets = self
-                .query(identity, facetime::SIGNALING, &[&call.caller], true)
+            let targets = self
+                .call_destination(identity, &call.caller, endpoint)
                 .await?;
-            let devices = targets
-                .get_mut(&call.caller)
-                .context("The FaceTime caller device is no longer in the IDS directory")?;
-            devices.retain(|device| device.push == endpoint.push_token());
-            ensure!(
-                devices.len() == 1,
-                "The FaceTime caller device could not be identified"
-            );
 
             let id = call.id.to_string().to_ascii_uppercase();
             let prekey = binary(&dictionary([
@@ -544,6 +531,86 @@ impl Madrid {
         })
         .await
         .context("The FaceTime call ended while publishing keys")?
+    }
+
+    async fn call_destination(
+        &mut self,
+        identity: &Identity,
+        caller: &str,
+        endpoint: facetime::CallEndpoint,
+    ) -> Result<HashMap<String, Vec<Destination>>> {
+        ensure!(
+            endpoint.participant().is_some(),
+            "The caller has not joined FaceTime yet"
+        );
+        ensure!(
+            *endpoint.push_token() != identity.token,
+            "Invalid FaceTime recipient"
+        );
+        let mut targets = self
+            .query(identity, facetime::SIGNALING, &[caller], true)
+            .await?;
+        let devices = targets
+            .get_mut(caller)
+            .context("The FaceTime caller device is no longer in the IDS directory")?;
+        devices.retain(|device| device.push == endpoint.push_token());
+        ensure!(
+            devices.len() == 1,
+            "The FaceTime caller device could not be identified"
+        );
+        Ok(targets)
+    }
+
+    pub(crate) async fn update_call_participant(
+        &mut self,
+        identity: &Identity,
+        call: &IncomingCall,
+        endpoint: facetime::CallEndpoint,
+        allocation: &facetime::CallRelayAllocation,
+        join: Option<(&[u8], &[u8; 65], CallMode)>,
+    ) -> Result<()> {
+        ensure!(
+            call.id == allocation.call_id
+                && endpoint.participant() == Some(allocation.caller_participant),
+            "FaceTime relay no longer matches the caller"
+        );
+        let setup_timeout = if join.is_some() {
+            let remaining = call.expires_ms.saturating_sub(now_ms());
+            ensure!(remaining > 0, "This FaceTime call has ended");
+            Duration::from_millis(remaining as u64).min(RESPONSE_TIMEOUT)
+        } else {
+            RESPONSE_TIMEOUT
+        };
+        timeout(setup_timeout, async {
+            let targets = self
+                .call_destination(identity, &call.caller, endpoint)
+                .await?;
+            let payload =
+                facetime::participant_update(allocation, &identity.handle, &call.caller, join);
+            let bytes = binary(&payload)?;
+            let sent = self
+                .deliver_message(
+                    identity,
+                    DeliveryPayload {
+                        recipient: &call.caller,
+                        guid: Uuid::new_v4(),
+                        request_receipt: false,
+                        bytes: &bytes,
+                        kind: DeliveryKind::CallParticipant {
+                            joined: join.is_some(),
+                        },
+                    },
+                    &targets,
+                )
+                .await?;
+            ensure!(
+                sent == Delivery::Accepted,
+                "Apple did not confirm the FaceTime participant update"
+            );
+            Ok(())
+        })
+        .await
+        .context("FaceTime participant update timed out")?
     }
 
     pub(crate) async fn allocate_call_relay(
@@ -680,6 +747,12 @@ impl Madrid {
                             DeliveryKind::Message => 100,
                             DeliveryKind::CallInvitation(_) => facetime::INVITATION_COMMAND,
                             DeliveryKind::CallMaterial { command, .. } => command,
+                            DeliveryKind::CallParticipant { joined: true } => {
+                                facetime::JOIN_COMMAND
+                            }
+                            DeliveryKind::CallParticipant { joined: false } => {
+                                facetime::LEAVE_COMMAND
+                            }
                         }
                         .into(),
                     ),
@@ -701,6 +774,14 @@ impl Madrid {
                         wire.insert("siu".into(), Value::Boolean(false));
                         if let Some(expires_at) = expires_at {
                             wire.insert("eX".into(), expires_at.into());
+                        }
+                    }
+                    DeliveryKind::CallParticipant { joined } => {
+                        wire.insert("is-initiator-key".into(), Value::Boolean(false));
+                        wire.insert("up1".into(), Value::Boolean(!joined));
+                        if !joined {
+                            wire.insert("cc".into(), 1.into());
+                            wire.insert("H".into(), 3.into());
                         }
                     }
                 }
@@ -1298,6 +1379,88 @@ mod tests {
             madrid.publish_call_keys(&identity, &local.handshake, selected_device, &key_offer),
             simulate_keys
         )?;
+        for joined in [true, false] {
+            let description = b"local media description";
+            let simulate_update = async {
+                answer_directory_lookup(&mut mock, &recipient_key).await?;
+                let frame = Frame::read(&mut mock).await?;
+                let wire: Dictionary =
+                    plist::from_bytes(frame.field(3).context("Missing call update")?)?;
+                assert_eq!(
+                    frame.field(1),
+                    Some(sha1(facetime::SIGNALING.as_bytes()).as_slice())
+                );
+                let command = if joined {
+                    facetime::JOIN_COMMAND
+                } else {
+                    facetime::LEAVE_COMMAND
+                };
+                assert_eq!(wire["c"].as_unsigned_integer(), Some(command));
+                assert_eq!(wire["is-initiator-key"].as_boolean(), Some(false));
+                assert_eq!(wire["up1"].as_boolean(), Some(!joined));
+                let targets = wire["dtl"].as_array().context("Missing call targets")?;
+                assert_eq!(targets.len(), 1);
+                let target = targets[0].as_dictionary().context("Invalid call target")?;
+                assert_eq!(field_data(target, "t"), Some([2; 32].as_slice()));
+                let clear = recipient.open(
+                    &sender_key,
+                    field_data(target, "P").context("Missing call ciphertext")?,
+                )?;
+                let update: Dictionary = plist::from_bytes(&clear)?;
+                assert_eq!(
+                    field_str(&update, "s"),
+                    Some(call.id.to_string().to_ascii_uppercase().as_str())
+                );
+                assert_eq!(
+                    update["participant-id-key"].as_unsigned_integer(),
+                    Some(LOCAL_ID)
+                );
+                assert_eq!(
+                    update["join-notification-key"].as_unsigned_integer(),
+                    Some(if joined { 1 } else { 2 })
+                );
+                if joined {
+                    assert_eq!(
+                        field_data(&update, "participant-data-key"),
+                        Some(description.as_slice())
+                    );
+                    assert_eq!(
+                        field_data(&update, "rtmpk"),
+                        Some(local.handshake.public_prekey().as_slice())
+                    );
+                } else {
+                    assert!(update.get("participant-data-key").is_none());
+                    assert_eq!(
+                        field_data(&update, "client-context-data-key"),
+                        Some([16, 0].as_slice())
+                    );
+                }
+                write_frame(
+                    &mut mock,
+                    0x0b,
+                    &[
+                        (4, frame.field(4).context("Missing call update push ID")?),
+                        (8, &[0]),
+                    ],
+                )
+                .await?;
+                Ok::<_, anyhow::Error>(())
+            };
+            tokio::try_join!(
+                madrid.update_call_participant(
+                    &identity,
+                    &call,
+                    selected_device,
+                    &relay,
+                    joined.then_some((
+                        description.as_slice(),
+                        local.handshake.public_prekey(),
+                        CallMode::Audio
+                    )),
+                ),
+                simulate_update,
+            )?;
+        }
         Ok(())
     }
 }

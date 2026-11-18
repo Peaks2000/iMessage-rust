@@ -26,6 +26,8 @@ pub use ssh_setup::{SshPrompt, run_ssh_askpass};
 use anyhow::{Context, Result, ensure};
 #[cfg(test)]
 pub(crate) use facetime::decode as decode_call_fixture;
+#[cfg(test)]
+pub(crate) use facetime::relay::tests::parsed_allocation as call_relay_fixture;
 pub use facetime::{
     CallAvcMaterial, CallKey, CallKeyOffer, CallMediaDescription, CallMediaHandshake, CallMediaKey,
     CallPeerKeys, CallRelayAllocation, CallRelayBinding, CallRelayConnection, CallRelayKeys,

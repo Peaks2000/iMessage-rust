@@ -1,9 +1,14 @@
+mod calls;
+
+use calls::{AnswerAttempt, AnswerLifetime, ConnectedCall, JoinAnswer};
+pub use calls::{AnsweredCall, CallAnswerConfig};
+
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
     os::unix::fs::OpenOptionsExt,
     path::Path,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, Weak},
     time::Duration,
 };
 
@@ -60,6 +65,14 @@ enum Request {
     PublishCallKeys {
         id: uuid::Uuid,
         reply: oneshot::Sender<Result<Arc<CallKeyOffer>>>,
+    },
+    BeginCallAnswer {
+        id: uuid::Uuid,
+        reply: oneshot::Sender<Result<Option<AnswerAttempt>>>,
+    },
+    JoinCall {
+        answer: JoinAnswer,
+        reply: oneshot::Sender<Result<AnswerLifetime>>,
     },
     Download {
         id: uuid::Uuid,
@@ -293,6 +306,9 @@ async fn run_apple(
             }
             Err(error) => error,
         };
+        if let Some(call) = calls.connected.as_ref() {
+            calls.end(call.call.id, now_ms());
+        }
         set_status(&status, false, &error.to_string());
         let delay = sleep(retry_delay);
         tokio::pin!(delay);
@@ -326,6 +342,12 @@ async fn run_apple(
                         Request::PublishCallKeys { reply, .. } => {
                             let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
                         }
+                        Request::BeginCallAnswer { reply, .. } => {
+                            let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
+                        }
+                        Request::JoinCall { reply, .. } => {
+                            let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
+                        }
                     }
                 }
             }
@@ -355,6 +377,16 @@ async fn online(
             }
             notification = madrid.next_notification() => {
                 receive_notification(identity, state, madrid, status, calls, notification?).await?;
+            }
+            () = calls.wait_for_local_hangup() => {
+                if let Some(connected) = calls.connected.take() {
+                    let call = connected.call.clone();
+                    let endpoint = connected.endpoint;
+                    let relay = connected.relay.clone();
+                    drop(connected); // Close the local call and clear peer keys before network I/O.
+                    calls.end(call.id, now_ms());
+                    let _ = madrid.update_call_participant(identity, &call, endpoint, &relay, None).await;
+                }
             }
             request = requests.recv() => {
                 let Some(request) = request else { return Ok(()) };
@@ -425,6 +457,36 @@ async fn online(
                         let result = result.and_then(|offer| active_call(&status.borrow(), id).map(|_| offer));
                         let _ = reply.send(result);
                     }
+                    Request::BeginCallAnswer { id, reply } => {
+                        if !reply.is_closed() {
+                            let _ = reply.send(calls.begin_answer(&status.borrow(), id));
+                        }
+                    }
+                    Request::JoinCall { answer, reply } => {
+                        for notification in madrid.take_queued() {
+                            receive_notification(identity, state, madrid, status, calls, notification).await?;
+                        }
+                        if reply.is_closed() {
+                            continue;
+                        }
+                        let result = calls.send_join(identity, madrid, status, &answer).await;
+                        for notification in madrid.take_queued() {
+                            receive_notification(identity, state, madrid, status, calls, notification).await?;
+                        }
+                        let result = match result {
+                            Ok(receipt) => {
+                                let joined = calls.finish_answer(status, &receipt);
+                                if joined.is_err() {
+                                    let _ = madrid.update_call_participant(
+                                        identity, &receipt.call, receipt.endpoint, &receipt.relay, None,
+                                    ).await;
+                                }
+                                joined
+                            }
+                            Err(error) => Err(error),
+                        };
+                        let _ = reply.send(result);
+                    }
                 }
             }
             _ = status.closed() => return Ok(()),
@@ -462,6 +524,8 @@ fn active_call(status: &Status, id: uuid::Uuid) -> Result<&crate::IncomingCall> 
 struct IncomingCalls {
     details: HashMap<uuid::Uuid, IncomingCallDetails>,
     ended: HashMap<uuid::Uuid, i64>,
+    answering: Option<Weak<()>>,
+    connected: Option<ConnectedCall>,
 }
 
 struct IncomingCallDetails {
@@ -474,20 +538,23 @@ struct IncomingCallDetails {
 }
 
 impl IncomingCallDetails {
-    fn learn_prekey(&mut self, key: PeerPrekey) {
+    fn learn_prekey(&mut self, key: PeerPrekey) -> bool {
         // One caller prekey per ringing attempt. An established call negotiates rekeys separately.
-        if self.prekey.as_ref().is_none_or(|known| known.same_as(&key)) {
+        if self.prekey.is_none() {
             self.prekey = Some(key);
+            return true;
         }
+        false
     }
 
-    fn learn_media(&mut self, media: Option<PeerMediaOffer>) {
-        if let Some(offer) = media {
-            if let Some(key) = offer.prekey {
-                self.learn_prekey(key);
-            }
-            self.description.get_or_insert(offer.description);
+    fn learn_media(&mut self, media: Option<PeerMediaOffer>) -> bool {
+        let Some(offer) = media else { return false };
+        let learned_key = offer.prekey.is_some_and(|key| self.learn_prekey(key));
+        if self.description.is_none() {
+            self.description = Some(offer.description);
+            return true;
         }
+        learned_key
     }
 }
 
@@ -564,6 +631,13 @@ impl IncomingCalls {
 
     fn end(&mut self, id: uuid::Uuid, now: i64) {
         self.details.remove(&id);
+        if self
+            .connected
+            .as_ref()
+            .is_some_and(|active| active.call.id == id)
+        {
+            self.connected = None;
+        }
         if self.ended.len() >= 256
             && let Some((&oldest, _)) = self.ended.iter().min_by_key(|(_, expiry)| *expiry)
         {
@@ -609,19 +683,28 @@ impl IncomingCalls {
                     call: offer,
                     endpoint,
                     media,
-                } if offer.expires_ms > now && !self.ended.contains_key(&offer.id) => {
+                } if offer.expires_ms > now
+                    && !self.ended.contains_key(&offer.id)
+                    && self
+                        .connected
+                        .as_ref()
+                        .is_none_or(|active| active.call.id != offer.id) =>
+                {
                     if let Some(existing) = calls.iter_mut().find(|call| call.id == offer.id) {
                         // Bind a standalone invitation to its join without extending the original ring.
                         if existing.caller == offer.caller
                             && let Some(details) = self.details.get_mut(&offer.id)
                             && details.endpoint.matches(endpoint)
                         {
+                            let upgraded_endpoint = details.endpoint.participant().is_none()
+                                && endpoint.participant().is_some();
                             details.endpoint = endpoint;
-                            details.learn_media(media);
+                            let learned_media = details.learn_media(media);
                             if existing.mode.is_none() && offer.mode.is_some() {
                                 existing.mode = offer.mode;
                                 return true;
                             }
+                            return expired || learned_media || upgraded_endpoint;
                         }
                         return expired;
                     }
@@ -652,8 +735,9 @@ impl IncomingCalls {
                         .any(|call| call.id == id && call.caller == sender)
                         && let Some(details) = self.details.get_mut(&id)
                         && details.endpoint.same_device(endpoint)
+                        && details.learn_prekey(key)
                     {
-                        details.learn_prekey(key);
+                        return true;
                     }
                     expired
                 }
@@ -663,6 +747,14 @@ impl IncomingCalls {
                     endpoint,
                     offer,
                 } => {
+                    if let Some(active) = &self.connected
+                        && active.call.id == id
+                        && active.call.caller == sender
+                        && active.endpoint.matches(endpoint)
+                    {
+                        let _ = active.exchange.receive(*offer);
+                        return expired;
+                    }
                     if calls
                         .iter()
                         .any(|call| call.id == id && call.caller == sender)
@@ -681,18 +773,31 @@ impl IncomingCalls {
                     received_ms,
                     endpoint,
                 } => {
+                    if self.connected.as_ref().is_some_and(|connected| {
+                        connected.call.id == id
+                            && (endpoint.is_some() || sender == own)
+                            && can_end_call(
+                                &connected.call,
+                                Some(connected.endpoint),
+                                own,
+                                &sender,
+                                received_ms,
+                                endpoint,
+                            )
+                    }) {
+                        self.end(id, now);
+                        return true;
+                    }
                     if let Some(index) = calls.iter().position(|call| {
-                        let can_end = match endpoint {
-                            Some(leaving) => {
-                                sender == call.caller
-                                    && self
-                                        .details
-                                        .get(&id)
-                                        .is_some_and(|details| details.endpoint.matches(leaving))
-                            }
-                            None => sender == own || sender == call.caller,
-                        };
-                        call.id == id && can_end && received_ms >= call.received_ms
+                        call.id == id
+                            && can_end_call(
+                                call,
+                                self.details.get(&id).map(|details| details.endpoint),
+                                own,
+                                &sender,
+                                received_ms,
+                                endpoint,
+                            )
                     }) {
                         calls.remove(index);
                         self.end(id, now);
@@ -704,6 +809,23 @@ impl IncomingCalls {
             }
         });
     }
+}
+
+fn can_end_call(
+    call: &crate::IncomingCall,
+    verified: Option<CallEndpoint>,
+    own: &str,
+    sender: &str,
+    received_ms: i64,
+    endpoint: Option<CallEndpoint>,
+) -> bool {
+    received_ms >= call.received_ms
+        && match endpoint {
+            Some(leaving) => {
+                sender == call.caller && verified.is_some_and(|known| known.matches(leaving))
+            }
+            None => sender == own || sender == call.caller,
+        }
 }
 
 async fn send_tapback(

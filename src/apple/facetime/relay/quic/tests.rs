@@ -311,6 +311,7 @@ async fn exchanges_media_and_signaling_on_the_bound_http3_socket() -> Result<()>
     let local_description = description::local_offer()?;
 
     let (local_address, received_address) = tokio::sync::oneshot::channel();
+    let (packets_received, ready_to_unbind) = tokio::sync::oneshot::channel();
     let server = async {
         let _listener = accept_relay(&mut relay, accept_connection).await?;
         let mut control = relay
@@ -438,6 +439,29 @@ async fn exchanges_media_and_signaling_on_the_bound_http3_socket() -> Result<()>
                 _ => {}
             }
         }
+        packets_received
+            .send(())
+            .map_err(|_| anyhow::anyhow!("Missing relay release task"))?;
+        let mut unbind = relay.accept_stream().await?;
+        let headers = read_fixture_frame(&mut relay, &mut unbind, 1).await?;
+        let headers = QpackDecoder::new()
+            .decode_field_section(&headers)
+            .expect("valid release headers");
+        assert!(
+            headers
+                .iter()
+                .any(|field| field.name == b":path" && field.value == b"/QR/UnAllocBind")
+        );
+        assert_eq!(
+            read_fixture_frame(&mut relay, &mut unbind, 0).await?,
+            [0xb2, 1, 2, 8, 1]
+        );
+        assert_eq!(relay.read(&mut unbind, &mut end).await?, 0);
+        // Static :status 200 with a protobuf field 23 carrying an empty release acknowledgment.
+        relay
+            .write_all(&mut unbind, &[1, 3, 0, 0, 0xd9, 0, 3, 0xba, 1, 0])
+            .await?;
+        relay.finish_stream(&mut unbind)?;
         Ok::<_, anyhow::Error>(())
     };
 
@@ -481,6 +505,8 @@ async fn exchanges_media_and_signaling_on_the_bound_http3_socket() -> Result<()>
         binding
             .send_datagram(RelayDatagramChannel::Signaling, b"client signaling")
             .await?;
+        ready_to_unbind.await?;
+        require_send(binding.unbind()).await?;
         Ok::<_, anyhow::Error>(())
     };
     tokio::time::timeout(Duration::from_secs(5), async {

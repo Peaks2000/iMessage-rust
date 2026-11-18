@@ -222,13 +222,24 @@ fn remove_secret(reply: &mut Dictionary, field: &str) -> Option<Zeroizing<Vec<u8
 }
 
 #[cfg(test)]
-pub(in crate::apple) mod tests {
+pub(crate) mod tests {
     use super::*;
 
     pub(in crate::apple) const LOCAL: &str = "mailto:local@example.org";
     pub(in crate::apple) const CALLER: &str = "mailto:caller@example.org";
     pub(in crate::apple) const LOCAL_ID: u64 = 0x8000_0000_0000_0022;
     pub(in crate::apple) const CALLER_ID: u64 = 77;
+
+    pub(crate) fn parsed_allocation(call: Uuid) -> Result<CallRelayAllocation> {
+        let request = Uuid::new_v4();
+        CallRelayAllocation::parse(
+            allocation_fixture(request, call),
+            request,
+            call,
+            (LOCAL, &[1; 32]),
+            (CALLER, CallEndpoint::new([2; 32], Some(CALLER_ID))),
+        )
+    }
 
     pub(in crate::apple) fn allocation_fixture(request: Uuid, call: Uuid) -> Dictionary {
         let allocation = |id: u64, uri, token| {

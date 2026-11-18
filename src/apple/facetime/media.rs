@@ -48,6 +48,7 @@ impl PeerPrekey {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn same_as(&self, other: &Self) -> bool {
         self.encoded == other.encoded
     }

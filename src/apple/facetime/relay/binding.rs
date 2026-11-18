@@ -46,6 +46,24 @@ pub struct CallRelayBinding {
 }
 
 impl CallRelayBinding {
+    /// Release an established relay binding and close its socket.
+    pub async fn unbind(mut self) -> Result<()> {
+        let envelope = UnbindRequestEnvelope {
+            request: Some(UnbindRequest { reason: 1 }),
+        };
+        let response = self
+            .control
+            .put("/QR/UnAllocBind", &envelope.encode_to_vec())
+            .await?;
+        let response = UnbindResponseEnvelope::decode(response.as_slice())
+            .context("Invalid FaceTime relay release response")?;
+        ensure!(
+            response.response.is_some(),
+            "Missing FaceTime relay release response"
+        );
+        Ok(())
+    }
+
     /// Use the TLS exporter of the connection that authenticated and bound these channels.
     pub fn export_keying_material(&self, output: &mut [u8], label: &str) -> Result<()> {
         self.control.transport.export_keying_material(output, label)
@@ -295,6 +313,27 @@ struct BindEnvelope {
     #[prost(message, optional, tag = "2")]
     response: Option<BindResponse>,
 }
+
+#[derive(Message)]
+struct UnbindRequestEnvelope {
+    #[prost(message, optional, tag = "22")]
+    request: Option<UnbindRequest>,
+}
+
+#[derive(Message)]
+struct UnbindRequest {
+    #[prost(int32, tag = "1")]
+    reason: i32,
+}
+
+#[derive(Message)]
+struct UnbindResponseEnvelope {
+    #[prost(message, optional, tag = "23")]
+    response: Option<UnbindResponse>,
+}
+
+#[derive(Message)]
+struct UnbindResponse {}
 
 #[derive(Message)]
 struct BindRequest {

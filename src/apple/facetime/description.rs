@@ -160,7 +160,7 @@ fn description_key(key: &CallKey) -> Result<Zeroizing<[u8; 32]>> {
 
 impl CallMediaDescription {
     /// Parse an AVC plist received in an authenticated FaceTime signaling message.
-    pub(super) fn parse(bytes: &[u8], mode: Option<CallMode>) -> Result<Self> {
+    pub(crate) fn parse(bytes: &[u8], mode: Option<CallMode>) -> Result<Self> {
         ensure!(
             !bytes.is_empty() && bytes.len() <= LIMIT,
             "Invalid FaceTime AVC description length"
