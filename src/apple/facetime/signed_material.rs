@@ -5,18 +5,139 @@ use openssl::{
     ecdsa::EcdsaSig,
     hash::MessageDigest,
     nid::Nid,
-    pkey::{PKey, Public},
-    sign::Verifier,
+    pkey::{PKey, Private, Public},
+    rand::rand_bytes,
+    sign::{Signer, Verifier},
 };
 use plist::Data;
 use prost::Message;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
 const KEYING_CONTEXT: &[u8] = b"com.apple.FaceTime.QRKeying";
 const MAX_DIRECTORY_KEY: usize = 1024;
 const MAX_KEY_MATERIAL: usize = 4096;
+const KT_VERSION: u32 = 5;
+
+#[derive(Clone)]
+pub(crate) struct SignedRelayPrekey {
+    pub(super) call: Uuid,
+    pub(super) material_id: [u8; 20],
+    pub(super) contents: Vec<u8>,
+}
+
+/// The device signing key registered with IDS for the FaceTime services.
+#[derive(Clone)]
+pub(in crate::apple) struct RelaySigningKey(PKey<Private>);
+
+impl RelaySigningKey {
+    pub(in crate::apple) fn generate() -> Result<Self> {
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
+        loop {
+            let key = EcKey::generate(&group)?;
+            if compact_x(&key)?.is_some() {
+                return Ok(Self(PKey::from_ec_key(key)?));
+            }
+        }
+    }
+
+    pub(in crate::apple) fn from_der(der: &[u8]) -> Result<Self> {
+        ensure!(
+            der.len() <= MAX_DIRECTORY_KEY,
+            "Invalid FaceTime device key length"
+        );
+        let key = PKey::private_key_from_der(der)?;
+        let ec = key.ec_key()?;
+        ensure!(
+            ec.group().curve_name() == Some(Nid::X9_62_PRIME256V1) && compact_x(&ec)?.is_some(),
+            "Invalid compact FaceTime signing key"
+        );
+        ec.check_key()?;
+        Ok(Self(key))
+    }
+
+    pub(in crate::apple) fn private_der(&self) -> Result<Zeroizing<Vec<u8>>> {
+        Ok(Zeroizing::new(self.0.private_key_to_der()?))
+    }
+
+    pub(in crate::apple) fn same_key(&self, other: &Self) -> bool {
+        self.0.public_eq(&other.0)
+    }
+
+    pub(in crate::apple) fn directory_data(&self) -> Result<Vec<u8>> {
+        let x = compact_x(&self.0.ec_key()?)?.context("Invalid compact FaceTime signing key")?;
+        Ok(DirectoryIdentity {
+            device: Some(DirectoryDevice { x }),
+            kt_version: Some(KT_VERSION),
+        }
+        .encode_to_vec())
+    }
+
+    pub(in crate::apple) fn sign_prekey(
+        &self,
+        call: Uuid,
+        prekey: &[u8; 65],
+    ) -> Result<SignedRelayPrekey> {
+        let mut payload = Vec::new();
+        plist::to_writer_binary(
+            &mut payload,
+            &plist::Dictionary::from_iter([
+                ("public-prekey", plist::Value::Data(prekey.to_vec())),
+                ("wrap-mode", 1.into()),
+                ("creation-date", (crate::now_ms() as f64 / 1_000.).into()),
+            ]),
+        )?;
+        let mut material_id = [0; 20];
+        rand_bytes(&mut material_id)?;
+        Ok(SignedRelayPrekey {
+            call,
+            material_id,
+            contents: sign_material(&self.0, call, payload)?,
+        })
+    }
+}
+
+fn compact_x(key: &EcKey<Private>) -> Result<Option<Vec<u8>>> {
+    let mut ctx = BigNumContext::new()?;
+    let (mut x, mut y, mut prime, mut a, mut b) = (
+        BigNum::new()?,
+        BigNum::new()?,
+        BigNum::new()?,
+        BigNum::new()?,
+        BigNum::new()?,
+    );
+    let group = key.group();
+    group.components_gfp(&mut prime, &mut a, &mut b, &mut ctx)?;
+    key.public_key()
+        .affine_coordinates_gfp(group, &mut x, &mut y, &mut ctx)?;
+    y.mul_word(2)?;
+    if y > prime {
+        return Ok(None);
+    }
+    Ok(Some(x.to_vec_padded(32)?))
+}
+
+fn sign_material(key: &PKey<Private>, call: Uuid, payload: Vec<u8>) -> Result<Vec<u8>> {
+    let session = call.to_string().to_ascii_uppercase();
+    let mut signer = Signer::new(MessageDigest::sha256(), key)?;
+    signer.update(KEYING_CONTEXT)?;
+    signer.update(session.as_bytes())?;
+    signer.update(&payload)?;
+    let signature = EcdsaSig::from_der(&signer.sign_to_vec()?)?;
+    let mut raw = signature.r().to_vec_padded(32)?;
+    raw.extend_from_slice(&signature.s().to_vec_padded(32)?);
+    let mut bytes = Vec::new();
+    plist::to_writer_binary(
+        &mut bytes,
+        &SignedMaterial {
+            session,
+            payload: Data::new(payload),
+            signature: Data::new(raw),
+        },
+    )?;
+    Ok(bytes)
+}
 
 /// The device signing key from an authenticated IDS reply for one exact push token.
 #[derive(Clone)]
@@ -90,6 +211,8 @@ impl PeerDeviceKey {
 struct DirectoryIdentity {
     #[prost(message, optional, tag = "1")]
     device: Option<DirectoryDevice>,
+    #[prost(uint32, optional, tag = "3")]
+    kt_version: Option<u32>,
 }
 
 #[derive(Message)]
@@ -98,7 +221,7 @@ struct DirectoryDevice {
     x: Vec<u8>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct SignedMaterial {
     #[serde(rename = "sessionID")]
     session: String,
@@ -109,7 +232,6 @@ struct SignedMaterial {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use openssl::{pkey::Private, sign::Signer};
     use plist::{Dictionary, Value};
 
     pub(crate) fn fixture_signer() -> Result<(PKey<Private>, PeerDeviceKey)> {
@@ -123,6 +245,7 @@ pub(super) mod tests {
             device: Some(DirectoryDevice {
                 x: hex::decode("6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296")?,
             }),
+            kt_version: None,
         };
         Ok((
             private,
@@ -131,22 +254,7 @@ pub(super) mod tests {
     }
 
     pub(crate) fn signed_key(key: &PKey<Private>, call: Uuid, payload: &[u8]) -> Result<Vec<u8>> {
-        let call = call.to_string().to_ascii_uppercase();
-        let mut signer = Signer::new(MessageDigest::sha256(), key)?;
-        signer.update(b"com.apple.FaceTime.QRKeying")?;
-        signer.update(call.as_bytes())?;
-        signer.update(payload)?;
-        let der = EcdsaSig::from_der(&signer.sign_to_vec()?)?;
-        let mut raw = der.r().to_vec_padded(32)?;
-        raw.extend_from_slice(&der.s().to_vec_padded(32)?);
-        let fields = Dictionary::from_iter([
-            ("sessionID", Value::String(call)),
-            ("payload", Value::Data(payload.to_vec())),
-            ("signature", Value::Data(raw)),
-        ]);
-        let mut bytes = Vec::new();
-        plist::to_writer_binary(&mut bytes, &fields)?;
-        Ok(bytes)
+        sign_material(key, call, payload.to_vec())
     }
 
     #[test]

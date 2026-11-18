@@ -9,7 +9,7 @@ use crate::{
     address,
     apple::{
         CallSignal, LocalCallPrekey, OutgoingCallTargets, OutgoingRelay, PeerKeyOffer, PeerPrekey,
-        RING_TIMEOUT_MS, RingingRelay,
+        RING_TIMEOUT_MS, RingingRelay, SignedRelayPrekey,
     },
 };
 
@@ -24,6 +24,7 @@ pub(in crate::engine) struct OutgoingAttempt {
     _cancel: oneshot::Sender<()>,
     progress: watch::Receiver<OutgoingProgress>,
     relay: Arc<OutgoingRelay>,
+    relay_prekey: Option<SignedRelayPrekey>,
 }
 
 #[derive(Clone)]
@@ -331,6 +332,7 @@ impl IncomingCalls {
             expires_ms: received_ms + RING_TIMEOUT_MS,
         };
         let local = LocalCallPrekey::generate()?;
+        let relay_prekey = identity.sign_relay_prekey(call.id, local.public())?;
         let targets = tokio::select! {
             biased;
             _ = reply.closed() => anyhow::bail!("The FaceTime call was canceled"),
@@ -356,6 +358,7 @@ impl IncomingCalls {
             _cancel: hangup,
             progress,
             relay,
+            relay_prekey,
         })
     }
 
@@ -492,12 +495,13 @@ impl Engine {
             _cancel,
             progress,
             relay,
+            relay_prekey,
         } = attempt
             .await
             .context("The Apple engine stopped while placing the call")??;
         let mut pending_relay = timeout(
             MEDIA_SETUP_TIMEOUT,
-            relay.bind_for_ringing(config.relay_profile),
+            relay.bind_for_ringing(config.relay_profile, relay_prekey),
         )
         .await
         .context("The FaceTime relay did not bind before ringing")??;

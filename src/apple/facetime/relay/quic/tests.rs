@@ -137,6 +137,7 @@ fn loopback_listener() -> Result<Option<(SocketAddr, CallRelayConnection, Listen
             keys,
             call: test_call(),
             device_key: None,
+            local_prekey: None,
         },
         accept_connection,
     )))
@@ -309,7 +310,10 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
         CallMode, IncomingCall,
         apple::{
             CallEndpoint, CallMediaExchange, LocalCallPrekey, PeerPrekey,
-            facetime::signed_material::tests::{fixture_signer, signed_key},
+            facetime::{
+                PeerDeviceKey, RelaySigningKey,
+                signed_material::tests::{fixture_signer, signed_key},
+            },
         },
     };
 
@@ -372,6 +376,11 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
         expires_ms: 45_001,
     };
     let local_prekey = LocalCallPrekey::generate()?;
+    let local_public = *local_prekey.public();
+    let relay_signer = RelaySigningKey::generate()?;
+    let local_relay_prekey = relay_signer.sign_prekey(description::CALL, &local_public)?;
+    let local_relay_id = local_relay_prekey.material_id;
+    let our_directory_key = PeerDeviceKey::from_directory(&relay_signer.directory_data()?)?;
     let remote = CallMediaExchange::prepare(
         call.clone(),
         &[],
@@ -436,7 +445,20 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
         let request = TestBindEnvelope::decode(body.as_slice())?
             .request
             .context("Missing AllocBind request")?;
-        assert!(request.materials.is_empty());
+        let [publication] = request.materials.as_slice() else {
+            anyhow::bail!("Missing local relay prekey publication");
+        };
+        assert_eq!(
+            (publication.owner, publication.receiver),
+            (Some(0), Some(0))
+        );
+        let [entry] = publication.entries.as_slice() else {
+            anyhow::bail!("Missing local relay prekey");
+        };
+        assert_eq!(entry.id, local_relay_id);
+        assert_eq!(entry.kind, 11);
+        let signed = our_directory_key.verify_material(description::CALL, &entry.ciphertext)?;
+        assert!(PeerPrekey::from_relay(&signed)?.same_as(&PeerPrekey::parse(1, &local_public)?));
         assert_eq!(request.connections.len(), 2);
         let response = TestBindEnvelope {
             request: None,
@@ -588,7 +610,7 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
         fixture_response(&mut relay, release, &[0xba, 1, 0]).await
     };
     let client = async {
-        let wire = CallRelayConnection::connect(
+        let mut wire = CallRelayConnection::connect(
             endpoint,
             test_keys(),
             RelayCall {
@@ -597,6 +619,7 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
             },
         )
         .await?;
+        wire.local_prekey = Some(local_relay_prekey);
         let profile = CallRelayProfile {
             os_version: "testOS,0.0,fixture",
             hardware_version: "fixture",
@@ -613,6 +636,7 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
             token: Zeroizing::default(),
             shared_key: Zeroizing::default(),
             device_key: Some(verification),
+            local_prekey: None,
         };
         assert!(waiting.select_peer(other, &allocation).is_err());
         waiting.select_peer(answered, &allocation)?;

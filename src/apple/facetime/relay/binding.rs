@@ -451,7 +451,7 @@ impl CallRelayConnection {
     async fn bind_channels(
         mut self,
         profile: CallRelayProfile<'_>,
-        materials: Vec<Material>,
+        mut materials: Vec<Material>,
     ) -> Result<CallRelayBinding> {
         ensure!(
             !profile.os_version.is_empty()
@@ -460,6 +460,21 @@ impl CallRelayConnection {
                 && profile.hardware_version.len() <= 128,
             "Invalid FaceTime relay device profile"
         );
+        if let Some(prekey) = self.local_prekey.take() {
+            ensure!(
+                prekey.call == self.call.id,
+                "FaceTime relay prekey belongs to another call"
+            );
+            materials.push(Material {
+                owner: Some(0),
+                receiver: Some(0),
+                entries: vec![MaterialInfo {
+                    id: prekey.material_id.to_vec(),
+                    kind: PREKEY_MATERIAL,
+                    content: prekey.contents,
+                }],
+            });
+        }
         let avc = new_connection_id(AVC)?;
         let ids = new_connection_id(IDS)?;
         // The relay may send its first datagram as soon as it writes the binding

@@ -209,6 +209,7 @@ pub struct CallRelayConnection {
     keys: CallRelayKeys,
     pub(super) call: RelayCall,
     pub(super) device_key: Option<super::PeerDeviceKey>,
+    pub(super) local_prekey: Option<super::SignedRelayPrekey>,
 }
 
 pub struct CallRelayStream {
@@ -236,6 +237,7 @@ impl CallRelayAllocation {
         )
         .await?;
         connection.device_key = self.device_key.clone();
+        connection.local_prekey = self.local_prekey.clone();
         Ok(connection)
     }
 }
@@ -297,6 +299,7 @@ impl CallRelayConnection {
             keys,
             call,
             device_key: None,
+            local_prekey: None,
         };
         connection
             .retry(HANDSHAKE_TIMEOUT, |ssl| {

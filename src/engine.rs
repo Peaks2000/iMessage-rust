@@ -29,7 +29,8 @@ use crate::{
 use crate::{
     apple::{
         CallEndpoint, CallKeyOffer, CallMediaExchange, CallMediaHandshake, CallRelayAllocation,
-        CallSignal, Identity, Incoming, Madrid, Notification, PeerMediaOffer, PeerPrekey,
+        CallSignal, Identity, Incoming, LocalCallPrekey, Madrid, Notification, PeerMediaOffer,
+        PeerPrekey,
     },
     history::History,
 };
@@ -627,6 +628,7 @@ struct IncomingCallDetails {
     endpoint: CallEndpoint,
     description: Option<Vec<u8>>,
     prekey: Option<PeerPrekey>,
+    local_prekey: Option<LocalCallPrekey>,
     exchange: Option<CallMediaExchange>,
     relay: Option<Arc<CallRelayAllocation>>,
     offer: Option<Arc<CallKeyOffer>>,
@@ -659,22 +661,39 @@ impl IncomingCallDetails {
 
 impl IncomingCalls {
     async fn request_relay(
-        &self,
+        &mut self,
         identity: &Identity,
         madrid: &mut Madrid,
         status: &watch::Sender<Status>,
         id: uuid::Uuid,
     ) -> Result<Arc<CallRelayAllocation>> {
         let call = active_call(&status.borrow(), id)?.clone();
-        let details = self.details.get(&id).context("Missing caller details")?;
+        let details = self
+            .details
+            .get_mut(&id)
+            .context("Missing caller details")?;
         if let Some(relay) = &details.relay {
             return Ok(relay.clone());
         }
-        Ok(Arc::new(
-            madrid
-                .allocate_call_relay(identity, &call, details.endpoint)
-                .await?,
-        ))
+        let mut relay = madrid
+            .allocate_call_relay(identity, &call, details.endpoint)
+            .await?;
+        if identity.can_sign_relay_prekey() {
+            let public = if let Some(exchange) = &details.exchange {
+                exchange.handshake.public_prekey()
+            } else {
+                if details.local_prekey.is_none() {
+                    details.local_prekey = Some(LocalCallPrekey::generate()?);
+                }
+                details
+                    .local_prekey
+                    .as_ref()
+                    .context("Missing local FaceTime prekey")?
+                    .public()
+            };
+            relay.local_prekey = identity.sign_relay_prekey(id, public)?;
+        }
+        Ok(Arc::new(relay))
     }
 
     async fn publish_keys(
@@ -766,7 +785,11 @@ impl IncomingCalls {
             .prekey
             .as_ref()
             .context("The caller has not sent a supported media prekey")?;
-        let exchange = CallMediaExchange::prepare(call.clone(), description, prekey)?;
+        let exchange = if let Some(local) = details.local_prekey.take() {
+            CallMediaExchange::with_prekey(call.clone(), description, prekey, local)
+        } else {
+            CallMediaExchange::prepare(call.clone(), description, prekey)?
+        };
         let handshake = exchange.handshake.clone();
         details.exchange = Some(exchange);
         Ok(handshake)
@@ -820,6 +843,7 @@ impl IncomingCalls {
                         endpoint,
                         description: None,
                         prekey: None,
+                        local_prekey: None,
                         exchange: None,
                         relay: None,
                         offer: None,

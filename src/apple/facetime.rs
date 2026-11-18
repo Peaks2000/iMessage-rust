@@ -28,7 +28,8 @@ pub use relay::{
     CallRelayStream, RelayChannel, RelayDatagramChannel, RelayStreamDirection,
 };
 pub(crate) use relay::{OutgoingRelay, RelayPeerUpdate, RingingRelay};
-pub(crate) use signed_material::PeerDeviceKey;
+pub(super) use signed_material::RelaySigningKey;
+pub(crate) use signed_material::{PeerDeviceKey, SignedRelayPrekey};
 pub(crate) use srtp::CallRtpProtection;
 #[cfg(feature = "desktop")]
 pub(crate) use srtp::RtpHeader;

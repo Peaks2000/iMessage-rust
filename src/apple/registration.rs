@@ -197,6 +197,20 @@ async fn register_at(
     };
     let pair = KeyPair::private(&signing_bytes, &encryption_bytes)?;
     let public_identity = pair.public_der()?;
+    let relay_signing = if existing.is_some() || registration.include_facetime {
+        Some(
+            match existing.and_then(|identity| identity.facetime_relay_signing.clone()) {
+                Some(signing) => signing,
+                None => facetime::RelaySigningKey::generate()?,
+            },
+        )
+    } else {
+        None
+    };
+    let relay_directory = relay_signing
+        .as_ref()
+        .map(facetime::RelaySigningKey::directory_data)
+        .transpose()?;
 
     let submit = async |registration: &DeviceRegistration, services| {
         let document = registration_document(
@@ -204,6 +218,7 @@ async fn register_at(
             &auth.user_id,
             &handle,
             &public_identity,
+            relay_directory.as_deref(),
             services,
         );
         let body = plist_xml_gzip(&document)?;
@@ -300,6 +315,16 @@ async fn register_at(
             result => result?,
         }
     };
+    let facetime_relay_signing_private_key =
+        if facetime_certificates.contains_key(facetime::SIGNALING) {
+            relay_signing
+                .as_ref()
+                .map(facetime::RelaySigningKey::private_der)
+                .transpose()?
+                .map(|bytes| Data::new(bytes.to_vec()))
+        } else {
+            None
+        };
     let session = Session {
         version: 1,
         handle,
@@ -309,6 +334,7 @@ async fn register_at(
         ids_certificate: cert,
         ids_private_key: Data::new(auth.key.private_key_to_der()?),
         facetime_certificates,
+        facetime_relay_signing_private_key,
         signing_private_key: Data::new(signing_bytes.to_vec()),
         encryption_private_key: Data::new(encryption_bytes.to_vec()),
         protocol_version: existing.map_or(registration.protocol_version, |identity| {
@@ -337,6 +363,7 @@ fn registration_document(
     user_id: &str,
     handle: &str,
     public_identity: &[u8],
+    relay_directory: Option<&[u8]>,
     services: Services,
 ) -> Value {
     let map = |fields: &[(&str, Value)]| {
@@ -355,7 +382,7 @@ fn registration_document(
         ("public-message-identity-version", 2.into()),
         ("ec-version", 1.into()),
     ]);
-    let account = map(&[
+    let mut account = Dictionary::from_iter([
         ("user-id", user_id.into()),
         ("uris", Value::Array(vec![map(&[("uri", handle.into())])])),
         ("client-data", client_data),
@@ -378,9 +405,21 @@ fn registration_document(
     };
     let mut requested = Vec::new();
     if !matches!(services, Services::FaceTime) {
-        requested.push(service(TOPIC, &[], "Messenger", 17, account.clone()));
+        requested.push(service(
+            TOPIC,
+            &[],
+            "Messenger",
+            17,
+            Value::Dictionary(account.clone()),
+        ));
     }
     if !matches!(services, Services::Messages) {
+        if let Some(directory) = relay_directory {
+            // Advertise only the device identity used for relay signatures. IDS signaling
+            // continues to use the legacy encryption identity above.
+            account.insert("kt-loggable-data".into(), Value::Data(directory.to_vec()));
+        }
+        let account = Value::Dictionary(account);
         requested.extend([
             service(facetime::SIGNALING, &[], "Invitation", 1, account.clone()),
             service(
@@ -707,6 +746,12 @@ mod tests {
             .collect()
     }
 
+    fn advertised_relay_key(document: &Dictionary, service: usize) -> Option<&[u8]> {
+        let service = document["services"].as_array()?[service].as_dictionary()?;
+        let user = service["users"].as_array()?.first()?.as_dictionary()?;
+        user.get("kt-loggable-data")?.as_data()
+    }
+
     #[tokio::test]
     async fn enabling_face_time_reuses_the_original_keys_and_never_reregisters_messages()
     -> Result<()> {
@@ -726,6 +771,7 @@ mod tests {
             ids_certificate: messages_cert.clone(),
             ids_private_key: Data::new(ids_key.private_key_to_der()?),
             facetime_certificates: BTreeMap::new(),
+            facetime_relay_signing_private_key: None,
             signing_private_key: Data::new(signing.private_key_to_der()?),
             encryption_private_key: Data::new(encryption.private_key_to_der()?),
             protocol_version: 1650,
@@ -773,6 +819,12 @@ mod tests {
                 Some(&previous),
             )
             .await;
+            let (headers, payload) = captured.try_recv()?;
+            let (document, advertised_key) =
+                request_identity(&headers, &payload, &push_key, &ids_key)?;
+            let advertised_relay_key =
+                advertised_relay_key(&document, 0).context("Missing FaceTime device key")?;
+            facetime::PeerDeviceKey::from_directory(advertised_relay_key)?;
             if index == 0 {
                 let upgraded = Identity::parse(&result?)?;
                 assert!(upgraded.same_messaging_registration(&previous)?);
@@ -789,12 +841,13 @@ mod tests {
                     upgraded.ids_certificate(facetime::VIDEO),
                     Some(face_time.as_ref())
                 );
+                let signer = upgraded
+                    .facetime_relay_signing
+                    .context("Missing persisted FaceTime relay key")?;
+                assert_eq!(signer.directory_data()?.as_slice(), advertised_relay_key);
             } else {
                 assert!(result.is_err());
             }
-            let (headers, payload) = captured.try_recv()?;
-            let (document, advertised_key) =
-                request_identity(&headers, &payload, &push_key, &ids_key)?;
             assert_eq!(
                 service_names(&document),
                 [facetime::SIGNALING, facetime::VIDEO_SERVICE]
@@ -913,6 +966,9 @@ mod tests {
             );
             let (headers, body) = captured.try_recv()?;
             let (initial, initial_key) = request_identity(&headers, &body, &push_key, &auth_key)?;
+            assert_eq!(identity.can_sign_relay_prekey(), face_time_granted);
+            assert!(advertised_relay_key(&initial, 0).is_none());
+            assert!(advertised_relay_key(&initial, 1).is_some());
             assert_eq!(
                 service_names(&initial),
                 [TOPIC, facetime::SIGNALING, facetime::VIDEO_SERVICE]
@@ -926,6 +982,7 @@ mod tests {
                 let (retry, retry_key) =
                     request_identity(&retry_headers, &body, &push_key, &auth_key)?;
                 assert_eq!(service_names(&retry), [TOPIC]);
+                assert!(advertised_relay_key(&retry, 0).is_none());
                 assert_eq!(retry_key, initial_key);
                 assert_eq!(
                     retry["validation-data"].as_data(),

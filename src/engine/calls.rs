@@ -718,18 +718,24 @@ mod tests {
                 .resolve_answer_media(&reader.borrow(), id, &attempt.lease, Some(prekey.clone()))
                 .is_err()
         );
-        incoming.details.get_mut(&id).unwrap().relay = Some(receipt.relay.clone());
+        let local = crate::apple::LocalCallPrekey::generate()?;
+        let published = *local.public();
+        let details = incoming
+            .details
+            .get_mut(&id)
+            .context("Missing caller details")?;
+        details.relay = Some(receipt.relay.clone());
+        details.local_prekey = Some(local);
         let forged_lease = Arc::new(AnswerLease { id });
         assert!(
             incoming
                 .resolve_answer_media(&reader.borrow(), id, &forged_lease, Some(prekey.clone()))
                 .is_err()
         );
-        assert!(
-            incoming
-                .resolve_answer_media(&reader.borrow(), id, &attempt.lease, Some(prekey.clone()))?
-                .is_some()
-        );
+        let handshake = incoming
+            .resolve_answer_media(&reader.borrow(), id, &attempt.lease, Some(prekey.clone()))?
+            .context("Missing answer handshake")?;
+        assert_eq!(*handshake.public_prekey(), published);
         let mut lifetime = incoming.finish_answer(&status, &receipt)?;
         drop(attempt);
         assert!(reader.borrow().incoming_calls.is_empty());

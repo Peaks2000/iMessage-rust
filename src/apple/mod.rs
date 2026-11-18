@@ -46,6 +46,7 @@ pub use facetime::{
 pub(crate) use facetime::{
     CallEndpoint, CallMediaExchange, CallRtpProtection, CallSignal, LocalCallPrekey, OutgoingRelay,
     PeerKeyOffer, PeerMediaOffer, PeerPrekey, RING_TIMEOUT_MS, RelayPeerUpdate, RingingRelay,
+    SignedRelayPrekey,
 };
 pub(crate) use madrid::{Incoming, Madrid, Notification, OutgoingCallTargets};
 use openssl::{
@@ -71,6 +72,7 @@ pub struct Identity {
     ids_cert: Vec<u8>,
     ids_key: PKey<Private>,
     facetime_certificates: std::collections::BTreeMap<String, Vec<u8>>,
+    facetime_relay_signing: Option<facetime::RelaySigningKey>,
     message_keys: crypto::KeyPair<Private>,
     protocol_version: u32,
     user_agent: String,
@@ -88,6 +90,8 @@ struct Session {
     ids_private_key: Data,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     facetime_certificates: std::collections::BTreeMap<String, Data>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    facetime_relay_signing_private_key: Option<Data>,
     signing_private_key: Data,
     encryption_private_key: Data,
     protocol_version: u32,
@@ -98,6 +102,9 @@ impl Drop for Session {
     fn drop(&mut self) {
         // plist::Data has no mutable accessor, so take ownership before clearing the bytes.
         use zeroize::Zeroize;
+        if let Some(secret) = self.facetime_relay_signing_private_key.take() {
+            Vec::from(secret).zeroize();
+        }
         for field in [
             &mut self.push_token,
             &mut self.push_private_key,
@@ -114,6 +121,21 @@ impl Drop for Session {
 impl Identity {
     pub fn facetime_registered(&self) -> bool {
         self.ids_certificate(facetime::SIGNALING).is_some()
+    }
+
+    pub(crate) fn can_sign_relay_prekey(&self) -> bool {
+        self.facetime_relay_signing.is_some()
+    }
+
+    pub(crate) fn sign_relay_prekey(
+        &self,
+        call: uuid::Uuid,
+        prekey: &[u8; 65],
+    ) -> Result<Option<SignedRelayPrekey>> {
+        self.facetime_relay_signing
+            .as_ref()
+            .map(|key| key.sign_prekey(call, prekey))
+            .transpose()
     }
 
     #[cfg(feature = "desktop")]
@@ -139,6 +161,11 @@ impl Identity {
 
     pub(crate) fn same_facetime_registration(&self, other: &Self) -> bool {
         self.facetime_certificates == other.facetime_certificates
+            && match (&self.facetime_relay_signing, &other.facetime_relay_signing) {
+                (Some(first), Some(second)) => first.same_key(second),
+                (None, None) => true,
+                _ => false,
+            }
     }
 
     pub fn parse(bytes: &[u8]) -> Result<Self> {
@@ -183,6 +210,17 @@ impl Identity {
             );
             facetime_certificates.insert(service.clone(), certificate.as_ref().to_vec());
         }
+        let facetime_relay_signing = session
+            .facetime_relay_signing_private_key
+            .as_ref()
+            .map(|key| facetime::RelaySigningKey::from_der(key.as_ref()))
+            .transpose()
+            .context("Invalid FaceTime relay device key")?;
+        ensure!(
+            facetime_relay_signing.is_none()
+                || facetime_certificates.contains_key(facetime::SIGNALING),
+            "FaceTime relay key requires a calling registration"
+        );
         Ok(Self {
             handle: address(&session.handle)?,
             token,
@@ -192,6 +230,7 @@ impl Identity {
             ids_cert: session.ids_certificate.as_ref().to_vec(),
             ids_key,
             facetime_certificates,
+            facetime_relay_signing,
             message_keys,
             protocol_version: session.protocol_version,
             user_agent: session.user_agent.clone(),

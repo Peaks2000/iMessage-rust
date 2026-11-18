@@ -15,7 +15,9 @@ use zeroize::Zeroizing;
 
 use crate::address;
 
-use super::{CallEndpoint, PeerDeviceKey, SIGNALING, media::hkdf, participant_id};
+use super::{
+    CallEndpoint, PeerDeviceKey, SIGNALING, SignedRelayPrekey, media::hkdf, participant_id,
+};
 
 pub use binding::{CallRelayBinding, CallRelayProfile, RelayChannel};
 pub(crate) use binding::{RelayPeerUpdate, RingingRelay};
@@ -73,6 +75,7 @@ pub struct CallRelayAllocation {
     token: Zeroizing<Vec<u8>>,
     shared_key: Zeroizing<Vec<u8>>,
     device_key: Option<PeerDeviceKey>,
+    pub(crate) local_prekey: Option<SignedRelayPrekey>,
 }
 
 struct RelayGrant {
@@ -168,6 +171,7 @@ impl RelayGrant {
             token: self.token.clone(),
             shared_key: self.shared_key.clone(),
             device_key: None,
+            local_prekey: None,
         }
     }
 }
@@ -256,8 +260,11 @@ impl OutgoingRelay {
     pub(crate) async fn bind_for_ringing(
         &self,
         profile: CallRelayProfile<'_>,
+        local_prekey: Option<SignedRelayPrekey>,
     ) -> Result<RingingRelay> {
-        let connection = self.grant.for_peer(0).connect().await?;
+        let mut allocation = self.grant.for_peer(0);
+        allocation.local_prekey = local_prekey;
+        let connection = allocation.connect().await?;
         RingingRelay::bind(connection, profile, self.endpoints.clone()).await
     }
 

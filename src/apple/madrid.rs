@@ -1458,6 +1458,7 @@ mod tests {
             ids_cert: Vec::new(),
             ids_key: PKey::from_rsa(rsa)?,
             facetime_certificates: [(facetime::SIGNALING.to_owned(), b"fixture".to_vec())].into(),
+            facetime_relay_signing: None,
             message_keys: KeyPair::private(
                 &signing.private_key_to_der()?,
                 &Rsa::generate(1280)?.private_key_to_der()?,
