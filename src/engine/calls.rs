@@ -1,8 +1,13 @@
-use std::{future::pending, sync::Arc, time::Duration};
+use std::{
+    future::{Future, pending},
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, ensure};
 use tokio::{
-    sync::{oneshot, watch},
+    sync::{mpsc, oneshot, watch},
     time::timeout,
 };
 use uuid::Uuid;
@@ -22,7 +27,8 @@ use crate::{
     apple::{
         CallAvcMaterial, CallEndpoint, CallKeyOffer, CallMediaDescription, CallMediaExchange,
         CallMediaHandshake, CallPeerKeys, CallRelayAllocation, CallRelayBinding, CallRelayProfile,
-        CallRtpProtection, Identity, Madrid, PeerPrekey, RelayPeerUpdate, SignedRelayKeys,
+        CallRtpProtection, Identity, Madrid, PeerKeyOffer, PeerPrekey, RelayMediaEvent,
+        RelayPeerUpdate, SignedRelayKeys,
     },
     now_ms,
 };
@@ -62,10 +68,14 @@ pub struct AnsweredCall {
     peer_keys: watch::Receiver<CallPeerKeys>,
     lifetime: AnswerLifetime,
     rtp: CallRtpProtection,
+    requests: mpsc::Sender<Request>,
+    installing_key: Option<RelayKeyInstall>,
 }
 
+type RelayKeyInstall = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+
 impl AnsweredCall {
-    /// Updates carry only keys received from the device that initiated this call.
+    /// Updates carry keys from the authenticated device on this call.
     pub fn watch_peer_keys(&self) -> watch::Receiver<CallPeerKeys> {
         self.peer_keys.clone()
     }
@@ -109,16 +119,38 @@ impl AnsweredCall {
         }
     }
 
-    /// Receive the caller's authenticated RTP, skipping invalid and replayed packets.
+    /// Receive authenticated RTP and install signed media keys as the other device rotates them.
     pub async fn receive_rtp(&mut self) -> Result<Zeroizing<Vec<u8>>> {
         loop {
-            let protected = tokio::select! {
+            if let Some(install) = &mut self.installing_key {
+                let result = tokio::select! {
+                    biased;
+                    _ = self.lifetime.ended.changed() => Err(anyhow::anyhow!("This FaceTime call has ended")),
+                    result = install => result,
+                };
+                self.installing_key = None;
+                result?;
+            }
+            let event = tokio::select! {
                 biased;
                 _ = self.lifetime.ended.changed() => anyhow::bail!("This FaceTime call has ended"),
-                result = self.relay.receive_routed_rtp() => result?,
+                result = self.relay.receive_media_event() => result?,
             };
-            if let Some(clear) = self.open_rtp(&protected)? {
-                return Ok(clear);
+            match event {
+                RelayMediaEvent::Keys(offer) => {
+                    // The desktop can interrupt this read to send audio or video. Keep the
+                    // in-flight installation so cancellation cannot lose a key or its receipt.
+                    self.installing_key = Some(Box::pin(install_relay_keys(
+                        self.requests.clone(),
+                        self.call.id,
+                        offer,
+                    )));
+                }
+                RelayMediaEvent::Rtp(protected) => {
+                    if let Some(clear) = self.open_rtp(&protected)? {
+                        return Ok(clear);
+                    }
+                }
             }
         }
     }
@@ -476,6 +508,8 @@ async fn complete_media(
         peer_keys,
         lifetime,
         rtp,
+        requests: engine.requests.clone(),
+        installing_key: None,
     })
 }
 
@@ -509,8 +543,7 @@ async fn wait_for_media(
                 match result {
                     Ok(Some(RelayPeerUpdate::Description)) => (),
                     Ok(Some(RelayPeerUpdate::Keys(offer))) => {
-                        engine.requests.send(Request::InstallRelayKeys { id: handshake.call().id, offer })
-                            .await.context("The Apple engine stopped while installing FaceTime keys")?;
+                        install_relay_keys(engine.requests.clone(), handshake.call().id, offer).await?;
                     }
                     Ok(None) => indications_open = false,
                     Err(_) if signed_description.is_some() => indications_open = false,
@@ -519,6 +552,21 @@ async fn wait_for_media(
             }
         }
     }
+}
+
+async fn install_relay_keys(
+    requests: mpsc::Sender<Request>,
+    id: Uuid,
+    offer: Box<PeerKeyOffer>,
+) -> Result<()> {
+    let (reply, receipt) = oneshot::channel();
+    requests
+        .send(Request::InstallRelayKeys { id, offer, reply })
+        .await
+        .context("The Apple engine stopped while installing FaceTime keys")?;
+    receipt
+        .await
+        .context("The Apple engine stopped before installing FaceTime keys")
 }
 
 impl IncomingCalls {

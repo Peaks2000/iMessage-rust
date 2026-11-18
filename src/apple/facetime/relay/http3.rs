@@ -20,6 +20,7 @@ use super::{
 };
 
 mod indications;
+pub(super) use indications::IndicationRead;
 use indications::Indications;
 
 const HEADERS: u64 = 1;
@@ -108,11 +109,22 @@ impl RelayHttp3 {
     }
 
     pub(super) async fn next_indication(&mut self) -> Result<Option<Bytes>> {
+        loop {
+            match self.poll_indication()? {
+                IndicationRead::Message(message) => return Ok(Some(message)),
+                IndicationRead::Progress => tokio::task::consume_budget().await,
+                IndicationRead::Pending => self.transport.wait_for_progress().await?,
+                IndicationRead::Closed => return Ok(None),
+            }
+        }
+    }
+
+    pub(super) fn poll_indication(&mut self) -> Result<IndicationRead> {
         let Some(indications) = self.indications.as_mut() else {
-            return Ok(None);
+            return Ok(IndicationRead::Closed);
         };
-        let result = indications.next(&mut self.transport).await;
-        if !matches!(result, Ok(Some(_))) {
+        let result = indications.poll_message(&mut self.transport);
+        if matches!(result, Ok(IndicationRead::Closed) | Err(_)) {
             self.indications = None;
         }
         result

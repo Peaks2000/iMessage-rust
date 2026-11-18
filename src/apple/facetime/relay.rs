@@ -20,7 +20,7 @@ use super::{
 };
 
 pub use binding::{CallRelayBinding, CallRelayProfile, RelayChannel};
-pub(crate) use binding::{RelayPeerUpdate, RingingRelay};
+pub(crate) use binding::{RelayMediaEvent, RelayPeerUpdate, RingingRelay};
 pub use pod::RelayDatagramChannel;
 pub use quic::{CallRelayConnection, CallRelayStream, RelayStreamDirection};
 

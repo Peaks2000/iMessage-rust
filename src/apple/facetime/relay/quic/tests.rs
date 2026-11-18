@@ -302,6 +302,73 @@ async fn fixture_response(
     relay.finish_stream(&mut stream)
 }
 
+#[derive(Message)]
+struct TestMaterialEnvelope {
+    #[prost(message, optional, tag = "24")]
+    request: Option<TestPutMaterial>,
+}
+#[derive(Message)]
+struct TestPutMaterial {
+    #[prost(message, repeated, tag = "1")]
+    materials: Vec<TestParticipantMaterial>,
+}
+#[derive(Message)]
+struct TestIndication {
+    #[prost(message, optional, tag = "26")]
+    material: Option<TestPutMaterial>,
+}
+
+fn indication(owner: u64, receiver: u64, entry: TestAvcMaterial) -> Vec<u8> {
+    let payload = TestIndication {
+        material: Some(TestPutMaterial {
+            materials: vec![TestParticipantMaterial {
+                owner: Some(owner),
+                receiver: Some(receiver),
+                entries: vec![entry],
+            }],
+        }),
+    }
+    .encode_to_vec();
+    let mut framed = vec![0, 0];
+    framed.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    framed.extend_from_slice(&payload);
+    framed
+}
+
+async fn indication_chunk(
+    relay: &mut CallRelayConnection,
+    stream: &mut CallRelayStream,
+    payload: &[u8],
+) -> Result<()> {
+    let mut frame = vec![0]; // HTTP/3 DATA.
+    super::super::wire::write_varint(&mut frame, payload.len());
+    frame.extend_from_slice(payload);
+    relay.write_all(stream, &frame).await
+}
+
+async fn fixture_indications(relay: &mut CallRelayConnection) -> Result<CallRelayStream> {
+    let mut indications = relay.accept_stream().await?;
+    let headers = read_fixture_frame(relay, &mut indications, 1).await?;
+    let headers = QpackDecoder::new()
+        .decode_field_section(&headers)
+        .expect("valid indication request");
+    assert!(
+        headers
+            .iter()
+            .any(|field| field.name == b":method" && field.value == b"GET")
+    );
+    assert!(
+        headers
+            .iter()
+            .any(|field| field.name == b":path" && field.value == b"/QR/Indications")
+    );
+    assert_eq!(relay.read(&mut indications, &mut [0]).await?, 0);
+    relay
+        .write_all(&mut indications, &[1, 3, 0, 0, 0xd9])
+        .await?;
+    Ok(indications)
+}
+
 #[tokio::test]
 async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answering_device()
 -> Result<()> {
@@ -316,50 +383,6 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
             },
         },
     };
-
-    #[derive(Message)]
-    struct TestMaterialEnvelope {
-        #[prost(message, optional, tag = "24")]
-        request: Option<TestPutMaterial>,
-    }
-    #[derive(Message)]
-    struct TestPutMaterial {
-        #[prost(message, repeated, tag = "1")]
-        materials: Vec<TestParticipantMaterial>,
-    }
-    #[derive(Message)]
-    struct TestIndication {
-        #[prost(message, optional, tag = "26")]
-        material: Option<TestPutMaterial>,
-    }
-
-    fn indication(owner: u64, receiver: u64, entry: TestAvcMaterial) -> Vec<u8> {
-        let payload = TestIndication {
-            material: Some(TestPutMaterial {
-                materials: vec![TestParticipantMaterial {
-                    owner: Some(owner),
-                    receiver: Some(receiver),
-                    entries: vec![entry],
-                }],
-            }),
-        }
-        .encode_to_vec();
-        let mut framed = vec![0, 0];
-        framed.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-        framed.extend_from_slice(&payload);
-        framed
-    }
-
-    async fn indication_chunk(
-        relay: &mut CallRelayConnection,
-        stream: &mut CallRelayStream,
-        payload: &[u8],
-    ) -> Result<()> {
-        let mut frame = vec![0]; // HTTP/3 DATA.
-        super::super::wire::write_varint(&mut frame, payload.len());
-        frame.extend_from_slice(payload);
-        relay.write_all(stream, &frame).await
-    }
 
     let Some((endpoint, mut relay, accept_connection)) = loopback_listener()? else {
         return Ok(());
@@ -486,25 +509,7 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
         };
         fixture_response(&mut relay, bind, &response.encode_to_vec()).await?;
 
-        let mut indications = relay.accept_stream().await?;
-        let headers = read_fixture_frame(&mut relay, &mut indications, 1).await?;
-        let headers = QpackDecoder::new()
-            .decode_field_section(&headers)
-            .expect("valid indication request");
-        assert!(
-            headers
-                .iter()
-                .any(|field| field.name == b":method" && field.value == b"GET")
-        );
-        assert!(
-            headers
-                .iter()
-                .any(|field| field.name == b":path" && field.value == b"/QR/Indications")
-        );
-        assert_eq!(relay.read(&mut indications, &mut [0]).await?, 0);
-        relay
-            .write_all(&mut indications, &[1, 3, 0, 0, 0xd9])
-            .await?;
+        let mut indications = fixture_indications(&mut relay).await?;
 
         let (stats, body) = fixture_request(&mut relay, b"/QR/Stats").await?;
         assert_eq!(body[..2], [0x92, 1]); // QuickRelay envelope field 18.
@@ -774,6 +779,14 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
 
 #[tokio::test]
 async fn exchanges_media_and_signaling_on_the_bound_http3_socket() -> Result<()> {
+    use crate::{
+        CallMode, IncomingCall,
+        apple::{
+            CallMediaDescription, CallMediaExchange, CallRtpProtection, LocalCallPrekey,
+            PeerPrekey, RelayMediaEvent, facetime::RelaySigningKey,
+        },
+    };
+
     let Some((endpoint, mut relay, accept_connection)) = loopback_listener()? else {
         return Ok(());
     };
@@ -826,7 +839,99 @@ async fn exchanges_media_and_signaling_on_the_bound_http3_socket() -> Result<()>
     let (local_address, received_address) = tokio::sync::oneshot::channel();
     let (packets_received, pods_verified) = tokio::sync::oneshot::channel();
     let (routed_received, ready_to_unbind) = tokio::sync::oneshot::channel();
-    let srtp = hex::decode("80681388010203001234567854e21a48c03a70957c92d1001036471633")?;
+    let (first_packet, first_received) = tokio::sync::oneshot::channel();
+    let (key_installed, key_received) = tokio::sync::oneshot::channel();
+    let call = IncomingCall {
+        id: description::CALL,
+        caller: "mailto:peer@example.org".into(),
+        mode: Some(CallMode::Video),
+        received_ms: 1,
+        expires_ms: 45_001,
+    };
+    let local = LocalCallPrekey::generate()?;
+    let other =
+        CallMediaExchange::prepare(call.clone(), &[], &PeerPrekey::parse(1, local.public())?)?;
+    let local = CallMediaExchange::with_prekey(
+        call,
+        &[],
+        &PeerPrekey::parse(1, other.handshake.public_prekey())?,
+        local,
+    );
+    let local_offer = local.handshake.build_key_offer(description::LOCAL)?;
+    let initial = other.handshake.build_key_offer(description::CALLER)?;
+    let initial_fields: plist::Dictionary = plist::from_bytes(&initial.payload)?;
+    local.receive(
+        crate::apple::PeerKeyOffer::parse(None, initial_fields["rtmkm"].as_dictionary())
+            .context("Missing fixture initial media key")?,
+    )?;
+    let mut rotated = other.handshake.build_key_offer(description::CALLER)?;
+    rotated.media.identifier[1] = 0x11;
+    let mut wrapped: plist::Dictionary = plist::from_bytes(&rotated.payload)?;
+    let media = wrapped
+        .get_mut("rtmkm")
+        .and_then(plist::Value::as_dictionary_mut)
+        .context("Missing fixture media key")?;
+    media.insert("mkgc".into(), 2.into());
+    media.insert(
+        "mki".into(),
+        plist::Value::Data(rotated.media.identifier.to_vec()),
+    );
+    rotated.payload.clear();
+    plist::to_writer_binary(&mut rotated.payload, &wrapped)?;
+    let signer = RelaySigningKey::generate()?;
+    let verification =
+        crate::apple::facetime::PeerDeviceKey::from_directory(&signer.directory_data()?)?;
+    let directory_signed = signer.sign_keys(&rotated, description::LOCAL)?;
+    let advertise = |receiver| {
+        indication(
+            description::CALLER,
+            receiver,
+            TestAvcMaterial {
+                id: directory_signed.media.id.to_vec(),
+                kind: 13,
+                ciphertext: directory_signed.media.contents.clone(),
+            },
+        )
+    };
+    let stream =
+        CallMediaDescription::parse(&description::signed_avc_fixture()?, Some(CallMode::Video))?;
+    let mut send = CallRtpProtection::new(
+        description::CALL,
+        description::LOCAL,
+        &rotated.media,
+        &stream,
+        &stream,
+    )?;
+    let mut receive = CallRtpProtection::new(
+        description::CALL,
+        description::CALLER,
+        &local_offer.media,
+        &stream,
+        &stream,
+    )?;
+    let mut clear = hex::decode("8068138901020300")?;
+    clear.extend_from_slice(&stream.audio.ssrc.to_be_bytes());
+    clear.extend_from_slice(b"Encoded AAC frame");
+    let mut first_clear = clear.clone();
+    first_clear[3] = 0x88;
+    let mut first_send = CallRtpProtection::new(
+        description::CALL,
+        description::LOCAL,
+        &initial.media,
+        &stream,
+        &stream,
+    )?;
+    let srtp = first_send.protect(&first_clear)?.to_vec();
+    let protected_rotated = send.protect(&clear)?;
+    let video = stream
+        .video
+        .as_ref()
+        .context("Missing fixture video stream")?;
+    let mut clear_video = hex::decode("8064138901020300")?;
+    clear_video[1] = video.payload_types[0];
+    clear_video.extend_from_slice(&video.ssrc.to_be_bytes());
+    clear_video.extend_from_slice(b"Encoded HEVC packet");
+    let protected_video = send.protect(&clear_video)?;
     let server = async {
         let _listener = accept_relay(&mut relay, accept_connection).await?;
         let mut control = relay
@@ -980,6 +1085,20 @@ async fn exchanges_media_and_signaling_on_the_bound_http3_socket() -> Result<()>
                 .async_io(Interest::WRITABLE, |socket| socket.send_to(&packet, peer))
                 .await?;
         }
+        loop {
+            let (size, source) = relay
+                .socket
+                .async_io(Interest::READABLE, |socket| socket.recv_from(&mut buffer))
+                .await?;
+            assert_eq!(source, peer);
+            let packet = &buffer[..size];
+            if super::super::pod::destination_id(packet) == Some(SERVER_IDS)
+                && let Some(control) = ids_pod.open(packet.to_vec())?
+                && control.get(4..6) == Some(&[0x80, 6])
+            {
+                break;
+            }
+        }
         let caller_media = forwarded_media(test_call(), &relay.keys, &srtp)?;
         let mut wrong_sender = caller_media.clone();
         wrong_sender[6] ^= 1;
@@ -991,9 +1110,28 @@ async fn exchanges_media_and_signaling_on_the_bound_http3_socket() -> Result<()>
                 .async_io(Interest::WRITABLE, |socket| socket.send_to(&frame, peer))
                 .await?;
         }
-        let mut got_route_ack = false;
+        first_received.await?;
+        let mut indications = fixture_indications(&mut relay).await?;
+        indication_chunk(
+            &mut relay,
+            &mut indications,
+            &advertise(description::LOCAL + 1),
+        )
+        .await?;
+        indication_chunk(&mut relay, &mut indications, &advertise(description::LOCAL)).await?;
+        relay.finish_stream(&mut indications)?;
+        key_received.await?;
+        for protected in [&protected_rotated, &protected_video] {
+            let refreshed = forwarded_media(test_call(), &relay.keys, protected)?;
+            relay
+                .socket
+                .async_io(Interest::WRITABLE, |socket| {
+                    socket.send_to(&refreshed, peer)
+                })
+                .await?;
+        }
         let mut got_routed_media = false;
-        while !got_route_ack || !got_routed_media {
+        while !got_routed_media {
             let (size, source) = relay
                 .socket
                 .async_io(Interest::READABLE, |socket| socket.recv_from(&mut buffer))
@@ -1004,12 +1142,6 @@ async fn exchanges_media_and_signaling_on_the_bound_http3_socket() -> Result<()>
                 assert_eq!(frame[..4], [0x20, 0x40, 0x12, 0x34]);
                 assert_eq!(frame[4..], srtp);
                 got_routed_media = true;
-            } else if super::super::pod::destination_id(packet) == Some(SERVER_IDS) {
-                let control = ids_pod
-                    .open(packet.to_vec())?
-                    .context("Invalid interface acknowledgment")?;
-                assert_eq!(control[4..6], [0x80, 6]);
-                got_route_ack = true;
             }
         }
         routed_received
@@ -1039,12 +1171,13 @@ async fn exchanges_media_and_signaling_on_the_bound_http3_socket() -> Result<()>
     };
 
     let client = async {
-        let conn = require_send(CallRelayConnection::connect(
+        let mut conn = require_send(CallRelayConnection::connect(
             endpoint,
             test_keys(),
             test_call(),
         ))
         .await?;
+        conn.device_key = Some(verification);
         local_address
             .send(conn.socket.get_ref().local_addr()?)
             .map_err(|_| anyhow::anyhow!("Fixture relay dropped the address channel"))?;
@@ -1080,10 +1213,54 @@ async fn exchanges_media_and_signaling_on_the_bound_http3_socket() -> Result<()>
             .await?;
         pods_verified.await?;
         require_send(binding.negotiate_media_path()).await?;
+        let RelayMediaEvent::Rtp(packet) = require_send(binding.receive_media_event()).await?
+        else {
+            anyhow::bail!("Expected the initial routed media");
+        };
+        assert_eq!(packet.as_slice(), srtp);
+        let installed = local.handshake.watch_peer_keys();
+        let first_key = installed
+            .borrow()
+            .media
+            .clone()
+            .context("Missing initial media key")?;
+        assert_eq!(first_key.generation, 1);
         assert_eq!(
-            require_send(binding.receive_routed_rtp()).await?.as_slice(),
-            srtp
+            receive
+                .open(first_key, &packet)?
+                .context("Could not open pre-rotation media")?
+                .as_slice(),
+            first_clear
         );
+        first_packet
+            .send(())
+            .map_err(|_| anyhow::anyhow!("The fixture relay closed"))?;
+        binding.subscribe_to_descriptions().await?;
+        let RelayMediaEvent::Keys(offer) = require_send(binding.receive_media_event()).await?
+        else {
+            anyhow::bail!("Expected a signed mid-call media key");
+        };
+        local.receive(*offer)?;
+        let keys = local.handshake.watch_peer_keys();
+        let key = keys
+            .borrow()
+            .media
+            .clone()
+            .context("Missing installed key")?;
+        assert_eq!(key.generation, 2);
+        key_installed
+            .send(())
+            .map_err(|_| anyhow::anyhow!("The fixture relay closed"))?;
+        for expected in [&clear, &clear_video] {
+            let RelayMediaEvent::Rtp(packet) = require_send(binding.receive_media_event()).await?
+            else {
+                anyhow::bail!("Expected media protected by the new key");
+            };
+            let opened = receive
+                .open(key.clone(), &packet)?
+                .context("Could not authenticate the rekeyed media")?;
+            assert_eq!(opened.as_slice(), expected);
+        }
         require_send(binding.send_routed_rtp(&srtp)).await?;
         ready_to_unbind.await?;
         require_send(binding.unbind()).await?;

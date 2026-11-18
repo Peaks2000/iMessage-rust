@@ -11,6 +11,13 @@ pub(super) struct Indications {
     frames: IndicationFrames,
 }
 
+pub(in crate::apple::facetime::relay) enum IndicationRead {
+    Message(Bytes),
+    Progress,
+    Pending,
+    Closed,
+}
+
 impl Indications {
     pub(super) fn new(stream: CallRelayStream) -> Self {
         Self {
@@ -19,26 +26,27 @@ impl Indications {
         }
     }
 
-    pub(super) async fn next(
+    pub(super) fn poll_message(
         &mut self,
         transport: &mut CallRelayConnection,
-    ) -> Result<Option<Bytes>> {
+    ) -> Result<IndicationRead> {
+        if let Some(message) = self.frames.next_message()? {
+            return Ok(IndicationRead::Message(message));
+        }
         let mut chunk = [0; 8192];
-        loop {
-            if let Some(message) = self.frames.next_message()? {
-                return Ok(Some(message));
+        match transport.read_available(&mut self.stream, &mut chunk)? {
+            Some(0) => {
+                self.frames.finish()?;
+                Ok(IndicationRead::Closed)
             }
-            match transport.read_available(&mut self.stream, &mut chunk)? {
-                Some(0) => {
-                    self.frames.finish()?;
-                    return Ok(None);
-                }
-                Some(size) => {
-                    self.frames.wire.extend_from_slice(&chunk[..size]);
-                    tokio::task::consume_budget().await;
-                }
-                None => transport.service_during_ring().await?,
+            Some(size) => {
+                self.frames.wire.extend_from_slice(&chunk[..size]);
+                Ok(self
+                    .frames
+                    .next_message()?
+                    .map_or(IndicationRead::Progress, IndicationRead::Message))
             }
+            None => Ok(IndicationRead::Pending),
         }
     }
 }

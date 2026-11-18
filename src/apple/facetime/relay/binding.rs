@@ -17,7 +17,7 @@ use crate::apple::facetime::{
 
 use super::{
     CallRelayAllocation, CallRelayConnection,
-    http3::RelayHttp3,
+    http3::{IndicationRead, RelayHttp3},
     one_to_one::OneToOnePath,
     pod::{Pod, RelayDatagramChannel},
     quic::RelayWireDatagram,
@@ -65,6 +65,11 @@ pub struct CallRelayBinding {
 pub(crate) enum RelayPeerUpdate {
     Description,
     Keys(Box<PeerKeyOffer>),
+}
+
+pub(crate) enum RelayMediaEvent {
+    Keys(Box<PeerKeyOffer>),
+    Rtp(Zeroizing<Vec<u8>>),
 }
 
 /// An authenticated local relay binding that has no peer or media keys yet.
@@ -277,16 +282,31 @@ impl CallRelayBinding {
 
     async fn read_peer_materials(&mut self) -> Result<Option<bool>> {
         while let Some(payload) = self.control.next_indication().await? {
-            let indication = PutMaterialIndicationEnvelope::decode(payload)
-                .context("Invalid FaceTime relay indication")?;
-            if let Some(update) = indication.indication {
-                return self.record_peer_materials(update.materials).map(Some);
+            if let Some(description) = self.record_indication(payload, true)? {
+                return Ok(Some(description));
             }
         }
         Ok(None)
     }
 
-    fn record_peer_materials(&mut self, materials: Vec<Material>) -> Result<bool> {
+    fn record_indication(
+        &mut self,
+        payload: bytes::Bytes,
+        descriptions: bool,
+    ) -> Result<Option<bool>> {
+        let indication = PutMaterialIndicationEnvelope::decode(payload)
+            .context("Invalid FaceTime relay indication")?;
+        indication
+            .indication
+            .map(|update| self.record_peer_materials(update.materials, descriptions))
+            .transpose()
+    }
+
+    fn record_peer_materials(
+        &mut self,
+        materials: Vec<Material>,
+        descriptions: bool,
+    ) -> Result<bool> {
         let call = self.control.transport.call;
         if call.peer == 0 {
             return Ok(false);
@@ -308,7 +328,9 @@ impl CallRelayBinding {
                             self.peer_prekey = Some(prekey);
                         }
                     }
-                    AVC_MATERIAL => append_peer_description(&mut self.peer_descriptions, entry)?,
+                    AVC_MATERIAL if descriptions => {
+                        append_peer_description(&mut self.peer_descriptions, entry)?
+                    }
                     MEDIA_KEY_MATERIAL | SESSION_KEY_MATERIAL
                         if group.receiver == Some(call.local)
                             && self.peer_keys.len() < MAX_PENDING_PEER_KEYS =>
@@ -411,13 +433,38 @@ impl CallRelayBinding {
         self.control.transport.send_datagram(&packet).await
     }
 
-    pub(crate) async fn receive_routed_rtp(&mut self) -> Result<Zeroizing<Vec<u8>>> {
+    pub(crate) async fn receive_media_event(&mut self) -> Result<RelayMediaEvent> {
         ensure!(
             self.one_to_one.as_ref().is_some_and(OneToOnePath::ready),
             "Missing FaceTime media route"
         );
         loop {
-            let received = self.control.transport.receive_datagram(true).await?;
+            tokio::task::consume_budget().await;
+            if let Some(offer) = self.peer_keys.pop_front() {
+                return Ok(RelayMediaEvent::Keys(Box::new(offer)));
+            }
+            self.control.transport.service_ready()?;
+            let control_progress = match self.control.poll_indication() {
+                Ok(IndicationRead::Message(payload)) => {
+                    // The negotiated codecs stay fixed. A malformed late indication must not
+                    // discard working RTP or prevent the courier from delivering keys.
+                    let _ = self.record_indication(payload, false);
+                    if let Some(offer) = self.peer_keys.pop_front() {
+                        return Ok(RelayMediaEvent::Keys(Box::new(offer)));
+                    }
+                    true
+                }
+                Ok(IndicationRead::Progress) => true,
+                Ok(IndicationRead::Pending | IndicationRead::Closed) | Err(_) => false,
+            };
+            let Some(received) = self.control.transport.take_datagram(true)? else {
+                if control_progress {
+                    tokio::task::consume_budget().await;
+                } else {
+                    self.control.transport.wait_for_progress().await?;
+                }
+                continue;
+            };
             let packet = match received {
                 RelayWireDatagram::Turn(packet) => Zeroizing::new(packet),
                 RelayWireDatagram::Pod(channel, packet) => {
@@ -436,7 +483,7 @@ impl CallRelayBinding {
                 .as_ref()
                 .and_then(|path| path.open_media(&packet))
             {
-                return Ok(Zeroizing::new(media.to_vec()));
+                return Ok(RelayMediaEvent::Rtp(Zeroizing::new(media.to_vec())));
             }
         }
     }
@@ -566,7 +613,7 @@ impl CallRelayConnection {
             avc,
             ids,
         };
-        bound.record_peer_materials(binding.materials)?;
+        bound.record_peer_materials(binding.materials, true)?;
         Ok(bound)
     }
 }

@@ -105,6 +105,7 @@ enum Request {
     InstallRelayKeys {
         id: uuid::Uuid,
         offer: Box<crate::apple::PeerKeyOffer>,
+        reply: oneshot::Sender<()>,
     },
     Download {
         id: uuid::Uuid,
@@ -593,13 +594,14 @@ async fn online(
                             Err(error) => { let _ = reply.send(Err(error)); }
                         }
                     }
-                    Request::InstallRelayKeys { id, offer } => {
+                    Request::InstallRelayKeys { id, offer, reply } => {
                         if let Some(active) = &calls.connected
                             && active.call.id == id
                             && active.endpoint.participant() == Some(offer.participant)
                         {
                             let _ = active.exchange.receive(*offer);
                         }
+                        let _ = reply.send(());
                     }
                 }
             }

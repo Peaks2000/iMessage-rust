@@ -27,7 +27,7 @@ pub use relay::{
     CallRelayAllocation, CallRelayBinding, CallRelayConnection, CallRelayKeys, CallRelayProfile,
     CallRelayStream, RelayChannel, RelayDatagramChannel, RelayStreamDirection,
 };
-pub(crate) use relay::{OutgoingRelay, RelayPeerUpdate, RingingRelay};
+pub(crate) use relay::{OutgoingRelay, RelayMediaEvent, RelayPeerUpdate, RingingRelay};
 pub(super) use signed_material::RelaySigningKey;
 pub(crate) use signed_material::{PeerDeviceKey, SignedRelayKeys, SignedRelayPrekey};
 pub(crate) use srtp::CallRtpProtection;

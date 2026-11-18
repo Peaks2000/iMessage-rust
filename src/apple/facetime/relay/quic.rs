@@ -365,29 +365,36 @@ impl CallRelayConnection {
         include_turn: bool,
     ) -> Result<RelayWireDatagram> {
         loop {
-            self.flush()?;
-            ensure!(
-                unsafe { ffi::SSL_get_shutdown(self.ssl.as_ptr()) } == 0,
-                "FaceTime relay connection closed"
-            );
-            if let Some(packet) = self
-                .bridge
-                .as_mut()
-                .context("Missing FaceTime datagram bridge")?
-                .pop(include_turn)
-            {
+            self.service_ready()?;
+            if let Some(packet) = self.take_datagram(include_turn)? {
                 return Ok(packet);
             }
             self.wait_for_progress().await?;
         }
     }
 
-    pub(super) async fn service_during_ring(&mut self) -> Result<()> {
+    pub(super) fn service_ready(&mut self) -> Result<()> {
         self.flush()?;
         ensure!(
             unsafe { ffi::SSL_get_shutdown(self.ssl.as_ptr()) } == 0,
             "FaceTime relay connection closed"
         );
+        Ok(())
+    }
+
+    pub(super) fn take_datagram(
+        &mut self,
+        include_turn: bool,
+    ) -> Result<Option<RelayWireDatagram>> {
+        Ok(self
+            .bridge
+            .as_mut()
+            .context("Missing FaceTime datagram bridge")?
+            .pop(include_turn))
+    }
+
+    pub(super) async fn service_during_ring(&mut self) -> Result<()> {
+        self.service_ready()?;
         self.wait_for_progress().await
     }
 
@@ -570,7 +577,7 @@ impl CallRelayConnection {
         }
     }
 
-    async fn wait_for_progress(&mut self) -> Result<()> {
+    pub(super) async fn wait_for_progress(&mut self) -> Result<()> {
         let mut timeout = libc::timeval {
             tv_sec: 0,
             tv_usec: 0,
