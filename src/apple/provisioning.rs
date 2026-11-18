@@ -525,6 +525,7 @@ impl Computer {
             push_certificate: push.certificate.clone(),
             push_private_key: push.key.clone(),
             protocol_version: MAC_IDS_PROTOCOL,
+            include_facetime: false,
             user_agent: format!(
                 "[macOS,{},{},{}]",
                 self.os_version, self.build_version, self.model

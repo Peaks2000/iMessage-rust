@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use openssl::{
@@ -21,6 +23,7 @@ use super::{
     aps::TOPIC,
     certified_rsa,
     crypto::KeyPair,
+    facetime,
     http::{apple_client, plist_xml_gzip, read_response},
     nonce, rsa_signature,
 };
@@ -54,6 +57,8 @@ pub(super) struct DeviceRegistration {
     pub(super) software_version: String,
     pub(super) private_device_data: Dictionary,
     pub(super) validation_data: Data,
+    #[serde(default)]
+    pub(super) include_facetime: bool,
 }
 
 pub(super) struct AccountAuth {
@@ -214,7 +219,22 @@ pub(super) async fn register(
     let bytes = read_response(response).await?;
     let response: RegisterReply =
         plist::from_bytes(&bytes).context("Could not decode Apple's registration response")?;
-    let cert = registered_certificate(response, &auth.user_id, &handle)?;
+    ensure!(
+        response.status == 0,
+        "Apple rejected registration (status {})",
+        response.status
+    );
+    let cert = registered_certificate(&response, TOPIC, &auth.user_id, &handle)?;
+    let mut facetime_certificates = BTreeMap::new();
+    if registration.include_facetime {
+        for service in [facetime::SIGNALING, facetime::VIDEO_SERVICE] {
+            if let Ok(certificate) =
+                registered_certificate(&response, service, &auth.user_id, &handle)
+            {
+                facetime_certificates.insert(service.to_owned(), certificate);
+            }
+        }
+    }
     let session = Session {
         version: 1,
         handle,
@@ -223,6 +243,7 @@ pub(super) async fn register(
         push_private_key: registration.push_private_key.clone(),
         ids_certificate: cert,
         ids_private_key: Data::new(auth.key.private_key_to_der()?),
+        facetime_certificates,
         signing_private_key: Data::new(signing_bytes.to_vec()),
         encryption_private_key: Data::new(encryption_bytes.to_vec()),
         protocol_version: registration.protocol_version,
@@ -259,17 +280,35 @@ fn registration_document(
         ("uris", Value::Array(vec![map(&[("uri", handle.into())])])),
         ("client-data", client_data),
     ]);
-    let capabilities = map(&[
-        ("flags", 17.into()),
-        ("name", "Messenger".into()),
-        ("version", 1.into()),
-    ]);
-    let service = map(&[
-        ("service", TOPIC.into()),
-        ("sub-services", Value::Array(Vec::new())),
-        ("capabilities", Value::Array(vec![capabilities])),
-        ("users", Value::Array(vec![account])),
-    ]);
+    let service = |name: &str, subservices: &[&str], capability: &str, flags: i32, user: Value| {
+        let capabilities = map(&[
+            ("flags", flags.into()),
+            ("name", capability.into()),
+            ("version", 1.into()),
+        ]);
+        map(&[
+            ("service", name.into()),
+            (
+                "sub-services",
+                Value::Array(subservices.iter().map(|name| (*name).into()).collect()),
+            ),
+            ("capabilities", Value::Array(vec![capabilities])),
+            ("users", Value::Array(vec![user])),
+        ])
+    };
+    let mut services = vec![service(TOPIC, &[], "Messenger", 17, account.clone())];
+    if input.include_facetime {
+        services.extend([
+            service(facetime::SIGNALING, &[], "Invitation", 1, account.clone()),
+            service(
+                facetime::VIDEO_SERVICE,
+                &[facetime::VIDEO],
+                "Invitation",
+                1,
+                account,
+            ),
+        ]);
+    }
     map(&[
         ("device-name", input.device_name.as_str().into()),
         ("hardware-version", input.hardware_version.as_str().into()),
@@ -280,7 +319,7 @@ fn registration_document(
             "private-device-data",
             Value::Dictionary(input.private_device_data.clone()),
         ),
-        ("services", Value::Array(vec![service])),
+        ("services", Value::Array(services)),
         (
             "validation-data",
             Value::Data(input.validation_data.as_ref().to_vec()),
@@ -318,19 +357,19 @@ struct RegisteredUri {
     status: u64,
 }
 
-fn registered_certificate(response: RegisterReply, user_id: &str, handle: &str) -> Result<Data> {
-    ensure!(
-        response.status == 0,
-        "Apple rejected registration (status {})",
-        response.status
-    );
+fn registered_certificate(
+    response: &RegisterReply,
+    service: &str,
+    user_id: &str,
+    handle: &str,
+) -> Result<Data> {
     let account = response
         .services
-        .into_iter()
-        .find(|entry| entry.service == TOPIC)
-        .context("Apple did not return an iMessage registration")?
+        .iter()
+        .find(|entry| entry.service == service)
+        .with_context(|| format!("Apple did not return a registration for {service}"))?
         .users
-        .into_iter()
+        .iter()
         .find(|entry| entry.user_id == user_id)
         .context("Apple did not return the requested account")?;
     ensure!(
@@ -350,5 +389,6 @@ fn registered_certificate(response: RegisterReply, user_id: &str, handle: &str) 
     );
     account
         .cert
+        .clone()
         .context("Apple did not return an IDS certificate")
 }

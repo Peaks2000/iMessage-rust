@@ -10,8 +10,8 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use eframe::egui;
 use linux_imessage::{
-    Conversation, FILE_LIMIT, Message, SendText, SetTapback, Status, Tapback, api, engine::Engine,
-    storage,
+    CallMode, Conversation, FILE_LIMIT, IncomingCall, Message, SendText, SetTapback, Status,
+    Tapback, api, display_address, engine::Engine, now_ms, storage,
 };
 use reqwest::{Client, Method, RequestBuilder, StatusCode, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -72,6 +72,7 @@ pub enum Action {
     Older { chat: String, offset: u32 },
     Send(SendText),
     Tapback { id: uuid::Uuid, request: SetTapback },
+    DeclineCall(uuid::Uuid),
     DeleteConversation(String),
     Attachment { id: AttachmentId, purpose: Purpose },
 }
@@ -97,6 +98,11 @@ pub enum Event {
         id: uuid::Uuid,
         result: Result<Vec<Tapback>>,
     },
+    CallDeclined {
+        id: uuid::Uuid,
+        result: Result<()>,
+    },
+    IncomingCalls(Vec<IncomingCall>),
     ConversationDeleted {
         chat: String,
         result: Result<()>,
@@ -194,9 +200,79 @@ fn run(
     if let Some(previous) = previous {
         persist(root, settings, &previous, &backend)?;
     }
+    let calls_registered = status.facetime_registered;
     emit(events, context, Event::Ready(status));
-    runtime.block_on(work(actions, events, context, Arc::new(backend)));
+    runtime.block_on(async {
+        let backend = Arc::new(backend);
+        if calls_registered {
+            tokio::spawn(watch_calls(
+                backend.clone(),
+                events.clone(),
+                context.clone(),
+            ));
+        }
+        work(actions, events, context, backend).await;
+    });
     Ok(())
+}
+
+async fn watch_calls(backend: Arc<Backend>, events: Sender<Event>, context: egui::Context) {
+    let mut status_changes = match backend.as_ref() {
+        Backend::Local(engine) => Some(engine.watch_status()),
+        Backend::Remote(_) => None,
+    };
+    let mut previous: Vec<IncomingCall> = Vec::new();
+    let delay = Duration::from_secs(4);
+    let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + delay, delay);
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        if let Ok(status) = backend.status().await {
+            let mut calls = status.incoming_calls;
+            calls.retain(|call| call.expires_ms > now_ms());
+            if calls != previous {
+                for call in &calls {
+                    if !previous.iter().any(|earlier| earlier.id == call.id) {
+                        let call = call.clone();
+                        tokio::spawn(async move {
+                            let kind = match call.mode {
+                                Some(CallMode::Video) => "FaceTime Video",
+                                Some(CallMode::Audio) => "FaceTime Audio",
+                                None => "FaceTime",
+                            };
+                            let caller = display_address(&call.caller);
+                            let _ = tokio::time::timeout(
+                                Duration::from_secs(5),
+                                tokio::process::Command::new("notify-send")
+                                    .args([
+                                        "--app-name",
+                                        "iMessage",
+                                        "--icon",
+                                        "camera-video",
+                                        "--expire-time=5000",
+                                        "--hint",
+                                        "string:sound-name:phone-incoming-call",
+                                        "--",
+                                        &format!("{kind} · {caller}"),
+                                    ])
+                                    .kill_on_drop(true)
+                                    .output(),
+                            )
+                            .await;
+                        });
+                    }
+                }
+                previous = calls.clone();
+                emit(&events, &context, Event::IncomingCalls(calls));
+            }
+        }
+        if let Some(changes) = &mut status_changes {
+            if changes.changed().await.is_err() {
+                return;
+            }
+        } else {
+            timer.tick().await;
+        }
+    }
 }
 
 fn persist(root: &Path, settings: &Settings, previous: &Settings, backend: &Backend) -> Result<()> {
@@ -242,6 +318,10 @@ async fn work(
             Action::Tapback { id, request } => {
                 let result = backend.set_tapback(id, request).await;
                 Event::Tapback { id, result }
+            }
+            Action::DeclineCall(id) => {
+                let result = backend.decline_call(id).await;
+                Event::CallDeclined { id, result }
             }
             Action::DeleteConversation(chat) => {
                 let result = backend.delete_conversation(&chat).await;
@@ -373,6 +453,21 @@ impl Backend {
                             .json(&request),
                     )
                     .await
+            }
+        }
+    }
+
+    async fn decline_call(&self, id: uuid::Uuid) -> Result<()> {
+        match self {
+            Self::Local(engine) => engine.decline_call(id).await,
+            Self::Remote(remote) => {
+                remote
+                    .body(
+                        remote.request(Method::POST, &format!("/v1/calls/{id}/decline")),
+                        4096,
+                    )
+                    .await?;
+                Ok(())
             }
         }
     }

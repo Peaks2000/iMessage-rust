@@ -19,7 +19,7 @@ use tokio::{
 };
 use tokio_rustls::{TlsConnector, client::TlsStream};
 
-use super::{Identity, nonce, rsa_signature};
+use super::{Identity, facetime, nonce, rsa_signature};
 
 pub(super) const TOPIC: &str = "com.apple.madrid";
 const MAX_FRAME: usize = 256 * 1024;
@@ -87,6 +87,7 @@ pub(super) struct Courier {
     frames: mpsc::Receiver<Result<Frame>>,
     reader: JoinHandle<()>,
     pub(super) token: [u8; 32],
+    topics: Vec<(&'static str, [u8; 20])>,
 }
 
 impl Drop for Courier {
@@ -113,12 +114,14 @@ impl Courier {
             &[(1, &[1]), (2, &i32::MAX.to_be_bytes())],
         )
         .await?;
-        write_frame(
-            &mut stream,
-            0x09,
-            &[(1, &token), (2, &sha1(TOPIC.as_bytes()))],
-        )
-        .await?;
+        let topics = [TOPIC, facetime::SIGNALING, facetime::VIDEO]
+            .into_iter()
+            .filter(|topic| identity.ids_certificate(topic).is_some())
+            .map(|topic| (topic, sha1(topic.as_bytes())))
+            .collect::<Vec<_>>();
+        let mut filter = vec![(1, token.as_slice())];
+        filter.extend(topics.iter().map(|(_, digest)| (2, digest.as_slice())));
+        write_frame(&mut stream, 0x09, &filter).await?;
         let (mut read, write) = tokio::io::split(stream);
         let (send, frames) = mpsc::channel(32);
         let reader = tokio::spawn(async move {
@@ -135,6 +138,7 @@ impl Courier {
             frames,
             reader,
             token,
+            topics,
         })
     }
 
@@ -145,12 +149,19 @@ impl Courier {
             .context("Apple courier disconnected")?
     }
 
-    pub(super) async fn push(&mut self, id: [u8; 4], payload: &[u8]) -> Result<()> {
+    pub(super) fn topic(&self, digest: &[u8]) -> Option<&'static str> {
+        self.topics
+            .iter()
+            .find(|(_, hash)| hash == digest)
+            .map(|(topic, _)| *topic)
+    }
+
+    pub(super) async fn push(&mut self, topic: &str, id: [u8; 4], payload: &[u8]) -> Result<()> {
         let token = self.token;
         self.write(
             0x0a,
             &[
-                (1, &sha1(TOPIC.as_bytes())),
+                (1, &sha1(topic.as_bytes())),
                 (2, &token),
                 (3, payload),
                 (4, &id),

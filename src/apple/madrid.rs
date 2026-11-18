@@ -7,19 +7,20 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
-use openssl::{pkey::Public, sha::sha1};
+use openssl::pkey::Public;
 use plist::{Data, Dictionary, Value};
 use serde::Deserialize;
 use tokio::time::{Instant, timeout};
 use uuid::Uuid;
 
 use crate::media::{MediaReference, MediaSource};
-use crate::{Delivery, Message, SendText, TapbackEvent, address, now_ms};
+use crate::{Delivery, IncomingCall, Message, SendText, TapbackEvent, address, now_ms};
 
 use super::{
     Identity,
     aps::{Courier, Frame, TOPIC, push_id},
     crypto::KeyPair,
+    facetime,
     http::plist_xml_gzip,
     message_content, mmcs, nonce, rsa_signature, tapback,
 };
@@ -34,24 +35,43 @@ const MAX_BATCH: usize = 10_000;
 pub(crate) struct Madrid {
     courier: Courier,
     queued: VecDeque<Notification>,
-    cached: HashMap<String, (Instant, Vec<Destination>)>,
+    cached: HashMap<(&'static str, String), (Instant, Vec<Destination>)>,
     keepalive: Instant,
 }
 
 pub(crate) struct Notification {
     pub id: [u8; 4],
+    topic: &'static str,
     data: Dictionary,
 }
 
 pub(crate) enum Incoming {
     Message(Message, Vec<MediaSource>),
     Tapback(TapbackEvent),
+    Call(facetime::CallSignal),
 }
 
 struct Destination {
     push: Vec<u8>,
     session: Vec<u8>,
     public_key: KeyPair<Public>,
+}
+
+struct DeliveryPayload<'a> {
+    recipient: &'a str,
+    guid: Uuid,
+    bytes: &'a [u8],
+    invite_context: Option<u64>,
+}
+
+impl DeliveryPayload<'_> {
+    fn topic(&self) -> &'static str {
+        if self.invite_context.is_some() {
+            facetime::SIGNALING
+        } else {
+            TOPIC
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -143,11 +163,11 @@ impl Madrid {
             .field(4)
             .context("Missing Apple push identifier")?
             .try_into()?;
-        if frame.field(2) == Some(sha1(TOPIC.as_bytes()).as_slice())
+        if let Some(topic) = frame.field(2).and_then(|digest| self.courier.topic(digest))
             && let Some(bytes) = frame.field(3)
             && let Ok(data) = plist::from_bytes(bytes)
         {
-            return Ok(Some(Notification { id, data }));
+            return Ok(Some(Notification { id, topic, data }));
         }
         self.courier.ack(id).await?;
         Ok(None)
@@ -165,7 +185,11 @@ impl Madrid {
     }
 
     async fn send_push(&mut self, id: [u8; 4], payload: &[u8]) -> Result<bool> {
-        self.courier.push(id, payload).await?;
+        self.send_push_on(TOPIC, id, payload).await
+    }
+
+    async fn send_push_on(&mut self, topic: &str, id: [u8; 4], payload: &[u8]) -> Result<bool> {
+        self.courier.push(topic, id, payload).await?;
         timeout(RESPONSE_TIMEOUT, async {
             loop {
                 let frame = self.courier.next().await?;
@@ -182,6 +206,7 @@ impl Madrid {
     async fn query(
         &mut self,
         identity: &Identity,
+        topic: &'static str,
         targets: &[&str],
         required: bool,
     ) -> Result<HashMap<String, Vec<Destination>>> {
@@ -208,11 +233,23 @@ impl Madrid {
                 "x-id-sig",
                 value(STANDARD.encode(rsa_signature(&identity.ids_key, &signed)?)),
             ),
-            ("x-id-cert", value(STANDARD.encode(&identity.ids_cert))),
+            (
+                "x-id-cert",
+                value(
+                    STANDARD.encode(
+                        identity
+                            .ids_certificate(topic)
+                            .context("No IDS registration for this Apple service")?,
+                    ),
+                ),
+            ),
         ]);
         if required {
             headers.insert("x-required-for-message".into(), value("true"));
             headers.insert("x-result-expected".into(), value("true"));
+        }
+        if topic == facetime::VIDEO {
+            headers.insert("x-id-sub-service".into(), value(topic));
         }
         let correlation = Uuid::new_v4();
         let wire = binary(&dictionary([
@@ -225,22 +262,24 @@ impl Madrid {
             ("b", data(&body)),
         ]))?;
         ensure!(
-            self.send_push(push_id()?, &wire).await?,
+            self.send_push_on(topic, push_id()?, &wire).await?,
             "Apple rejected the IDS directory request"
         );
         let response = timeout(RESPONSE_TIMEOUT, async {
             loop {
-                let candidate =
-                    if let Some(index) = self.queued.iter().position(|item| {
-                        field_data(&item.data, "U") == Some(correlation.as_bytes())
-                    }) {
-                        self.queued.remove(index)
-                    } else {
-                        let frame = self.courier.next().await?;
-                        self.notification(frame).await?
-                    };
+                let candidate = if let Some(index) = self.queued.iter().position(|item| {
+                    item.topic == topic
+                        && field_data(&item.data, "U") == Some(correlation.as_bytes())
+                }) {
+                    self.queued.remove(index)
+                } else {
+                    let frame = self.courier.next().await?;
+                    self.notification(frame).await?
+                };
                 if let Some(item) = candidate {
-                    if field_data(&item.data, "U") == Some(correlation.as_bytes()) {
+                    if item.topic == topic
+                        && field_data(&item.data, "U") == Some(correlation.as_bytes())
+                    {
                         self.courier.ack(item.id).await?;
                         return Ok::<_, anyhow::Error>(item.data);
                     }
@@ -305,7 +344,7 @@ impl Madrid {
     ) -> Result<Delivery> {
         let participants = [&identity.handle[..], &message.address[..]];
         let targets = self
-            .message_destinations(identity, &message.address)
+            .message_destinations(identity, TOPIC, &message.address)
             .await?;
         let plain = format!("{}{}", "\u{fffc}".repeat(message.files.len()), message.body);
         let mut content = dictionary([
@@ -332,8 +371,17 @@ impl Madrid {
             );
             binary(&content)?
         };
-        self.deliver_message(identity, message.id, &message.address, &text, &targets)
-            .await
+        self.deliver_message(
+            identity,
+            DeliveryPayload {
+                recipient: &message.address,
+                guid: message.id,
+                bytes: &text,
+                invite_context: None,
+            },
+            &targets,
+        )
+        .await
     }
 
     pub(crate) async fn send_tapback(
@@ -344,25 +392,66 @@ impl Madrid {
     ) -> Result<Delivery> {
         let payload = tapback::encode(event, target, &identity.handle)?;
         let payload = compress(&binary(&payload)?)?;
-        let targets = self.message_destinations(identity, &event.chat).await?;
-        self.deliver_message(identity, event.id, &event.chat, &payload, &targets)
-            .await
+        let targets = self
+            .message_destinations(identity, TOPIC, &event.chat)
+            .await?;
+        self.deliver_message(
+            identity,
+            DeliveryPayload {
+                recipient: &event.chat,
+                guid: event.id,
+                bytes: &payload,
+                invite_context: None,
+            },
+            &targets,
+        )
+        .await
+    }
+
+    pub(crate) async fn decline_call(
+        &mut self,
+        identity: &Identity,
+        call: &IncomingCall,
+    ) -> Result<()> {
+        let bytes = compress(&facetime::decline(call.id))?;
+        let targets = self
+            .message_destinations(identity, facetime::SIGNALING, &call.caller)
+            .await?;
+        ensure!(call.expires_ms > now_ms(), "This FaceTime call has ended");
+        let result = self
+            .deliver_message(
+                identity,
+                DeliveryPayload {
+                    recipient: &call.caller,
+                    guid: Uuid::new_v4(),
+                    bytes: &bytes,
+                    invite_context: Some(facetime::DECLINE),
+                },
+                &targets,
+            )
+            .await?;
+        ensure!(
+            result == Delivery::Accepted,
+            "Apple did not confirm the call decline"
+        );
+        Ok(())
     }
 
     async fn message_destinations(
         &mut self,
         identity: &Identity,
+        topic: &'static str,
         recipient: &str,
     ) -> Result<HashMap<String, Vec<Destination>>> {
         let targets = self
-            .query(identity, &[&identity.handle, recipient], true)
+            .query(identity, topic, &[&identity.handle, recipient], true)
             .await?;
         let entries = targets
             .get(recipient)
             .context("Apple IDS has no result for this recipient")?;
         ensure!(
             entries.iter().any(|device| device.push != identity.token),
-            "Apple IDS returned no compatible iMessage devices for this recipient"
+            "Apple IDS returned no compatible devices for this recipient"
         );
         Ok(targets)
     }
@@ -370,20 +459,20 @@ impl Madrid {
     async fn deliver_message(
         &mut self,
         identity: &Identity,
-        guid: Uuid,
-        recipient: &str,
-        text: &[u8],
+        payload: DeliveryPayload<'_>,
         targets: &HashMap<String, Vec<Destination>>,
     ) -> Result<Delivery> {
         let mut batches = vec![Vec::new()];
         let mut batch_bytes = 0;
         let mut seen = HashSet::new();
-        for uri in [recipient, identity.handle.as_str()] {
+        for uri in [payload.recipient, identity.handle.as_str()] {
             for device in targets.get(uri).into_iter().flatten() {
                 if device.push == identity.token || !seen.insert(device.push.as_slice()) {
                     continue;
                 }
-                let encrypted = identity.message_keys.seal(&device.public_key, text)?;
+                let encrypted = identity
+                    .message_keys
+                    .seal(&device.public_key, payload.bytes)?;
                 let cost = encrypted.len() + device.session.len() + 512;
                 ensure!(
                     cost <= MAX_BATCH && seen.len() <= 64,
@@ -399,7 +488,12 @@ impl Madrid {
                     .expect("A batch always exists")
                     .push(Value::Dictionary(dictionary([
                         ("tP", value(uri)),
-                        ("D", Value::Boolean(uri == recipient)),
+                        (
+                            "D",
+                            Value::Boolean(
+                                payload.invite_context.is_none() && uri == payload.recipient,
+                            ),
+                        ),
                         ("sT", data(&device.session)),
                         ("P", data(&encrypted)),
                         ("t", data(&device.push)),
@@ -412,24 +506,35 @@ impl Madrid {
             .enumerate()
             .map(|(index, bundle)| {
                 let id = push_id()?;
-                let wire = binary(&dictionary([
-                    ("c", 100.into()),
+                let mut wire = dictionary([
+                    (
+                        "c",
+                        if payload.invite_context.is_some() {
+                            facetime::INVITATION_COMMAND
+                        } else {
+                            100
+                        }
+                        .into(),
+                    ),
                     ("E", value("pair")),
                     ("ua", value(&identity.user_agent)),
                     ("v", 8.into()),
                     ("i", i32::from_be_bytes(id).into()),
-                    ("U", data(guid.as_bytes())),
+                    ("U", data(payload.guid.as_bytes())),
                     ("sP", value(&identity.handle)),
                     ("fcn", (index as u32 + 1).into()),
                     ("dtl", Value::Array(bundle)),
-                ]))?;
-                Ok((id, wire))
+                ]);
+                if let Some(context) = payload.invite_context {
+                    wire.insert("cc".into(), context.into());
+                }
+                Ok((id, binary(&wire)?))
             })
             .collect::<Result<Vec<_>>>()?;
 
         let mut pushed = false;
         for (id, wire) in payloads {
-            match self.send_push(id, &wire).await {
+            match self.send_push_on(payload.topic(), id, &wire).await {
                 Ok(true) => pushed = true,
                 Ok(false) if !pushed => return Ok(Delivery::Failed),
                 Ok(false) | Err(_) => return Ok(Delivery::Unknown),
@@ -506,7 +611,13 @@ impl Madrid {
     ) -> Result<Option<Incoming>> {
         let wire = &notice.data;
         let command = wire.get("c").and_then(Value::as_unsigned_integer);
-        if command != Some(100) || field_str(wire, "E").is_some_and(|name| name != "pair") {
+        let call = notice.topic == facetime::SIGNALING
+            && command == Some(facetime::INVITATION_COMMAND)
+            && field_str(wire, "E") == Some("pair");
+        let message = notice.topic == TOPIC
+            && command == Some(100)
+            && field_str(wire, "E").is_none_or(|name| name == "pair");
+        if !call && !message {
             return Ok(None);
         }
         let (Some(sender), Some(target), Some(token), Some(envelope), Some(guid)) = (
@@ -527,26 +638,29 @@ impl Madrid {
             return Ok(None);
         }
 
+        let cache_key = (notice.topic, sender.clone());
         self.cached
             .retain(|_, (deadline, _)| *deadline > Instant::now());
         if !self
             .cached
-            .get(&sender)
+            .get(&cache_key)
             .is_some_and(|(_, keys)| keys.iter().any(|key| key.push == token))
         {
-            let mut keys = self.query(identity, &[&sender], false).await?;
+            let mut keys = self
+                .query(identity, notice.topic, &[&sender], false)
+                .await?;
             if self.cached.len() >= 128 {
                 self.cached.clear();
             }
             self.cached.insert(
-                sender.clone(),
+                cache_key.clone(),
                 (
                     Instant::now() + Duration::from_secs(120),
                     keys.remove(&sender).unwrap_or_default(),
                 ),
             );
         }
-        let Some((_, devices)) = self.cached.get(&sender) else {
+        let Some((_, devices)) = self.cached.get(&cache_key) else {
             return Ok(None);
         };
         let Some(device) = devices.iter().find(|entry| entry.push == token) else {
@@ -554,6 +668,22 @@ impl Madrid {
         };
         let decoded = (|| -> Result<Option<Incoming>> {
             let plaintext = identity.message_keys.open(&device.public_key, envelope)?;
+            if call {
+                let Some(received_ms) = wire
+                    .get("e")
+                    .and_then(Value::as_unsigned_integer)
+                    .and_then(|ns| i64::try_from(ns / 1_000_000).ok())
+                else {
+                    return Ok(None);
+                };
+                return Ok(facetime::decode(
+                    &decompress(&plaintext)?,
+                    sender,
+                    &identity.handle,
+                    received_ms,
+                )
+                .map(Incoming::Call));
+            }
             let body: Dictionary = plist::from_bytes(&decompress(&plaintext)?)?;
             let Some(participants) = body
                 .get("p")

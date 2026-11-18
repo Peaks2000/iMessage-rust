@@ -12,8 +12,9 @@ use eframe::egui::{
     Stroke, StrokeKind, TextEdit, Ui, UiBuilder, pos2, vec2,
 };
 use linux_imessage::{
-    Conversation, Delivery, FILE_LIMIT, MAX_ATTACHMENTS, Message, PAGE_SIZE, SendText, SetTapback,
-    Status, TEXT_LIMIT, TapbackKind, address, display_address, now_ms, storage,
+    CallMode, Conversation, Delivery, FILE_LIMIT, IncomingCall, MAX_ATTACHMENTS, Message,
+    PAGE_SIZE, SendText, SetTapback, Status, TEXT_LIMIT, TapbackKind, address, display_address,
+    now_ms, storage,
 };
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
@@ -75,6 +76,9 @@ pub struct MessagesApp {
     sending: bool,
     retry: Option<SendText>,
     tapback_pending: Option<Uuid>,
+    incoming_calls: Vec<IncomingCall>,
+    declining_call: Option<Uuid>,
+    call_error: Option<String>,
 }
 
 #[derive(Default)]
@@ -164,6 +168,9 @@ impl MessagesApp {
             sending: false,
             retry: None,
             tapback_pending: None,
+            incoming_calls: Vec::new(),
+            declining_call: None,
+            call_error: None,
         }
     }
 
@@ -176,7 +183,7 @@ impl MessagesApp {
             .and_then(|connection| connection.events.try_recv().ok())
         {
             match event {
-                Event::Ready(status) => {
+                Event::Ready(mut status) => {
                     self.connection = self.candidate.take();
                     self.delete_conversation = None;
                     if let Some(form) = self.settings.take() {
@@ -185,6 +192,7 @@ impl MessagesApp {
                     if self.config.mode == Mode::Local {
                         self.local_unregistered = false;
                     }
+                    self.incoming_calls = std::mem::take(&mut status.incoming_calls);
                     self.status = Some(status);
                     self.pins = self.read_pins();
                     self.chats.clear();
@@ -199,6 +207,8 @@ impl MessagesApp {
                     self.media = TranscriptMedia::default();
                     self.retry = None;
                     self.tapback_pending = None;
+                    self.declining_call = None;
+                    self.call_error = None;
                     self.error = None;
                     self.refresh_running = false;
                     self.loading_older = false;
@@ -343,6 +353,18 @@ impl MessagesApp {
                             self.error = None;
                         }
                         Err(error) => self.error = Some(format!("{error:#}")),
+                    }
+                    self.refresh_at = Instant::now();
+                }
+                Event::IncomingCalls(calls) => self.incoming_calls = calls,
+                Event::CallDeclined { id, result } => {
+                    self.declining_call = None;
+                    match result {
+                        Ok(()) => {
+                            self.incoming_calls.retain(|call| call.id != id);
+                            self.call_error = None;
+                        }
+                        Err(error) => self.call_error = Some(format!("{error:#}")),
                     }
                     self.refresh_at = Instant::now();
                 }
@@ -1487,6 +1509,69 @@ impl MessagesApp {
         }
     }
 
+    fn incoming_call_panel(&mut self, ctx: &egui::Context) {
+        let now = now_ms();
+        let Some(call) = self
+            .incoming_calls
+            .iter()
+            .find(|call| call.expires_ms > now)
+        else {
+            self.call_error = None;
+            return;
+        };
+        let name = self.contacts.name(&call.caller);
+        let heading = match call.mode {
+            Some(CallMode::Audio) => "FaceTime Audio",
+            Some(CallMode::Video) => "FaceTime Video",
+            None => "FaceTime",
+        };
+        ctx.request_repaint_after(Duration::from_millis((call.expires_ms - now) as u64));
+        egui::Area::new(egui::Id::new("incoming-facetime"))
+            .anchor(Align2::RIGHT_TOP, vec2(-18., 60.))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                chrome::sheet().show(ui, |ui| {
+                    ui.set_width(245.);
+                    ui.horizontal(|ui| {
+                        let (rect, _) = ui.allocate_exact_size(vec2(36., 36.), Sense::hover());
+                        ui.painter().circle_filled(
+                            rect.center(),
+                            17.,
+                            Color32::from_rgb(45, 176, 78),
+                        );
+                        chrome::icon(ui.painter(), rect.center(), Icon::Video, Color32::WHITE);
+                        ui.vertical(|ui| {
+                            ui.add(egui::Label::new(chrome::bold(name, 15.)).truncate());
+                            ui.label(RichText::new(heading).size(12.).color(MUTED));
+                        });
+                    });
+                    if let Some(error) = &self.call_error {
+                        ui.label(RichText::new(error).size(11.).color(DANGER));
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add_enabled(
+                                self.declining_call.is_none(),
+                                egui::Button::new(RichText::new("Decline").color(Color32::WHITE))
+                                    .fill(DANGER)
+                                    .corner_radius(5)
+                                    .min_size(vec2(72., 27.)),
+                            )
+                            .clicked()
+                            && let Some(connection) = &self.connection
+                            && connection
+                                .actions
+                                .send(Action::DeclineCall(call.id))
+                                .is_ok()
+                        {
+                            self.declining_call = Some(call.id);
+                            self.call_error = None;
+                        }
+                    });
+                });
+            });
+    }
+
     fn conversation_deleted(&mut self, chat: &str) {
         self.delete_conversation = None;
         self.error = None;
@@ -1813,6 +1898,7 @@ impl eframe::App for MessagesApp {
         }
         self.sidebar(ctx);
         self.right_panel(ctx, paste);
+        self.incoming_call_panel(ctx);
         if self.delete_conversation.is_some() {
             self.delete_dialog(ctx);
         } else if self.mac_setup.is_some() {

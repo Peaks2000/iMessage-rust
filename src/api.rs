@@ -8,7 +8,7 @@ use axum::{
     http::{HeaderValue, StatusCode, header, uri::Authority},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, put},
+    routing::{get, post, put},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use openssl::{rand::rand_bytes, sha::sha256};
@@ -145,6 +145,7 @@ pub fn router(engine: Engine, access: AccessPolicy) -> Router {
         )
         .route("/v1/messages", get(messages).post(send))
         .route("/v1/messages/{id}/tapback", put(set_tapback))
+        .route("/v1/calls/{id}/decline", post(decline_call))
         .route("/v1/attachments/{id}/{index}", get(attachment))
         .layer(DefaultBodyLimit::max(
             FILE_LIMIT.div_ceil(3) * 4 + 48 * 1024,
@@ -190,6 +191,14 @@ async fn set_tapback(
     Json(request): Json<SetTapback>,
 ) -> Result<Json<Vec<Tapback>>, Failure> {
     Ok(Json(engine.set_tapback(id, request.reaction).await?))
+}
+
+async fn decline_call(
+    State(engine): State<Engine>,
+    RoutePath(id): RoutePath<uuid::Uuid>,
+) -> Result<StatusCode, Failure> {
+    engine.decline_call(id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn attachment(

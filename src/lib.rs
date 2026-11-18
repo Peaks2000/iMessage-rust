@@ -96,6 +96,26 @@ pub enum Delivery {
 pub struct Status {
     pub connected: bool,
     pub detail: String,
+    #[serde(default)]
+    pub facetime_registered: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incoming_calls: Vec<IncomingCall>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CallMode {
+    Audio,
+    Video,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct IncomingCall {
+    pub id: uuid::Uuid,
+    pub caller: String,
+    pub mode: Option<CallMode>,
+    pub received_ms: i64,
+    pub expires_ms: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

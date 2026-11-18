@@ -1,5 +1,6 @@
 mod aps;
 mod crypto;
+mod facetime;
 mod gsa;
 mod http;
 mod icloud_contacts;
@@ -23,6 +24,7 @@ pub use registration::register_device;
 pub use ssh_setup::{SshPrompt, run_ssh_askpass};
 
 use anyhow::{Context, Result, ensure};
+pub(crate) use facetime::CallSignal;
 pub(crate) use madrid::{Incoming, Madrid};
 use openssl::{
     hash::MessageDigest,
@@ -46,6 +48,7 @@ pub struct Identity {
     push_key: PKey<Private>,
     ids_cert: Vec<u8>,
     ids_key: PKey<Private>,
+    facetime_certificates: std::collections::BTreeMap<String, Vec<u8>>,
     message_keys: crypto::KeyPair<Private>,
     protocol_version: u32,
     user_agent: String,
@@ -61,6 +64,8 @@ struct Session {
     push_private_key: Data,
     ids_certificate: Data,
     ids_private_key: Data,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    facetime_certificates: std::collections::BTreeMap<String, Data>,
     signing_private_key: Data,
     encryption_private_key: Data,
     protocol_version: u32,
@@ -85,6 +90,10 @@ impl Drop for Session {
 }
 
 impl Identity {
+    pub(crate) fn facetime_registered(&self) -> bool {
+        self.ids_certificate(facetime::SIGNALING).is_some()
+    }
+
     pub fn handle(&self) -> &str {
         &self.handle
     }
@@ -113,6 +122,24 @@ impl Identity {
             session.encryption_private_key.as_ref(),
         )
         .context("Invalid legacy iMessage encryption or signing private key")?;
+        let ids_key = certified_rsa(&session.ids_certificate, &session.ids_private_key)
+            .context("Invalid IDS certificate or private key")?;
+        let mut facetime_certificates = std::collections::BTreeMap::new();
+        for (service, certificate) in &session.facetime_certificates {
+            ensure!(
+                matches!(
+                    service.as_str(),
+                    facetime::SIGNALING | facetime::VIDEO_SERVICE
+                ),
+                "Unknown calling service"
+            );
+            let public = X509::from_der(certificate.as_ref())?.public_key()?;
+            ensure!(
+                ids_key.public_eq(&public),
+                "The FaceTime certificate does not match the IDS signing key"
+            );
+            facetime_certificates.insert(service.clone(), certificate.as_ref().to_vec());
+        }
         Ok(Self {
             handle: address(&session.handle)?,
             token,
@@ -120,12 +147,27 @@ impl Identity {
             push_key: certified_rsa(&session.push_certificate, &session.push_private_key)
                 .context("Invalid APNs certificate or private key")?,
             ids_cert: session.ids_certificate.as_ref().to_vec(),
-            ids_key: certified_rsa(&session.ids_certificate, &session.ids_private_key)
-                .context("Invalid IDS certificate or private key")?,
+            ids_key,
+            facetime_certificates,
             message_keys,
             protocol_version: session.protocol_version,
             user_agent: session.user_agent.clone(),
         })
+    }
+
+    fn ids_certificate(&self, topic: &str) -> Option<&[u8]> {
+        match topic {
+            aps::TOPIC => Some(&self.ids_cert),
+            facetime::SIGNALING => self
+                .facetime_certificates
+                .get(facetime::SIGNALING)
+                .map(Vec::as_slice),
+            facetime::VIDEO => self
+                .facetime_certificates
+                .get(facetime::VIDEO_SERVICE)
+                .map(Vec::as_slice),
+            _ => None,
+        }
     }
 
     pub fn profile_id(&self) -> String {

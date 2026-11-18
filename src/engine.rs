@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs::{File, OpenOptions},
     os::unix::fs::OpenOptionsExt,
     path::Path,
@@ -18,7 +19,7 @@ use crate::{
     Tapback, TapbackEvent, TapbackKind, address, now_ms, now_ns,
 };
 use crate::{
-    apple::{Identity, Incoming, Madrid},
+    apple::{CallSignal, Identity, Incoming, Madrid},
     history::History,
 };
 
@@ -40,6 +41,10 @@ enum Request {
         target: uuid::Uuid,
         reaction: Option<TapbackKind>,
         reply: oneshot::Sender<Result<Vec<Tapback>>>,
+    },
+    DeclineCall {
+        id: uuid::Uuid,
+        reply: oneshot::Sender<Result<()>>,
     },
     Download {
         id: uuid::Uuid,
@@ -67,6 +72,8 @@ impl Engine {
         let (updates, status) = watch::channel(Status {
             connected: false,
             detail: "Connecting to Apple…".into(),
+            facetime_registered: identity.facetime_registered(),
+            incoming_calls: Vec::new(),
         });
         let (requests, receiver) = mpsc::channel(16);
         tokio::spawn(run_apple(identity, state.clone(), receiver, updates));
@@ -78,7 +85,14 @@ impl Engine {
     }
 
     pub fn status(&self) -> Status {
-        self.status.borrow().clone()
+        let mut status = self.status.borrow().clone();
+        let now = now_ms();
+        status.incoming_calls.retain(|call| call.expires_ms > now);
+        status
+    }
+
+    pub fn watch_status(&self) -> watch::Receiver<Status> {
+        self.status.clone()
     }
 
     pub fn chats(&self) -> Result<Vec<Conversation>> {
@@ -112,6 +126,16 @@ impl Engine {
         answer
             .await
             .context("The Apple engine stopped during the reaction")?
+    }
+
+    pub async fn decline_call(&self, id: uuid::Uuid) -> Result<()> {
+        let (reply, answer) = oneshot::channel();
+        self.requests
+            .try_send(Request::DeclineCall { id, reply })
+            .context("The Apple engine is busy or stopped")?;
+        answer
+            .await
+            .context("The Apple engine stopped during the call response")?
     }
 
     pub async fn send(&self, mut request: SendText) -> Result<Message> {
@@ -214,6 +238,9 @@ async fn run_apple(
                         Request::Tapback { reply, .. } => {
                             let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
                         }
+                        Request::DeclineCall { reply, .. } => {
+                            let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
+                        }
                     }
                 }
             }
@@ -229,6 +256,7 @@ async fn online(
     requests: &mut mpsc::Receiver<Request>,
     status: &watch::Sender<Status>,
 ) -> Result<()> {
+    let mut ended_calls = HashMap::new();
     loop {
         tokio::select! {
             notification = madrid.next_notification() => {
@@ -236,6 +264,7 @@ async fn online(
                 match madrid.decode(identity, &notification).await? {
                     Some(Incoming::Message(message, media)) => state.history()?.insert(&message, media)?,
                     Some(Incoming::Tapback(event)) => state.history()?.insert_tapback(&event)?,
+                    Some(Incoming::Call(signal)) => update_calls(status, identity.handle(), &mut ended_calls, signal),
                     None => (),
                 }
                 madrid.acknowledge(notification.id).await?;
@@ -252,11 +281,68 @@ async fn online(
                     Request::Tapback { target, reaction, reply } => {
                         let _ = reply.send(send_tapback(identity, state, madrid, target, reaction).await);
                     }
+                    Request::DeclineCall { id, reply } => {
+                        let call = status.borrow().incoming_calls.iter()
+                            .find(|call| call.id == id && call.expires_ms > now_ms()).cloned();
+                        let result = match call {
+                            Some(call) => {
+                                let result = madrid.decline_call(identity, &call).await;
+                                if result.is_ok() {
+                                    ended_calls.insert(id, call.expires_ms);
+                                }
+                                result
+                            }
+                            None => Ok(()),
+                        };
+                        if result.is_ok() {
+                            status.send_modify(|status| status.incoming_calls.retain(|call| call.id != id));
+                        }
+                        let _ = reply.send(result);
+                    }
                 }
             }
             _ = status.closed() => return Ok(()),
         }
     }
+}
+
+fn update_calls(
+    status: &watch::Sender<Status>,
+    own: &str,
+    ended: &mut HashMap<uuid::Uuid, i64>,
+    signal: CallSignal,
+) {
+    let now = now_ms();
+    ended.retain(|_, expires_ms| *expires_ms > now);
+    status.send_modify(|status| {
+        let calls = &mut status.incoming_calls;
+        calls.retain(|call| call.expires_ms > now);
+        match signal {
+            CallSignal::Ring(offer)
+                if !ended.contains_key(&offer.id)
+                    && !calls.iter().any(|call| call.id == offer.id) =>
+            {
+                if calls.len() >= 16 {
+                    calls.remove(0);
+                }
+                calls.push(offer);
+            }
+            CallSignal::End {
+                id,
+                sender,
+                received_ms,
+            } => {
+                if let Some(index) = calls.iter().position(|call| {
+                    call.id == id
+                        && (sender == own || sender == call.caller)
+                        && received_ms >= call.received_ms
+                }) {
+                    ended.insert(id, calls.remove(index).expires_ms);
+                }
+            }
+            CallSignal::Ring(_) => (),
+        }
+    });
 }
 
 async fn send_tapback(
@@ -381,9 +467,10 @@ fn start_send(history: &History, request: &SendText) -> Result<(Message, bool)> 
 }
 
 fn set_status(status: &watch::Sender<Status>, connected: bool, detail: &str) {
-    status.send_replace(Status {
-        connected,
-        detail: detail.to_owned(),
+    status.send_modify(|status| {
+        status.connected = connected;
+        status.detail = detail.to_owned();
+        status.incoming_calls.clear();
     });
 }
 
@@ -409,6 +496,45 @@ async fn download(
 mod tests {
     use super::*;
     use crate::{Attachment, Upload};
+
+    #[test]
+    fn only_the_caller_or_our_account_can_end_a_ring_and_replays_stay_ended() {
+        let caller = "mailto:caller@example.org";
+        let own = "mailto:receiver@example.org";
+        let now = now_ms();
+        let id = uuid::Uuid::new_v4();
+        let (status, reader) = watch::channel(Status {
+            connected: true,
+            detail: String::new(),
+            facetime_registered: true,
+            incoming_calls: Vec::new(),
+        });
+        let offer = crate::IncomingCall {
+            id,
+            caller: caller.into(),
+            mode: Some(crate::CallMode::Video),
+            received_ms: now,
+            expires_ms: now + 45_000,
+        };
+        let end = |sender: &str, time| CallSignal::End {
+            id,
+            sender: sender.into(),
+            received_ms: time,
+        };
+        let mut ended = HashMap::new();
+        update_calls(&status, own, &mut ended, CallSignal::Ring(offer.clone()));
+        update_calls(
+            &status,
+            own,
+            &mut ended,
+            end("mailto:stranger@example.org", now),
+        );
+        update_calls(&status, own, &mut ended, end(caller, now - 1));
+        assert_eq!(reader.borrow().incoming_calls, vec![offer.clone()]);
+        update_calls(&status, own, &mut ended, end(own, now));
+        update_calls(&status, own, &mut ended, CallSignal::Ring(offer));
+        assert!(reader.borrow().incoming_calls.is_empty());
+    }
 
     #[test]
     fn an_attachment_retry_preserves_the_message_and_its_original_bytes() -> Result<()> {
@@ -490,6 +616,8 @@ mod tests {
             status: watch::channel(Status {
                 connected: false,
                 detail: String::new(),
+                facetime_registered: false,
+                incoming_calls: Vec::new(),
             })
             .1,
         };
