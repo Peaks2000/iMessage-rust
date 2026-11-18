@@ -2658,7 +2658,7 @@ dependencies = [
 
 [[package]]
 name = "linux-imessage"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "aps",
