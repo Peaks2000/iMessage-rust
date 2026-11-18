@@ -4,7 +4,9 @@ use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::media::MediaSource;
-use crate::{Attachment, Conversation, Delivery, Message, PAGE_SIZE, Tapback, TapbackEvent};
+use crate::{
+    Attachment, Conversation, Delivery, Message, PAGE_SIZE, Tapback, TapbackEvent, TapbackKind,
+};
 
 pub struct History(Connection);
 
@@ -134,8 +136,8 @@ impl History {
         Ok(row)
     }
 
-    pub fn insert_tapback(&self, event: &TapbackEvent) -> Result<()> {
-        self.0.execute(
+    pub fn insert_tapback(&self, event: &TapbackEvent) -> Result<bool> {
+        let inserted = self.0.execute(
             "INSERT INTO tapback_events (id, message_id, address, timestamp_ns, part, outgoing, kind, removed)
              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
              WHERE NOT EXISTS (SELECT 1 FROM deleted_messages WHERE id = ?2)
@@ -144,7 +146,7 @@ impl History {
                 event.tapback.part, event.tapback.outgoing, serde_json::to_string(&event.tapback.kind)?,
                 event.removed],
         )?;
-        Ok(())
+        Ok(inserted != 0)
     }
 
     pub fn tapbacks(&self, id: &str, address: &str) -> Result<Vec<Tapback>> {
@@ -153,7 +155,7 @@ impl History {
              WHERE address = ?1 AND message_id = ?2 ORDER BY timestamp_ns, id",
         )?;
         let mut rows = query.query(params![address, id])?;
-        let mut active = std::collections::BTreeMap::new();
+        let mut active = std::collections::BTreeMap::<_, TapbackKind>::new();
         while let Some(row) = rows.next()? {
             let part = row.get(0)?;
             let outgoing = row.get(1)?;
@@ -161,7 +163,10 @@ impl History {
             let removed: bool = row.get(3)?;
             if !removed {
                 active.insert((part, outgoing), kind);
-            } else if active.get(&(part, outgoing)) == Some(&kind) {
+            } else if active
+                .get(&(part, outgoing))
+                .is_some_and(|current| current.matches_reaction(&kind))
+            {
                 active.remove(&(part, outgoing));
             }
         }
@@ -310,7 +315,6 @@ fn read_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TapbackKind;
 
     #[test]
     fn opening_older_history_keeps_messages_and_saves_part_indices() -> Result<()> {
@@ -378,8 +382,8 @@ mod tests {
         history.insert_tapback(&make(2, TapbackKind::Like, false))?;
         assert!(history.tapbacks(&target.to_string(), chat)?.is_empty());
         let latest = make(5, TapbackKind::Laugh, false);
-        history.insert_tapback(&latest)?;
-        history.insert_tapback(&latest)?;
+        assert!(history.insert_tapback(&latest)?);
+        assert!(!history.insert_tapback(&latest)?);
         history.insert_tapback(&make(6, TapbackKind::Heart, true))?;
         assert_eq!(
             history.tapbacks(&target.to_string(), chat)?,
@@ -390,6 +394,9 @@ mod tests {
                 .tapbacks(&target.to_string(), "mailto:other@example.org")?
                 .is_empty()
         );
+        history.insert_tapback(&make(7, TapbackKind::Emoji("❤️".into()), false))?;
+        history.insert_tapback(&make(8, TapbackKind::Emoji("❤".into()), true))?;
+        assert!(history.tapbacks(&target.to_string(), chat)?.is_empty());
         history.delete_conversation(chat)?;
         assert!(history.tapbacks(&target.to_string(), chat)?.is_empty());
         Ok(())

@@ -71,6 +71,16 @@ pub enum TapbackKind {
 }
 
 impl TapbackKind {
+    pub fn matches_reaction(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Emoji(first), Self::Emoji(second)) => first
+                .chars()
+                .filter(|ch| *ch != '\u{fe0f}')
+                .eq(second.chars().filter(|ch| *ch != '\u{fe0f}')),
+            _ => self == other,
+        }
+    }
+
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         if let Self::Emoji(emoji) = self {
             anyhow::ensure!(
@@ -123,6 +133,8 @@ pub enum Delivery {
 pub struct Status {
     pub connected: bool,
     pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tapback_revision: Option<uuid::Uuid>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

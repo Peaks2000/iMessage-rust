@@ -10,8 +10,8 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use eframe::egui;
 use linux_imessage::{
-    Conversation, FILE_LIMIT, Message, SendText, SetTapback, Status, Tapback, api, engine::Engine,
-    storage,
+    Conversation, FILE_LIMIT, Message, PAGE_SIZE, SendText, SetTapback, Status, Tapback, api,
+    engine::Engine, storage,
 };
 use reqwest::{Client, Method, RequestBuilder, StatusCode, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -68,12 +68,29 @@ impl Settings {
 }
 
 pub enum Action {
-    Refresh(Option<String>),
-    Older { chat: String, offset: u32 },
+    Refresh {
+        chat: Option<String>,
+        older: Option<OlderRefresh>,
+    },
+    Older {
+        chat: String,
+        offset: u32,
+    },
     Send(SendText),
-    Tapback { id: uuid::Uuid, request: SetTapback },
+    Tapback {
+        id: uuid::Uuid,
+        request: SetTapback,
+    },
     DeleteConversation(String),
-    Attachment { id: AttachmentId, purpose: Purpose },
+    Attachment {
+        id: AttachmentId,
+        purpose: Purpose,
+    },
+}
+
+pub struct OlderRefresh {
+    pub oldest: (i64, String),
+    pub tapback_revision: Option<uuid::Uuid>,
 }
 
 pub enum Event {
@@ -228,7 +245,7 @@ async fn work(
 ) {
     while let Some(action) = actions.recv().await {
         let event = match action {
-            Action::Refresh(chat) => refresh(&backend, chat)
+            Action::Refresh { chat, older } => refresh(&backend, chat, older)
                 .await
                 .unwrap_or_else(|error| Event::Error(error.to_string())),
             Action::Older { chat, offset } => {
@@ -279,12 +296,39 @@ fn emit(events: &Sender<Event>, context: &egui::Context, event: Event) {
     context.request_repaint();
 }
 
-async fn refresh(backend: &Backend, chat: Option<String>) -> Result<Event> {
+async fn refresh(
+    backend: &Backend,
+    chat: Option<String>,
+    older: Option<OlderRefresh>,
+) -> Result<Event> {
     let status = backend.status().await?;
     let chats = backend.chats().await?;
     let thread = if let Some(chat) = chat {
-        let messages = backend.messages(&chat, 0).await?;
-        Some((chat, messages))
+        let mut page = backend.messages(&chat, 0).await?;
+        if let Some(older) = older.filter(|older| older.tapback_revision != status.tapback_revision)
+        {
+            let mut pages = Vec::new();
+            let mut offset = 0;
+            let oldest = (older.oldest.0, older.oldest.1.as_str());
+            while page.len() == PAGE_SIZE as usize
+                && page
+                    .first()
+                    .is_some_and(|first| (first.timestamp_ms, first.id.as_str()) > oldest)
+            {
+                let Some(next) = u32::checked_add(offset, PAGE_SIZE) else {
+                    break;
+                };
+                pages.push(page);
+                offset = next;
+                page = backend.messages(&chat, offset).await?;
+            }
+            if !pages.is_empty() {
+                page.retain(|message| (message.timestamp_ms, message.id.as_str()) >= oldest);
+            }
+            pages.push(page);
+            page = pages.into_iter().rev().flatten().collect();
+        }
+        Some((chat, page))
     } else {
         None
     };
@@ -370,6 +414,7 @@ impl Backend {
                     .fetch(
                         remote
                             .request(Method::PUT, &format!("/v1/messages/{id}/tapback"))
+                            .timeout(Duration::from_secs(120))
                             .json(&request),
                     )
                     .await
@@ -480,5 +525,101 @@ impl Remote {
             anyhow::bail!("The server returned HTTP {}", status.as_u16());
         }
         Ok(body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{Json, Router, extract::Query, routing::get};
+    use linux_imessage::{Delivery, TapbackKind};
+    use uuid::Uuid;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn reaction_changes_refresh_loaded_older_messages() -> Result<()> {
+        let chat = "mailto:peer@example.org";
+        let id = |index| Uuid::from_u128(index).to_string();
+        let reaction = Tapback {
+            kind: TapbackKind::Heart,
+            outgoing: false,
+            part: 0,
+        };
+        let rows = Arc::new(
+            (0..80)
+                .map(|index| Message {
+                    id: id(index),
+                    address: chat.into(),
+                    body: "Hello".into(),
+                    text_part: None,
+                    outgoing: true,
+                    timestamp_ms: index as i64,
+                    status: Delivery::Accepted,
+                    attachments: Vec::new(),
+                    tapbacks: if index == 3 {
+                        vec![reaction.clone()]
+                    } else {
+                        Vec::new()
+                    },
+                })
+                .collect::<Vec<_>>(),
+        );
+        let revision = Uuid::new_v4();
+        let router = Router::new()
+            .route(
+                "/v1/status",
+                get(move || async move {
+                    Json(serde_json::json!({
+                        "connected": true, "detail": "Connected", "tapback_revision": revision
+                    }))
+                }),
+            )
+            .route(
+                "/v1/conversations",
+                get(|| async { Json(Vec::<Conversation>::new()) }),
+            )
+            .route(
+                "/v1/messages",
+                get(
+                    move |Query(query): Query<std::collections::HashMap<String, String>>| {
+                        let rows = Arc::clone(&rows);
+                        async move {
+                            let offset = query["offset"].parse::<usize>().unwrap();
+                            let end = rows.len().saturating_sub(offset);
+                            Json(rows[end.saturating_sub(PAGE_SIZE as usize)..end].to_vec())
+                        }
+                    },
+                ),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let settings = Settings {
+            url: format!("http://{}", listener.local_addr()?),
+            ..Settings::default()
+        };
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+        let backend = Backend::Remote(Remote::new(&settings, Zeroizing::new(String::new()))?);
+        for known_revision in [Some(revision), None] {
+            let older = OlderRefresh {
+                oldest: (3, id(3)),
+                tapback_revision: known_revision,
+            };
+            let Event::Refresh {
+                thread: Some((_, messages)),
+                ..
+            } = refresh(&backend, Some(chat.into()), Some(older)).await?
+            else {
+                panic!("Expected a message refresh");
+            };
+            if known_revision.is_some() {
+                assert_eq!(messages.len(), PAGE_SIZE as usize);
+                assert_eq!(messages[0].id, id(5));
+            } else {
+                assert_eq!(messages.len(), 77);
+                assert_eq!(messages[0].id, id(3));
+                assert_eq!(messages[0].tapbacks, vec![reaction.clone()]);
+            }
+        }
+        server.abort();
+        Ok(())
     }
 }

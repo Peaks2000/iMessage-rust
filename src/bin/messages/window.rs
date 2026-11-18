@@ -21,7 +21,7 @@ use zeroize::{Zeroize, Zeroizing};
 use super::{
     attachments::{self, AttachmentId, DraftFile, LoadedFile, Preview, TranscriptMedia},
     clipboard::Clipboard,
-    connection::{Action, Connection, Event, Mode, Settings},
+    connection::{Action, Connection, Event, Mode, OlderRefresh, Settings},
     contacts::Contacts,
     links::MessageText,
     mac_setup::{MacSetup, Outcome as MacOutcome},
@@ -365,11 +365,26 @@ impl MessagesApp {
         }
         if Instant::now() >= self.refresh_at
             && !self.refresh_running
+            && !self.loading_older
             && let Some(connection) = &self.connection
         {
+            let older = self
+                .messages
+                .first()
+                .filter(|_| self.messages.len() >= PAGE_SIZE as usize)
+                .map(|first| OlderRefresh {
+                    oldest: (first.timestamp_ms, first.id.clone()),
+                    tapback_revision: self
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.tapback_revision),
+                });
             self.refresh_running = connection
                 .actions
-                .send(Action::Refresh(self.selected.clone()))
+                .send(Action::Refresh {
+                    chat: self.selected.clone(),
+                    older,
+                })
                 .is_ok();
             self.refresh_at = Instant::now() + POLL;
         }
@@ -1905,7 +1920,7 @@ fn tapback_options(
             TapbackKind::Question,
         ] {
             let (symbol, label) = tapback_label(&kind);
-            let selected = current.is_some_and(|reaction| reaction.kind == kind);
+            let selected = current.is_some_and(|reaction| reaction.kind.matches_reaction(&kind));
             if ui
                 .add(
                     egui::Button::new(RichText::new(symbol).size(17.))
@@ -1925,7 +1940,8 @@ fn tapback_options(
         ui.horizontal(|ui| {
             for emoji in ["😂", "❤️", "🎉", "🔥", "😮", "🙌"] {
                 let kind = TapbackKind::Emoji(emoji.to_owned());
-                let selected = current.is_some_and(|reaction| reaction.kind == kind);
+                let selected =
+                    current.is_some_and(|reaction| reaction.kind.matches_reaction(&kind));
                 if ui
                     .selectable_label(selected, RichText::new(emoji).size(17.))
                     .clicked()

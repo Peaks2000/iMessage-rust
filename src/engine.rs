@@ -67,6 +67,7 @@ impl Engine {
         let (updates, status) = watch::channel(Status {
             connected: false,
             detail: "Connecting to Apple…".into(),
+            tapback_revision: None,
         });
         let (requests, receiver) = mpsc::channel(16);
         tokio::spawn(run_apple(identity, state.clone(), receiver, updates));
@@ -251,7 +252,10 @@ async fn online(
                 let notification = notification?;
                 match madrid.decode(identity, &notification).await? {
                     Some(Incoming::Message(message, media)) => state.history()?.insert(&message, media)?,
-                    Some(Incoming::Tapback(event)) => state.history()?.insert_tapback(&event)?,
+                    Some(Incoming::Tapback(event)) => {
+                        let history = state.history()?;
+                        record_tapback(&history, status, &event)?;
+                    }
                     None => (),
                 }
                 madrid.acknowledge(notification.id).await?;
@@ -266,7 +270,7 @@ async fn online(
                         let _ = reply.send(download(identity, state, madrid, id, index).await);
                     }
                     Request::Tapback { target, request, reply } => {
-                        let _ = reply.send(send_tapback(identity, state, madrid, target, request).await);
+                        let _ = reply.send(send_tapback(identity, state, madrid, status, target, request).await);
                     }
                 }
             }
@@ -279,6 +283,7 @@ async fn send_tapback(
     identity: &Identity,
     state: &State,
     madrid: &mut Madrid,
+    status: &watch::Sender<Status>,
     target: uuid::Uuid,
     request: SetTapback,
 ) -> Result<Vec<Tapback>> {
@@ -307,7 +312,12 @@ async fn send_tapback(
         message.has_part(part) || (request.reaction.is_none() && previous.is_some()),
         "This part of the message is unavailable"
     );
-    if previous.map(|tapback| &tapback.kind) == request.reaction.as_ref() {
+    let unchanged = match (previous, &request.reaction) {
+        (Some(previous), Some(kind)) => previous.kind.matches_reaction(kind),
+        (None, None) => true,
+        _ => false,
+    };
+    if unchanged {
         return Ok(message.tapbacks);
     }
     let removed = request.reaction.is_none();
@@ -333,8 +343,19 @@ async fn send_tapback(
         "Apple did not confirm the reaction"
     );
     let history = state.history()?;
-    history.insert_tapback(&event)?;
+    record_tapback(&history, status, &event)?;
     history.tapbacks(&message.id, &message.address)
+}
+
+fn record_tapback(
+    history: &History,
+    status: &watch::Sender<Status>,
+    event: &TapbackEvent,
+) -> Result<()> {
+    if history.insert_tapback(event)? {
+        status.send_modify(|status| status.tapback_revision = Some(event.id));
+    }
+    Ok(())
 }
 
 async fn send_on_courier(
@@ -411,9 +432,9 @@ fn start_send(history: &History, request: &SendText) -> Result<(Message, bool)> 
 }
 
 fn set_status(status: &watch::Sender<Status>, connected: bool, detail: &str) {
-    status.send_replace(Status {
-        connected,
-        detail: detail.to_owned(),
+    status.send_modify(|status| {
+        status.connected = connected;
+        status.detail = detail.to_owned();
     });
 }
 
@@ -523,6 +544,7 @@ mod tests {
             status: watch::channel(Status {
                 connected: false,
                 detail: String::new(),
+                tapback_revision: None,
             })
             .1,
         };
