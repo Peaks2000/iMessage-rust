@@ -124,11 +124,14 @@ impl RingResponses {
                 && device.description.is_none() =>
             {
                 // The recipient may answer a video invitation with audio.
-                let description = CallMediaDescription::parse(&media.description, response.mode);
-                let Ok(description) = description else { return };
+                let description =
+                    CallMediaDescription::parse(&media.description, response.mode).ok();
                 let video = call.mode == Some(CallMode::Video)
-                    && response.mode != Some(CallMode::Audio)
-                    && description.video.is_some();
+                    && match response.mode {
+                        Some(CallMode::Video) => true,
+                        Some(CallMode::Audio) => false,
+                        None => description.is_some_and(|description| description.video.is_some()),
+                    };
                 device.mode = Some(if video {
                     CallMode::Video
                 } else {

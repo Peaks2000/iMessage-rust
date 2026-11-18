@@ -208,11 +208,12 @@ impl Engine {
             let allocation = self.allocate_call_relay(id).await?;
             let local_keys = self.publish_call_keys(id).await?;
             let description = local_keys.seal_description(config.avc_plist, config.mode)?;
-            let relay = allocation
+            let mut relay = allocation
                 .connect()
                 .await?
                 .bind_with_description(config.relay_profile, &description)
                 .await?;
+            relay.subscribe_to_descriptions().await?;
             Ok::<_, anyhow::Error>((relay, local_keys, allocation.caller_participant, attempt))
         };
         let (relay, local_keys, caller_participant, AnswerAttempt { lease, handshake }) = tokio::select! {
@@ -329,7 +330,8 @@ async fn wait_for_media(
     relay: &mut CallRelayBinding,
     keys: &mut watch::Receiver<CallPeerKeys>,
 ) -> Result<CallMediaDescription> {
-    let signed_description = handshake.decode_peer_description();
+    let signed_description = handshake.decode_peer_description().ok();
+    let mut indications_open = true;
     loop {
         {
             let authenticated = keys.borrow_and_update();
@@ -337,14 +339,25 @@ async fn wait_for_media(
                 if let Some(description) = relay.peer_description(&authenticated)? {
                     return Ok(description);
                 }
-                if let Ok(description) = signed_description {
+                if let Some(description) = signed_description {
                     return Ok(description);
+                }
+                ensure!(
+                    indications_open,
+                    "The peer did not supply a FaceTime media description"
+                );
+            }
+        }
+        tokio::select! {
+            result = keys.changed() => result.context("This FaceTime call has ended")?,
+            result = relay.wait_for_peer_descriptions(), if indications_open => {
+                match result {
+                    Ok(open) => indications_open = open,
+                    Err(_) if signed_description.is_some() => indications_open = false,
+                    Err(error) => return Err(error),
                 }
             }
         }
-        keys.changed()
-            .await
-            .context("This FaceTime call has ended")?;
     }
 }
 

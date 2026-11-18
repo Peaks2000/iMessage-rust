@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
+use bytes::Bytes;
 use compcol::{
     hpack::HeaderField,
     qpack::{QpackDecoder, QpackEncoder},
@@ -18,6 +19,9 @@ use super::{
     wire::{take_varint, write_varint},
 };
 
+mod indications;
+use indications::Indications;
+
 const HEADERS: u64 = 1;
 const DATA: u64 = 0;
 const SETTINGS: u64 = 4;
@@ -30,6 +34,7 @@ pub(super) struct RelayHttp3 {
     _local_control: CallRelayStream,
     _peer_streams: Vec<CallRelayStream>,
     peer_max_fields: u64,
+    indications: Option<Indications>,
 }
 
 impl RelayHttp3 {
@@ -64,6 +69,7 @@ impl RelayHttp3 {
                             _local_control: local_control,
                             _peer_streams: peer_streams,
                             peer_max_fields: limit,
+                            indications: None,
                         });
                     }
                     1 => bail!("Unexpected HTTP/3 push stream from relay"),
@@ -85,16 +91,45 @@ impl RelayHttp3 {
     }
 
     pub(super) async fn put(&mut self, path: &str, body: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        timeout(REQUEST_TIMEOUT, async {
+            let mut stream = self.request(path, Some(body)).await?;
+            read_response(&mut self.transport, &mut stream).await
+        })
+        .await
+        .context("FaceTime relay HTTP/3 request timed out")?
+    }
+
+    pub(super) async fn open_indications(&mut self) -> Result<()> {
+        let stream = timeout(REQUEST_TIMEOUT, self.request("/QR/Indications", None))
+            .await
+            .context("FaceTime relay indication subscription timed out")??;
+        self.indications = Some(Indications::new(stream));
+        Ok(())
+    }
+
+    pub(super) async fn next_indication(&mut self) -> Result<Option<Bytes>> {
+        let Some(indications) = self.indications.as_mut() else {
+            return Ok(None);
+        };
+        let result = indications.next(&mut self.transport).await;
+        if !matches!(result, Ok(Some(_))) {
+            self.indications = None;
+        }
+        result
+    }
+
+    async fn request(&mut self, path: &str, body: Option<&[u8]>) -> Result<CallRelayStream> {
         ensure!(
-            body.len() <= MAX_BODY,
+            body.is_none_or(|body| body.len() <= MAX_BODY),
             "FaceTime relay request is too large"
         );
         let mut txn = [0; 4];
         openssl::rand::rand_bytes(&mut txn)?;
         let txn = u32::from_be_bytes(txn).to_string();
         let authority = self.transport.peer_addr()?.to_string();
-        let fields = [
-            HeaderField::new(b":method", b"PUT"),
+        let method: &[u8] = if body.is_some() { b"PUT" } else { b"GET" };
+        let mut fields = vec![
+            HeaderField::new(b":method", method),
             HeaderField::new(b":scheme", b"https"),
             HeaderField::new(b":authority", authority.as_bytes()),
             HeaderField::new(b":path", path.as_bytes()),
@@ -102,8 +137,13 @@ impl RelayHttp3 {
             HeaderField::new(b"user-agent", b"GFT/2.0"),
             HeaderField::new(b"accept", b"*/*"),
             HeaderField::new(b"txn_id", txn.as_bytes()),
-            HeaderField::new(b"content-length", body.len().to_string().as_bytes()),
         ];
+        if let Some(body) = body {
+            fields.push(HeaderField::new(
+                b"content-length",
+                body.len().to_string().as_bytes(),
+            ));
+        }
         ensure!(
             field_size(&fields) as u64 <= self.peer_max_fields,
             "FaceTime relay cannot accept these HTTP/3 fields"
@@ -111,18 +151,16 @@ impl RelayHttp3 {
         let mut message = Zeroizing::new(Vec::new());
         let block = QpackEncoder::new().encode_field_section(&fields);
         write_frame(&mut message, HEADERS as u8, &block);
-        write_frame(&mut message, DATA as u8, body);
-        timeout(REQUEST_TIMEOUT, async {
-            let mut stream = self
-                .transport
-                .open_stream(RelayStreamDirection::Bidirectional)
-                .await?;
-            self.transport.write_all(&mut stream, &message).await?;
-            self.transport.finish_stream(&mut stream)?;
-            read_response(&mut self.transport, &mut stream).await
-        })
-        .await
-        .context("FaceTime relay HTTP/3 request timed out")?
+        if let Some(body) = body {
+            write_frame(&mut message, DATA as u8, body);
+        }
+        let mut stream = self
+            .transport
+            .open_stream(RelayStreamDirection::Bidirectional)
+            .await?;
+        self.transport.write_all(&mut stream, &message).await?;
+        self.transport.finish_stream(&mut stream)?;
+        Ok(stream)
     }
 }
 

@@ -316,6 +316,43 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
         #[prost(message, repeated, tag = "1")]
         materials: Vec<TestParticipantMaterial>,
     }
+    #[derive(Message)]
+    struct TestIndication {
+        #[prost(message, optional, tag = "26")]
+        material: Option<TestPutMaterial>,
+    }
+
+    fn indication(owner: u64, receiver: u64, ciphertext: Vec<u8>) -> Vec<u8> {
+        let payload = TestIndication {
+            material: Some(TestPutMaterial {
+                materials: vec![TestParticipantMaterial {
+                    owner: Some(owner),
+                    receiver: Some(receiver),
+                    entries: vec![TestAvcMaterial {
+                        id: vec![7; 20],
+                        kind: 12,
+                        ciphertext,
+                    }],
+                }],
+            }),
+        }
+        .encode_to_vec();
+        let mut framed = vec![0, 0];
+        framed.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        framed.extend_from_slice(&payload);
+        framed
+    }
+
+    async fn indication_chunk(
+        relay: &mut CallRelayConnection,
+        stream: &mut CallRelayStream,
+        payload: &[u8],
+    ) -> Result<()> {
+        let mut frame = vec![0]; // HTTP/3 DATA.
+        super::super::wire::write_varint(&mut frame, payload.len());
+        frame.extend_from_slice(payload);
+        relay.write_all(stream, &frame).await
+    }
 
     let Some((endpoint, mut relay, accept_connection)) = loopback_listener()? else {
         return Ok(());
@@ -323,6 +360,8 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
     let answered = CallEndpoint::new([7; 32], Some(description::CALLER));
     let other = CallEndpoint::new([8; 32], Some(description::CALLER + 1));
     let offer = description::local_offer()?;
+    let (started, has_partial_frame) = tokio::sync::oneshot::channel();
+    let (paused, continue_indications) = tokio::sync::oneshot::channel();
     let server = async {
         let _listener = accept_relay(&mut relay, accept_connection).await?;
         let mut client_settings = relay.accept_stream().await?;
@@ -359,6 +398,26 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
         };
         fixture_response(&mut relay, bind, &response.encode_to_vec()).await?;
 
+        let mut indications = relay.accept_stream().await?;
+        let headers = read_fixture_frame(&mut relay, &mut indications, 1).await?;
+        let headers = QpackDecoder::new()
+            .decode_field_section(&headers)
+            .expect("valid indication request");
+        assert!(
+            headers
+                .iter()
+                .any(|field| field.name == b":method" && field.value == b"GET")
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|field| field.name == b":path" && field.value == b"/QR/Indications")
+        );
+        assert_eq!(relay.read(&mut indications, &mut [0]).await?, 0);
+        relay
+            .write_all(&mut indications, &[1, 3, 0, 0, 0xd9])
+            .await?;
+
         let (stats, body) = fixture_request(&mut relay, b"/QR/Stats").await?;
         assert_eq!(body[..2], [0x92, 1]); // QuickRelay envelope field 18.
         fixture_response(&mut relay, stats, &[0x9a, 1, 0]).await?;
@@ -380,6 +439,21 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
         assert_eq!(entry.ciphertext, offer.ciphertext);
         fixture_response(&mut relay, publish, &[0xca, 1, 0]).await?;
 
+        let wrong_device = indication(description::CALLER + 1, description::LOCAL, vec![0]);
+        indication_chunk(&mut relay, &mut indications, &wrong_device).await?;
+        let media = indication(
+            description::CALLER,
+            description::LOCAL,
+            description::opaque_peer_offer()?,
+        );
+        indication_chunk(&mut relay, &mut indications, &media[..3]).await?;
+        started
+            .send(())
+            .map_err(|_| anyhow::anyhow!("Waiting call ended early"))?;
+        continue_indications.await?;
+        indication_chunk(&mut relay, &mut indications, &media[3..]).await?;
+        relay.finish_stream(&mut indications)?;
+
         let (release, _) = fixture_request(&mut relay, b"/QR/UnAllocBind").await?;
         fixture_response(&mut relay, release, &[0xba, 1, 0]).await
     };
@@ -400,8 +474,34 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
         };
         let mut waiting = RingingRelay::bind(wire, profile, vec![answered, other]).await?;
         waiting.keepalive().await?;
-        let connection = waiting.join(answered, &offer).await?;
+        let mut connection = waiting.join(answered, &offer).await?;
         assert_eq!(connection.channel_id, 0x4008);
+        assert!(
+            connection
+                .peer_description(&description::remote_keys())?
+                .is_none()
+        );
+        has_partial_frame.await?;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(40),
+                connection.wait_for_peer_descriptions()
+            )
+            .await
+            .is_err()
+        );
+        paused
+            .send(())
+            .map_err(|_| anyhow::anyhow!("Relay stopped sending indications"))?;
+        assert!(connection.wait_for_peer_descriptions().await?);
+        let media = connection
+            .peer_description(&description::remote_keys())?
+            .context("Missing authenticated late media offer")?;
+        assert_eq!(media.audio.ssrc, 0x1020_3040);
+        assert_eq!(
+            media.video.context("Missing late video stream")?.ssrc,
+            0x5060_7080
+        );
         connection.unbind().await
     };
     tokio::time::timeout(Duration::from_secs(5), async {

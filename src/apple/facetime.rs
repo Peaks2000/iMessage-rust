@@ -466,7 +466,8 @@ pub(crate) fn decode(
             let prekey = participant.media_prekey();
             let description = participant
                 .participant_data_key
-                .filter(|data| !data.as_ref().is_empty())?;
+                .map(Vec::<u8>::from)
+                .unwrap_or_default();
             let context =
                 JoinContext::decode(participant.client_context_data_key?.as_ref()).ok()?;
             let offer = context.message.as_ref()?;
@@ -499,7 +500,7 @@ pub(crate) fn decode(
                 })
             });
             let media = PeerMediaOffer {
-                description: description.into(),
+                description,
                 prekey,
             };
             if offer.kind == 1 || participant.is_initiator_key == Some(true) {
@@ -690,11 +691,13 @@ mod tests {
             Some(CallSignal::Accepted { call, endpoint, .. }) if call.id == id
                 && endpoint == CallEndpoint::new([7; 32], Some(-11_i64 as u64)))
         );
+        wire.remove("participant-data-key");
         wire.insert("is-initiator-key".into(), Value::Boolean(true));
         context.video = Some(false);
         assert!(
             matches!(parse(JOIN_COMMAND, &context, wire.clone(), peer, own)?,
-            Some(CallSignal::Ring { call, .. }) if call.mode == Some(CallMode::Audio))
+            Some(CallSignal::Ring { call, media: Some(media), .. }) if call.mode == Some(CallMode::Audio)
+                && media.description.is_empty())
         );
         assert!(
             matches!(parse(LEAVE_COMMAND, &context, wire.clone(), peer, own)?,

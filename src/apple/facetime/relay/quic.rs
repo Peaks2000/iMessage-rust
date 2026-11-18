@@ -488,19 +488,22 @@ impl CallRelayConnection {
     pub async fn read(&mut self, stream: &mut CallRelayStream, bytes: &mut [u8]) -> Result<usize> {
         self.check_stream(stream)?;
         ensure!(!bytes.is_empty(), "A relay stream read needs a buffer");
-        self.retry(STREAM_TIMEOUT, |_| {
-            let ssl = stream.ssl.as_ptr();
-            let mut used = 0;
-            let result =
-                unsafe { ffi::SSL_read_ex(ssl, bytes.as_mut_ptr().cast(), bytes.len(), &mut used) };
-            if result == 0
-                && unsafe { ffi::SSL_get_error(ssl, result) } == ffi::SSL_ERROR_ZERO_RETURN
-            {
-                return Ok(Some(0));
-            }
-            retry_ssl(ssl, result, "Read relay stream", used)
-        })
-        .await
+        self.retry(STREAM_TIMEOUT, |_| read_stream(stream, bytes))
+            .await
+    }
+
+    pub(super) fn read_available(
+        &mut self,
+        stream: &mut CallRelayStream,
+        bytes: &mut [u8],
+    ) -> Result<Option<usize>> {
+        self.check_stream(stream)?;
+        ensure!(!bytes.is_empty(), "A relay stream read needs a buffer");
+        self.flush()?;
+        let _ = ErrorStack::get();
+        let result = read_stream(stream, bytes);
+        self.send_pending()?;
+        result
     }
 
     pub fn stream_id(&self, stream: &CallRelayStream) -> Result<u64> {
@@ -604,6 +607,17 @@ impl CallRelayConnection {
         }
         Ok(())
     }
+}
+
+fn read_stream(stream: &mut CallRelayStream, bytes: &mut [u8]) -> Result<Option<usize>> {
+    let ssl = stream.ssl.as_ptr();
+    let mut used = 0;
+    let result =
+        unsafe { ffi::SSL_read_ex(ssl, bytes.as_mut_ptr().cast(), bytes.len(), &mut used) };
+    if result == 0 && unsafe { ffi::SSL_get_error(ssl, result) } == ffi::SSL_ERROR_ZERO_RETURN {
+        return Ok(Some(0));
+    }
+    retry_ssl(ssl, result, "Read relay stream", used)
 }
 
 fn retry_ssl<T>(ssl: SslPtr, result: c_int, operation: &str, success: T) -> Result<Option<T>> {

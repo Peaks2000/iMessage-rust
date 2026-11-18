@@ -66,10 +66,9 @@ impl RingingRelay {
             connection.call.peer == 0,
             "FaceTime relay already has a peer"
         );
-        Ok(Self {
-            binding: connection.bind_channels(profile, Vec::new()).await?,
-            eligible,
-        })
+        let mut binding = connection.bind_channels(profile, Vec::new()).await?;
+        binding.subscribe_to_descriptions().await?;
+        Ok(Self { binding, eligible })
     }
 
     pub(crate) async fn keepalive(&mut self) -> Result<()> {
@@ -181,6 +180,30 @@ impl CallRelayBinding {
         );
         let call = self.control.transport.call;
         open_description(call.id, call.peer, key, &description.content).map(Some)
+    }
+
+    pub(crate) async fn subscribe_to_descriptions(&mut self) -> Result<()> {
+        self.control.open_indications().await
+    }
+
+    pub(crate) async fn wait_for_peer_descriptions(&mut self) -> Result<bool> {
+        let call = self.control.transport.call;
+        ensure!(call.peer != 0, "Missing authenticated FaceTime participant");
+        while let Some(payload) = self.control.next_indication().await? {
+            let indication = PutMaterialIndicationEnvelope::decode(payload)
+                .context("Invalid FaceTime relay indication")?;
+            if let Some(update) = indication.indication
+                && append_peer_descriptions(
+                    &mut self.peer_descriptions,
+                    update.materials,
+                    call.peer,
+                    call.local,
+                )?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Send a call-protocol datagram over the relay. The call layer encrypts peer payloads.
@@ -427,6 +450,17 @@ fn collect_peer_descriptions(
     local: u64,
 ) -> Result<Vec<MaterialInfo>> {
     let mut accepted: Vec<MaterialInfo> = Vec::new();
+    append_peer_descriptions(&mut accepted, materials, peer, local)?;
+    Ok(accepted)
+}
+
+fn append_peer_descriptions(
+    accepted: &mut Vec<MaterialInfo>,
+    materials: Vec<Material>,
+    peer: u64,
+    local: u64,
+) -> Result<bool> {
+    let previous_count = accepted.len();
     for group in materials {
         if group.owner != Some(peer)
             || !matches!(group.receiver, None | Some(0)) && group.receiver != Some(local)
@@ -455,7 +489,7 @@ fn collect_peer_descriptions(
             }
         }
     }
-    Ok(accepted)
+    Ok(accepted.len() != previous_count)
 }
 
 fn new_connection_id(kind: i32) -> Result<[u8; 4]> {
@@ -561,6 +595,18 @@ struct PutMaterialResponseEnvelope {
 
 #[derive(Message)]
 struct PutMaterialResponse {}
+
+#[derive(Message)]
+struct PutMaterialIndicationEnvelope {
+    #[prost(message, optional, tag = "26")]
+    indication: Option<PutMaterialIndication>,
+}
+
+#[derive(Message)]
+struct PutMaterialIndication {
+    #[prost(message, repeated, tag = "1")]
+    materials: Vec<Material>,
+}
 
 #[derive(Message)]
 struct BindRequest {

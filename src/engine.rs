@@ -617,7 +617,11 @@ impl IncomingCallDetails {
     fn learn_media(&mut self, media: Option<PeerMediaOffer>) -> bool {
         let Some(offer) = media else { return false };
         let learned_key = offer.prekey.is_some_and(|key| self.learn_prekey(key));
-        if self.description.is_none() {
+        if self
+            .description
+            .as_ref()
+            .is_none_or(|current| current.is_empty() && !offer.description.is_empty())
+        {
             self.description = Some(offer.description);
             return true;
         }
