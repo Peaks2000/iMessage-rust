@@ -9,7 +9,7 @@ publish = false
 [features]
 default = ["desktop"]
 desktop = [
-    "dep:arboard", "dep:eframe", "dep:fdk-aac-sys", "dep:heic-rs", "dep:image", "dep:linkify",
+    "dep:arboard", "dep:eframe", "dep:emojis", "dep:fdk-aac-sys", "dep:heic-rs", "dep:image", "dep:linkify",
     "dep:phonenumber", "dep:raw-window-handle", "dep:roxmltree",
     "dep:smithay-client-toolkit", "dep:wayland-client", "dep:winit", "dep:zbus",
 ]
@@ -73,3 +73,4 @@ wayland-client = { version = "0.31", features = ["system", "dlopen"], optional =
 winit = { version = "0.30", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen", "x11"], optional = true }
 zbus = { version = "4.4", optional = true }
 zeroize = { version = "1", features = ["derive", "serde"] }
+emojis = { version = "0.9.1", optional = true }

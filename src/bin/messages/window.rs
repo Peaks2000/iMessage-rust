@@ -2279,13 +2279,16 @@ fn tapback_options(
     let current = message
         .tapbacks
         .iter()
-        .find(|reaction| reaction.outgoing && reaction.part == part);
-    let select = |reaction| {
+        .filter(|reaction| reaction.outgoing && tapback_on_part(message, part, reaction.part))
+        .min_by_key(|reaction| reaction.part != part);
+    let select = |kind: Option<TapbackKind>| {
         (
             id,
             SetTapback {
-                reaction,
-                part: Some(part),
+                reaction: kind.filter(|kind| {
+                    !current.is_some_and(|reaction| reaction.kind.matches_reaction(kind))
+                }),
+                part: Some(current.map_or(part, |reaction| reaction.part)),
             },
         )
     };
@@ -2310,31 +2313,66 @@ fn tapback_options(
                 .on_hover_text(label)
                 .clicked()
             {
-                *selection = Some(select((!selected).then_some(kind)));
+                *selection = Some(select(Some(kind)));
                 ui.close();
             }
         }
     });
-    ui.menu_button("Emoji…", |ui| {
-        ui.horizontal(|ui| {
-            for emoji in ["😂", "❤️", "🎉", "🔥", "😮", "🙌"] {
-                let kind = TapbackKind::Emoji(emoji.to_owned());
-                let selected =
-                    current.is_some_and(|reaction| reaction.kind.matches_reaction(&kind));
-                if ui
-                    .selectable_label(selected, RichText::new(emoji).size(17.))
-                    .clicked()
-                {
-                    *selection = Some(select((!selected).then_some(kind)));
-                    ui.close_kind(egui::UiKind::Menu);
+    let config = egui::containers::menu::MenuConfig::new()
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+    egui::containers::menu::SubMenuButton::new("Emoji…")
+        .config(config)
+        .ui(ui, |ui| {
+            ui.horizontal(|ui| {
+                for emoji in ["😂", "❤️", "🎉", "🔥", "😮", "🙌"] {
+                    let kind = TapbackKind::Emoji(emoji.to_owned());
+                    let selected =
+                        current.is_some_and(|reaction| reaction.kind.matches_reaction(&kind));
+                    if ui
+                        .selectable_label(selected, RichText::new(emoji).size(17.))
+                        .clicked()
+                    {
+                        *selection = Some(select(Some(kind)));
+                        ui.close_kind(egui::UiKind::Menu);
+                    }
                 }
+            });
+            if let Some(kind) = tapback_emoji_input(ui) {
+                *selection = Some(select(Some(kind)));
+                ui.close_kind(egui::UiKind::Menu);
             }
         });
-    });
     if current.is_some() && ui.button("Remove Tapback").clicked() {
         *selection = Some(select(None));
         ui.close();
     }
+}
+
+fn tapback_emoji_input(ui: &mut Ui) -> Option<TapbackKind> {
+    let id = ui.id().with("custom-emoji");
+    let mut value = ui.data_mut(|data| data.get_temp::<String>(id).unwrap_or_default());
+    let input = ui.add(
+        egui::TextEdit::singleline(&mut value)
+            .id(id)
+            .hint_text("Paste emoji or type :name:")
+            .desired_width(154.)
+            .char_limit(64),
+    );
+    let value_trimmed = value.trim();
+    let emoji = emojis::get(value_trimmed).or_else(|| {
+        let name = value_trimmed.strip_prefix(':')?;
+        emojis::get_by_shortcode(name.trim_end_matches(':'))
+    });
+    let confirm = ui.add_enabled(emoji.is_some(), egui::Button::new("Select Emoji"));
+    let enter = input.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+    if let Some(emoji) = emoji.filter(|_| confirm.clicked() || enter) {
+        ui.data_mut(|data| data.remove::<String>(id));
+        return Some(TapbackKind::Emoji(emoji.as_str().to_owned()));
+    }
+    if input.changed() {
+        ui.data_mut(|data| data.insert_temp(id, value));
+    }
+    None
 }
 
 fn has_tapbacks(message: &Message, part: u32) -> bool {
@@ -2720,8 +2758,73 @@ fn window_edge(ctx: &egui::Context) {
 }
 
 #[cfg(test)]
-mod call_panel_tests {
+mod tests {
     use super::*;
+
+    #[test]
+    fn tapback_menu_replaces_a_legacy_reaction_with_a_pasted_emoji() -> anyhow::Result<()> {
+        let ctx = egui::Context::default();
+        let root = tempfile::tempdir()?;
+        let mut app = MessagesApp::new(&ctx, root.path().to_owned(), true, Clipboard::empty());
+        let (connection, mut actions, _events) = Connection::test_channels();
+        app.connection = Some(connection);
+        app.status = Some(Status {
+            connected: true,
+            detail: String::new(),
+            tapback_revision: None,
+            facetime_registered: false,
+            incoming_calls: Vec::new(),
+        });
+        app.thread_loaded = true;
+        app.history_all = true;
+        let id = Uuid::new_v4();
+        let chat = "mailto:peer@example.org";
+        app.messages.push(Message {
+            id: id.to_string(),
+            address: chat.into(),
+            body: "Choose a reaction".into(),
+            text_part: Some(1),
+            outgoing: false,
+            timestamp_ms: now_ms(),
+            status: Delivery::Received,
+            attachments: Vec::new(),
+            tapbacks: vec![linux_imessage::Tapback {
+                kind: TapbackKind::Like,
+                outgoing: true,
+                part: 0,
+            }],
+        });
+        let mut frame = |events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(640., 420.))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.transcript(ui, chat));
+                },
+            )
+        };
+        let bubble = find_label(&mut frame, "Choose a reaction");
+        pointer_click(&mut frame, bubble, egui::PointerButton::Secondary);
+        let submenu = find_label(&mut frame, "Emoji…");
+        frame(vec![egui::Event::PointerMoved(submenu)]);
+        click(&mut frame, "Paste emoji or type :name:");
+        frame(vec![egui::Event::Paste("🚀".into())]);
+        click(&mut frame, "Select Emoji");
+        let Action::Tapback {
+            id: target,
+            request,
+        } = actions.try_recv()?
+        else {
+            anyhow::bail!("Expected a Tapback request");
+        };
+        assert_eq!(target, id);
+        assert_eq!(request.part, Some(0));
+        assert_eq!(request.reaction, Some(TapbackKind::Emoji("🚀".into())));
+        Ok(())
+    }
 
     #[test]
     fn existing_apple_session_can_open_face_time_upgrade_from_settings() -> anyhow::Result<()> {
@@ -2917,18 +3020,33 @@ mod call_panel_tests {
     }
 
     fn click(frame: &mut impl FnMut(Vec<egui::Event>) -> egui::FullOutput, label: &str) {
+        let position = find_label(frame, label);
+        click_at(frame, position);
+    }
+
+    fn find_label(
+        frame: &mut impl FnMut(Vec<egui::Event>) -> egui::FullOutput,
+        label: &str,
+    ) -> egui::Pos2 {
         frame(Vec::new()); // The area's first frame measures its content.
         let shapes = frame(Vec::new()).shapes;
-        let position = shapes
+        shapes
             .iter()
             .find_map(|shape| label_position(&shape.shape, label))
-            .unwrap_or_else(|| panic!("Missing FaceTime button {label}"));
-        click_at(frame, position);
+            .unwrap_or_else(|| panic!("Missing label {label}"))
     }
 
     fn click_at(
         frame: &mut impl FnMut(Vec<egui::Event>) -> egui::FullOutput,
         position: egui::Pos2,
+    ) {
+        pointer_click(frame, position, egui::PointerButton::Primary);
+    }
+
+    fn pointer_click(
+        frame: &mut impl FnMut(Vec<egui::Event>) -> egui::FullOutput,
+        position: egui::Pos2,
+        button: egui::PointerButton,
     ) {
         frame(vec![egui::Event::PointerMoved(position)]);
         for pressed in [true, false] {
@@ -2936,7 +3054,7 @@ mod call_panel_tests {
                 egui::Event::PointerMoved(position),
                 egui::Event::PointerButton {
                     pos: position,
-                    button: egui::PointerButton::Primary,
+                    button,
                     pressed,
                     modifiers: egui::Modifiers::NONE,
                 },
