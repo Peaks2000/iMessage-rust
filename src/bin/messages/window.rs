@@ -510,6 +510,7 @@ impl MessagesApp {
                     id,
                     address: request.address,
                     body: request.body,
+                    text_part: None,
                     outgoing: true,
                     timestamp_ms: now_ms(),
                     status: Delivery::Pending,
@@ -1339,7 +1340,15 @@ impl MessagesApp {
                     if delivery_label(&self.messages, index).is_some() {
                         content_height += 14.;
                     }
-                    if !self.messages[index].tapbacks.is_empty() {
+                    let message = &self.messages[index];
+                    let reacted_parts = media
+                        .iter()
+                        .filter(|(id, _, _)| {
+                            has_tapbacks(message, message.attachment_part(id.index))
+                        })
+                        .count();
+                    content_height += 10. * reacted_parts as f32;
+                    if text.is_some() && has_tapbacks(message, message.body_part()) {
                         content_height += 10.;
                     }
                 }
@@ -1378,7 +1387,6 @@ impl MessagesApp {
                     let can_react = self.tapback_pending.is_none()
                         && self.status.as_ref().is_some_and(|status| status.connected)
                         && matches!(message.status, Delivery::Accepted | Delivery::Received);
-                    let mut first_bubble = None;
                     let day = time.map(|value| value.date_naive());
                     if day != last_day
                         && let Some(time) = time
@@ -1412,12 +1420,12 @@ impl MessagesApp {
                     let shift =
                         (1. - progress) * vec2(if message.outgoing { 8. } else { 0. }, slide);
                     let alpha = 0.23 + progress.clamp(0., 1.) * 0.77;
-                    if !message.tapbacks.is_empty() {
-                        ui.add_space(10.);
-                    }
                     for (id, info, size) in media {
+                        let part = message.attachment_part(id.index);
+                        if has_tapbacks(message, part) {
+                            ui.add_space(10.);
+                        }
                         let rect = transcript_slot(ui, size, message.outgoing).translate(shift);
-                        first_bubble.get_or_insert(rect);
                         ui.scope(|ui| {
                             ui.multiply_opacity(alpha);
                             if let Some(response) =
@@ -1425,21 +1433,36 @@ impl MessagesApp {
                                     .paint(ui, rect, id, &info, self.connection.as_ref())
                                 && can_react
                             {
-                                response
-                                    .context_menu(|ui| tapback_options(ui, message, &mut reaction));
+                                response.context_menu(|ui| {
+                                    tapback_options(ui, message, part, &mut reaction)
+                                });
                             }
                         });
+                        paint_tapbacks(ui, rect, message, part, can_react.then_some(&mut reaction));
                         ui.add_space(4.);
                     }
                     if let Some(text) = text {
+                        let part = message.body_part();
+                        if has_tapbacks(message, part) {
+                            ui.add_space(10.);
+                        }
                         let size = text.galley.size() + vec2(19., 10.);
                         let rect = transcript_slot(ui, size, message.outgoing).translate(shift);
-                        first_bubble.get_or_insert(rect);
                         if ui.is_rect_visible(rect) {
                             let fill = if message.outgoing { BLUE } else { BUBBLE_GRAY };
                             let mut painter = ui.painter().clone();
                             painter.multiply_opacity(alpha);
                             chrome::bubble_shape(&painter, rect, message.outgoing, tail, fill);
+                            if can_react {
+                                ui.interact(
+                                    rect,
+                                    ui.id().with((&message.id, "bubble")),
+                                    Sense::click(),
+                                )
+                                .context_menu(|ui| {
+                                    tapback_options(ui, message, part, &mut reaction)
+                                });
+                            }
                             let mut text_ui = ui.new_child(
                                 UiBuilder::new()
                                     .id_salt((&message.id, "body"))
@@ -1450,7 +1473,7 @@ impl MessagesApp {
                             let response = text.show(
                                 &mut text_ui,
                                 can_react.then_some(|ui: &mut Ui| {
-                                    tapback_options(ui, message, &mut reaction);
+                                    tapback_options(ui, message, part, &mut reaction);
                                 }),
                             );
                             if let Some(time) = time
@@ -1461,12 +1484,7 @@ impl MessagesApp {
                                 );
                             }
                         }
-                    }
-                    if let Some(rect) = first_bubble
-                        && !message.tapbacks.is_empty()
-                        && ui.is_rect_visible(rect.expand(10.))
-                    {
-                        paint_tapbacks(ui, rect, message);
+                        paint_tapbacks(ui, rect, message, part, can_react.then_some(&mut reaction));
                     }
                     if let Some((label, color)) = delivery_label(&self.messages, index) {
                         let (status, _) =
@@ -1941,15 +1959,28 @@ fn tapback_label(kind: &TapbackKind) -> (&str, &str) {
     }
 }
 
-fn tapback_options(ui: &mut Ui, message: &Message, selection: &mut Option<(Uuid, SetTapback)>) {
+fn tapback_options(
+    ui: &mut Ui,
+    message: &Message,
+    part: u32,
+    selection: &mut Option<(Uuid, SetTapback)>,
+) {
     let Ok(id) = Uuid::parse_str(&message.id) else {
         return;
     };
     let current = message
         .tapbacks
         .iter()
-        .find(|reaction| reaction.outgoing && reaction.part == 0)
-        .or_else(|| message.tapbacks.iter().find(|reaction| reaction.outgoing));
+        .find(|reaction| reaction.outgoing && reaction.part == part);
+    let select = |reaction| {
+        (
+            id,
+            SetTapback {
+                reaction,
+                part: Some(part),
+            },
+        )
+    };
     ui.horizontal(|ui| {
         for kind in [
             TapbackKind::Heart,
@@ -1971,12 +2002,7 @@ fn tapback_options(ui: &mut Ui, message: &Message, selection: &mut Option<(Uuid,
                 .on_hover_text(label)
                 .clicked()
             {
-                *selection = Some((
-                    id,
-                    SetTapback {
-                        reaction: (!selected).then_some(kind),
-                    },
-                ));
+                *selection = Some(select((!selected).then_some(kind)));
                 ui.close();
             }
         }
@@ -1990,26 +2016,46 @@ fn tapback_options(ui: &mut Ui, message: &Message, selection: &mut Option<(Uuid,
                     .selectable_label(selected, RichText::new(emoji).size(17.))
                     .clicked()
                 {
-                    *selection = Some((
-                        id,
-                        SetTapback {
-                            reaction: (!selected).then_some(kind),
-                        },
-                    ));
+                    *selection = Some(select((!selected).then_some(kind)));
                     ui.close_kind(egui::UiKind::Menu);
                 }
             }
         });
     });
     if current.is_some() && ui.button("Remove Tapback").clicked() {
-        *selection = Some((id, SetTapback { reaction: None }));
+        *selection = Some(select(None));
         ui.close();
     }
 }
 
-fn paint_tapbacks(ui: &mut Ui, bubble: Rect, message: &Message) {
+fn has_tapbacks(message: &Message, part: u32) -> bool {
+    message
+        .tapbacks
+        .iter()
+        .any(|reaction| tapback_on_part(message, part, reaction.part))
+}
+
+fn tapback_on_part(message: &Message, part: u32, reacted_part: u32) -> bool {
+    reacted_part == part || (part == message.first_part() && !message.has_part(reacted_part))
+}
+
+fn paint_tapbacks(
+    ui: &mut Ui,
+    bubble: Rect,
+    message: &Message,
+    part: u32,
+    mut selection: Option<&mut Option<(Uuid, SetTapback)>>,
+) {
+    if !ui.is_rect_visible(bubble.expand(11.)) {
+        return;
+    }
     let mut corner = bubble.right_top() + vec2(1., 0.);
-    for reaction in message.tapbacks.iter().take(5) {
+    for reaction in message
+        .tapbacks
+        .iter()
+        .filter(|reaction| tapback_on_part(message, part, reaction.part))
+        .take(5)
+    {
         let (symbol, label) = tapback_label(&reaction.kind);
         let rect = Rect::from_center_size(corner - vec2(11., 0.), vec2(22., 21.));
         let fill = if reaction.outgoing { BLUE } else { BUBBLE_GRAY };
@@ -2032,17 +2078,23 @@ fn paint_tapbacks(ui: &mut Ui, bubble: Rect, message: &Message) {
             chrome::bold_font(11.),
             ink,
         );
-        ui.interact(
-            rect,
-            ui.id()
-                .with((&message.id, reaction.part, reaction.outgoing)),
-            Sense::hover(),
-        )
-        .on_hover_text(if reaction.outgoing {
-            format!("You · {label}")
+        let editable = selection.as_deref_mut().filter(|_| reaction.outgoing);
+        let id = ui
+            .id()
+            .with((&message.id, reaction.part, reaction.outgoing));
+        if let Some(selection) = editable {
+            let response = ui
+                .interact(rect, id, Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(format!("You · {label}"));
+            egui::Popup::menu(&response)
+                .frame(chrome::sheet())
+                .show(|ui| {
+                    tapback_options(ui, message, reaction.part, selection);
+                });
         } else {
-            label.to_owned()
-        });
+            ui.interact(rect, id, Sense::hover()).on_hover_text(label);
+        }
         corner.x -= 18.;
     }
 }

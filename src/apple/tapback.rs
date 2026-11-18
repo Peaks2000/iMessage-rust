@@ -65,10 +65,12 @@ pub(super) fn encode(event: &TapbackEvent, original: &Message, sender: &str) -> 
         TapbackKind::Question => (5, "Questioned", "a question mark"),
         TapbackKind::Emoji(emoji) => (6, emoji.as_str(), emoji.as_str()),
     };
-    let quoted = if original.attachments.is_empty() || event.tapback.part != 0 {
-        original.body.as_str()
-    } else {
+    let quoted = if (0..original.attachments.len())
+        .any(|index| original.attachment_part(index) == event.tapback.part)
+    {
         "\u{fffc}"
+    } else {
+        original.body.as_str()
     };
     let mut summary = Vec::new();
     plist::to_writer_binary(
@@ -124,6 +126,7 @@ mod tests {
         let message = Message {
             id: "76ab2a9b-903d-48a0-9de5-2df815ce3c71".into(),
             body: "Hi 👋".into(),
+            text_part: None,
             address: "mailto:peer@example.org".into(),
             outgoing: false,
             timestamp_ms: 0,
@@ -154,6 +157,59 @@ mod tests {
         assert!(decoded.removed);
         assert_eq!(decoded.target, event.target);
         assert_eq!(decoded.tapback, event.tapback);
+        Ok(())
+    }
+
+    #[test]
+    fn photo_and_caption_tapbacks_use_the_apple_part_and_matching_quote() -> Result<()> {
+        let body = Dictionary::from_iter([
+            ("t", Value::from("Caption\u{fffc}\u{fffc}")),
+            (
+                "x",
+                Value::from(
+                    r#"<html><body><span message-part="0">Caption</span><FILE name="first.png" uti-type="public.png" message-part="4" inline-attachment="ia-0"/><FILE name="second.png" uti-type="public.png" message-part="7" inline-attachment="ia-1"/></body></html>"#,
+                ),
+            ),
+            ("ia-0", Value::Data(vec![1])),
+            ("ia-1", Value::Data(vec![2])),
+        ]);
+        let content = super::super::message_content::decode(&body);
+        let target = Uuid::parse_str("76AB2A9B-903D-48A0-9DE5-2DF815CE3C71")?;
+        let message = Message {
+            id: target.to_string(),
+            body: content.text,
+            text_part: content.text_part,
+            address: "mailto:peer@example.org".into(),
+            outgoing: false,
+            timestamp_ms: 0,
+            status: Delivery::Received,
+            attachments: content.files.into_iter().map(|(info, _)| info).collect(),
+            tapbacks: Vec::new(),
+        };
+        for (part, quote) in [
+            (message.attachment_part(1), "\u{fffc}"),
+            (message.body_part(), "Caption"),
+        ] {
+            let event = TapbackEvent {
+                id: Uuid::new_v4(),
+                target,
+                chat: message.address.clone(),
+                timestamp_ns: 1,
+                removed: false,
+                tapback: Tapback {
+                    kind: TapbackKind::Like,
+                    outgoing: true,
+                    part,
+                },
+            };
+            let payload = encode(&event, &message, "mailto:me@example.org")?;
+            let key = format!("p:{part}/76AB2A9B-903D-48A0-9DE5-2DF815CE3C71");
+            assert_eq!(payload["amk"].as_string(), Some(key.as_str()));
+            let summary: Dictionary = plist::from_bytes(payload["msi"].as_data().unwrap())?;
+            assert_eq!(summary["ams"].as_string(), Some(quote));
+        }
+        assert_eq!(message.attachment_part(1), 7);
+        assert_eq!(message.body_part(), 0);
         Ok(())
     }
 }

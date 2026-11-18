@@ -61,6 +61,7 @@ struct DeliveryPayload<'a> {
     recipient: &'a str,
     guid: Uuid,
     bytes: &'a [u8],
+    request_receipt: bool,
     invite_context: Option<u64>,
 }
 
@@ -377,6 +378,7 @@ impl Madrid {
                 recipient: &message.address,
                 guid: message.id,
                 bytes: &text,
+                request_receipt: true,
                 invite_context: None,
             },
             &targets,
@@ -390,8 +392,7 @@ impl Madrid {
         target: &Message,
         event: &TapbackEvent,
     ) -> Result<Delivery> {
-        let payload = tapback::encode(event, target, &identity.handle)?;
-        let payload = compress(&binary(&payload)?)?;
+        let payload = binary(&tapback::encode(event, target, &identity.handle)?)?;
         let targets = self
             .message_destinations(identity, TOPIC, &event.chat)
             .await?;
@@ -401,6 +402,7 @@ impl Madrid {
                 recipient: &event.chat,
                 guid: event.id,
                 bytes: &payload,
+                request_receipt: false,
                 invite_context: None,
             },
             &targets,
@@ -425,6 +427,7 @@ impl Madrid {
                     recipient: &call.caller,
                     guid: Uuid::new_v4(),
                     bytes: &bytes,
+                    request_receipt: false,
                     invite_context: Some(facetime::DECLINE),
                 },
                 &targets,
@@ -490,9 +493,7 @@ impl Madrid {
                         ("tP", value(uri)),
                         (
                             "D",
-                            Value::Boolean(
-                                payload.invite_context.is_none() && uri == payload.recipient,
-                            ),
+                            Value::Boolean(payload.request_receipt && uri == payload.recipient),
                         ),
                         ("sT", data(&device.session)),
                         ("P", data(&encrypted)),
@@ -722,7 +723,11 @@ impl Madrid {
                 return Ok(tapback::decode(&body, guid, peer, outgoing, timestamp_ns)
                     .map(Incoming::Tapback));
             }
-            let (text, files) = message_content::decode(&body);
+            let message_content::Content {
+                text,
+                text_part,
+                files,
+            } = message_content::decode(&body);
             if text.trim().is_empty() && files.is_empty() {
                 return Ok(None);
             }
@@ -732,6 +737,7 @@ impl Madrid {
                     id: guid.to_string(),
                     address: peer,
                     body: text,
+                    text_part,
                     attachments,
                     outgoing,
                     timestamp_ms: timestamp_ns / 1_000_000,

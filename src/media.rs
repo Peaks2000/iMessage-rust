@@ -13,6 +13,8 @@ pub struct Attachment {
     pub width: u32,
     #[serde(default)]
     pub height: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part: Option<u32>,
 }
 
 impl Attachment {

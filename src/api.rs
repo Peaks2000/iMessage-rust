@@ -190,7 +190,7 @@ async fn set_tapback(
     RoutePath(id): RoutePath<uuid::Uuid>,
     Json(request): Json<SetTapback>,
 ) -> Result<Json<Vec<Tapback>>, Failure> {
-    Ok(Json(engine.set_tapback(id, request.reaction).await?))
+    Ok(Json(engine.set_message_tapback(id, request).await?))
 }
 
 async fn decline_call(
