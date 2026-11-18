@@ -963,12 +963,7 @@ impl Madrid {
                 .find(|part| *part != identity.handle)
                 .context("Missing conversation recipient")?;
             let outgoing = sender == identity.handle;
-            let timestamp_ns = wire
-                .get("e")
-                .and_then(Value::as_unsigned_integer)
-                .and_then(|ns| i64::try_from(ns).ok())
-                .filter(|ns| *ns > 0 && *ns / 1_000_000 <= now_ms() + 120_000)
-                .unwrap_or_else(crate::now_ns);
+            let timestamp_ns = message_timestamp(wire, crate::now_ns());
             if body.contains_key("amk")
                 && matches!(
                     body.get("amt").and_then(Value::as_unsigned_integer),
@@ -1009,6 +1004,16 @@ impl Madrid {
         // Invalid or unsupported payloads cannot be retried into validity.
         Ok(decoded.unwrap_or(None))
     }
+}
+
+fn message_timestamp(wire: &Dictionary, now: i64) -> i64 {
+    // On retry, the original send time precedes the new APNs delivery time.
+    ["e", "oe"]
+        .into_iter()
+        .filter_map(|field| wire.get(field)?.as_unsigned_integer()?.try_into().ok())
+        .filter(|ns: &i64| *ns > 0 && *ns <= now.saturating_add(120_000_000_000))
+        .min()
+        .unwrap_or(now)
 }
 
 fn lookup_body(targets: &[&str]) -> Result<Vec<u8>> {
@@ -1085,6 +1090,19 @@ mod tests {
         rsa::Rsa,
         sha::sha1,
     };
+
+    #[test]
+    fn retried_messages_keep_their_original_timestamp() {
+        let original = 1_700_000_000_000_000_000_i64;
+        let delivered = original + 2_000_000_000;
+        let now = delivered + 1_000_000_000;
+        let mut wire = dictionary([("e", delivered.into()), ("oe", original.into())]);
+        assert_eq!(message_timestamp(&wire, now), original);
+        wire.insert("oe".into(), (now + 121_000_000_000).into());
+        assert_eq!(message_timestamp(&wire, now), delivered);
+        wire.remove("e");
+        assert_eq!(message_timestamp(&wire, now), now);
+    }
 
     #[test]
     fn ids_queries_encode_recipients_as_gzipped_xml() -> Result<()> {

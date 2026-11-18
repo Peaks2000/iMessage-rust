@@ -451,6 +451,7 @@ mod tests {
         let (status, mut reader) = watch::channel(Status {
             connected: true,
             detail: String::new(),
+            tapback_revision: None,
             facetime_registered: true,
             incoming_calls: Vec::new(),
         });
