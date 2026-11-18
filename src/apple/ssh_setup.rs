@@ -134,10 +134,7 @@ impl MacConnection {
                     status = master.wait() => {
                         status?;
                         let error = errors.await.unwrap_or_default();
-                        if String::from_utf8_lossy(&error).contains("REMOTE HOST IDENTIFICATION HAS CHANGED") {
-                            bail!("The Mac's SSH fingerprint changed. Verify the Mac before updating its trusted SSH key");
-                        }
-                        bail!("Could not sign in to the Mac. Check Remote Login, the Mac address and the Mac login credentials");
+                        bail!(ssh_connection_error(&String::from_utf8_lossy(&error)));
                     }
                     incoming = listener.accept() => {
                         let (stream, _) = incoming?;
@@ -150,7 +147,9 @@ impl MacConnection {
                     }
                 }
             }
-        }).await.context("Mac SSH sign-in timed out")??;
+        })
+        .await
+        .context("Mac SSH sign-in timed out")??;
         Ok(Self {
             host,
             control,
@@ -258,6 +257,50 @@ impl MacConnection {
             remote,
         ])
     }
+}
+
+fn ssh_connection_error(stderr: &str) -> &'static str {
+    if stderr.contains("REMOTE HOST IDENTIFICATION HAS CHANGED") {
+        return "The Mac's SSH fingerprint changed. Verify the Mac before updating its trusted SSH key";
+    }
+
+    for line in stderr.lines().rev() {
+        if let Some(reason) = line
+            .strip_prefix("ssh: connect to host ")
+            .and_then(|message| message.rsplit_once(": "))
+            .map(|(_, reason)| reason)
+        {
+            return match reason {
+                "Connection refused" => {
+                    "The Mac address refused SSH. Check that Remote Login is on in Sharing on the Mac and use the address shown there"
+                }
+                "Connection timed out"
+                | "Operation timed out"
+                | "No route to host"
+                | "Network is unreachable"
+                | "Host is down" => {
+                    "Could not reach the Mac over SSH. Check that it is awake and that its address in Sharing is current"
+                }
+                _ => {
+                    "Could not connect to the Mac over SSH. Check its address and Remote Login in Sharing"
+                }
+            };
+        }
+        if line.starts_with("ssh: Could not resolve hostname ") {
+            return "Could not find the Mac by that name. Use the SSH address shown in Remote Login on the Mac";
+        }
+        if line == "Host key verification failed." {
+            return "Could not verify the Mac's SSH fingerprint";
+        }
+        if line.contains(": Permission denied (") || line.ends_with(": Permission denied.") {
+            return "The Mac rejected the SSH login. Check the Mac username, login password and Remote Login access for that user";
+        }
+        if line.starts_with("Unable to negotiate with ") && line.contains(": no matching ") {
+            return "OpenSSH and the Mac could not agree on an SSH security algorithm";
+        }
+    }
+
+    "OpenSSH closed the connection before iMessage could start Mac setup"
 }
 
 async fn exchange_validation_frames(
@@ -394,6 +437,47 @@ pub fn run_ssh_askpass() -> Result<bool> {
 mod tests {
     use super::*;
     use tokio::io::{duplex, split};
+
+    #[test]
+    fn ssh_connection_errors_distinguish_network_login_and_trust_failures() {
+        let cases = [
+            (
+                "ssh: connect to host 192.168.4.5 port 22: Connection refused\n",
+                "The Mac address refused SSH",
+            ),
+            (
+                "ssh: connect to host mac.local port 22: Connection timed out\n",
+                "Could not reach the Mac over SSH",
+            ),
+            (
+                "ssh: Could not resolve hostname test.local: Name or service not known\n",
+                "Could not find the Mac by that name",
+            ),
+            (
+                "test@mac.local: Permission denied (publickey,password,keyboard-interactive).\n",
+                "The Mac rejected the SSH login",
+            ),
+            (
+                "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\nHost key verification failed.\n",
+                "The Mac's SSH fingerprint changed",
+            ),
+            (
+                "Host key verification failed.\n",
+                "Could not verify the Mac's SSH fingerprint",
+            ),
+            (
+                "Unable to negotiate with 192.168.4.5 port 22: no matching host key type found.\n",
+                "OpenSSH and the Mac could not agree",
+            ),
+            (
+                "Unrecognized OpenSSH output\n",
+                "OpenSSH closed the connection",
+            ),
+        ];
+        for (stderr, expected) in cases {
+            assert!(ssh_connection_error(stderr).starts_with(expected));
+        }
+    }
 
     #[tokio::test]
     async fn validation_waits_for_the_linux_session_reply_and_bounds_frames() -> Result<()> {

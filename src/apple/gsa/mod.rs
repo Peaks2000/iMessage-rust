@@ -56,6 +56,10 @@ pub trait SmsPrompts {
         async { self.read_code().await.map(TrustedDeviceResponse::Code) }
     }
 
+    fn retry_apple_password(&mut self) -> impl Future<Output = Result<Option<Zeroizing<String>>>> {
+        async { Ok(None) }
+    }
+
     fn request_icloud_contacts(&self) -> bool {
         false
     }
@@ -133,15 +137,9 @@ pub(super) async fn login(
         push_token: device.token()?,
         mac_provisioned: proofs.is_some(),
     };
-    let password_hash = Zeroizing::new(sha256(password.as_bytes()));
-    drop(password);
-    prompts.setup_stage(AppleSetupStage::SignIn);
-    let session = gsa
-        .sign_in(anisette, account, &password_hash, prompts)
-        .await?;
-    // The account can pause for a trusted-device or SMS code. A connected provider can
-    // issue a fresh qualification proof when Apple Account verification has finished.
-    if session.verified_with_code
+    let session = gsa.sign_in(anisette, account, password, prompts).await?;
+    // Refresh the qualification proof after waiting for user input during sign-in.
+    if session.needs_fresh_qualification
         && let Some(proofs @ Proofs::Provider(_)) = &proofs
     {
         prompts.setup_stage(AppleSetupStage::ValidateDevice);
@@ -209,10 +207,8 @@ pub async fn authorize_icloud_contacts(
         push_token: identity.token,
         mac_provisioned: true,
     };
-    let password_hash = Zeroizing::new(sha256(password.as_bytes()));
-    drop(password);
     let session = gsa
-        .sign_in(&mut anisette, account, &password_hash, prompts)
+        .sign_in(&mut anisette, account, password, prompts)
         .await?;
     super::icloud_contacts::authorize(account, &session, &mut anisette).await
 }
@@ -227,7 +223,7 @@ struct GrandSlam<'a> {
 pub(super) struct LoginSession {
     pub adsid: String,
     pub pet: Zeroizing<String>,
-    verified_with_code: bool,
+    needs_fresh_qualification: bool,
 }
 
 enum PasswordStep {
@@ -359,6 +355,17 @@ impl fmt::Display for SignInUnavailable {
 
 impl std::error::Error for SignInUnavailable {}
 
+#[derive(Debug)]
+struct ApplePasswordRejected;
+
+impl fmt::Display for ApplePasswordRejected {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Apple did not accept the Apple Account sign-in (Apple status -22406)")
+    }
+}
+
+impl std::error::Error for ApplePasswordRejected {}
+
 struct PhoneOptions {
     phones: Vec<TrustedPhone>,
     sent_to: Option<u32>,
@@ -388,12 +395,28 @@ impl GrandSlam<'_> {
         &self,
         anisette: &mut Anisette,
         account: &str,
-        password: &[u8; 32],
+        mut password: Zeroizing<String>,
         prompts: &mut impl SmsPrompts,
     ) -> Result<LoginSession> {
-        let challenge = match self.password_step(anisette, account, password).await? {
-            PasswordStep::Verified(session) => return Ok(session),
-            PasswordStep::Challenge(challenge) => challenge,
+        let mut password_retried = false;
+        let (challenge, password_hash) = loop {
+            validate_login(account, &password)?;
+            let hash = Zeroizing::new(sha256(password.as_bytes()));
+            drop(password);
+            prompts.setup_stage(AppleSetupStage::SignIn);
+            match self.password_step(anisette, account, &hash).await {
+                Ok(PasswordStep::Verified(mut session)) => {
+                    session.needs_fresh_qualification = password_retried;
+                    return Ok(session);
+                }
+                Ok(PasswordStep::Challenge(challenge)) => break (challenge, hash),
+                Err(error) if error.is::<ApplePasswordRejected>() => {
+                    drop(hash);
+                    password = prompts.retry_apple_password().await?.ok_or(error)?;
+                    password_retried = true;
+                }
+                Err(error) => return Err(error),
+            }
         };
         if let Some(session) = self
             .complete_challenge(anisette, &challenge, prompts)
@@ -401,13 +424,16 @@ impl GrandSlam<'_> {
         {
             return Ok(session);
         }
-        match self.password_step(anisette, account, password).await? {
+        match self
+            .password_step(anisette, account, &password_hash)
+            .await?
+        {
             PasswordStep::Verified(mut session) => {
                 ensure!(
                     session.adsid == challenge.adsid,
                     "Apple changed the account after verification"
                 );
-                session.verified_with_code = true;
+                session.needs_fresh_qualification = true;
                 Ok(session)
             }
             PasswordStep::Challenge(_) => {
@@ -619,7 +645,7 @@ impl GrandSlam<'_> {
                 Ok(PasswordStep::Verified(LoginSession {
                     adsid,
                     pet: Zeroizing::new(pet.into()),
-                    verified_with_code: false,
+                    needs_fresh_qualification: false,
                 }))
             }
         }
@@ -663,6 +689,9 @@ impl GrandSlam<'_> {
             .and_then(|value| value.get("ec"))
             .and_then(Value::as_signed_integer)
             .context("Apple omitted the sign-in status")?;
+        if returned == -22406 {
+            return Err(ApplePasswordRejected.into());
+        }
         ensure!(
             returned == 0 && status.is_success(),
             "Apple rejected sign-in (Apple status {returned}, HTTP {})",
@@ -834,7 +863,7 @@ async fn finish_verification(
     Ok(Some(LoginSession {
         adsid: challenge.adsid.clone(),
         pet: Zeroizing::new(token.to_owned()),
-        verified_with_code: true,
+        needs_fresh_qualification: true,
     }))
 }
 
@@ -1071,7 +1100,7 @@ mod tests {
                 let result = result.context("The fixture supplies a PET")?;
                 assert_eq!(result.adsid, "123");
                 assert_eq!(result.pet.as_str(), "fixture-pet");
-                assert!(result.verified_with_code);
+                assert!(result.needs_fresh_qualification);
                 assert_eq!(prompts.choices, 1);
                 assert_eq!(
                     *fixture.requests.lock().unwrap(),
@@ -1232,20 +1261,7 @@ mod tests {
                                 )
                                     .into_response();
                             }
-                            let reply = Dictionary::from_iter([(
-                                "Response",
-                                Value::Dictionary(Dictionary::from_iter([
-                                    (
-                                        "Status",
-                                        Value::Dictionary(Dictionary::from_iter([("ec", 0_i64)])),
-                                    ),
-                                    ("s", Value::Data(vec![1; 16])),
-                                    ("B", Value::Data(vec![3])),
-                                    ("i", 1.into()),
-                                    ("c", "fixture challenge".into()),
-                                ])),
-                            )]);
-                            (StatusCode::OK, plist_xml(&reply).unwrap().to_vec()).into_response()
+                            (StatusCode::OK, fixture_srp_challenge(0)).into_response()
                         },
                     ),
                 )
@@ -1289,6 +1305,98 @@ mod tests {
             server.abort();
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejected_apple_password_prompts_before_starting_a_new_exchange() -> Result<()> {
+        struct RetryPrompts(usize);
+
+        impl SmsPrompts for RetryPrompts {
+            async fn choose_phone(&mut self, _: &[TrustedPhone]) -> Result<usize> {
+                anyhow::bail!("Unexpected phone selection")
+            }
+
+            async fn read_code(&mut self) -> Result<Zeroizing<String>> {
+                anyhow::bail!("Unexpected verification code request")
+            }
+
+            async fn retry_apple_password(&mut self) -> Result<Option<Zeroizing<String>>> {
+                self.0 += 1;
+                Ok(Some(Zeroizing::new("second fixture password".into())))
+            }
+        }
+
+        let requests = Arc::new(Mutex::new(Vec::<Dictionary>::new()));
+        let app = Router::new()
+            .route(
+                "/grandslam/GsService2",
+                post(
+                    |State(requests): State<Arc<Mutex<Vec<Dictionary>>>>, body: Bytes| async move {
+                        let document: Dictionary = plist::from_bytes(&body).unwrap();
+                        let request = document["Request"].as_dictionary().unwrap().clone();
+                        let mut requests = requests.lock().unwrap();
+                        requests.push(request);
+                        let status = match requests.len() {
+                            1 | 3 => 0_i64,
+                            2 => -22406,
+                            _ => -1,
+                        };
+                        fixture_srp_challenge(status)
+                    },
+                ),
+            )
+            .with_state(Arc::clone(&requests));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let origin = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = Client::builder().no_proxy().build()?;
+        let service = GrandSlam {
+            client: &client,
+            origin: &origin,
+            push_token: [0; 32],
+            mac_provisioned: true,
+        };
+        let temp = tempfile::tempdir()?;
+        let mut anisette = fixture_anisette(temp.path())?;
+        let mut prompts = RetryPrompts(0);
+        let error = service
+            .sign_in(
+                &mut anisette,
+                "fixture@example.com",
+                Zeroizing::new("first fixture password".into()),
+                &mut prompts,
+            )
+            .await
+            .err()
+            .context("The fixture ends with another Apple status")?;
+        assert!(error.to_string().contains("Apple status -1, HTTP 200"));
+        assert_eq!(prompts.0, 1);
+        let requests = requests.lock().unwrap();
+        let operations: Vec<_> = requests
+            .iter()
+            .map(|item| item["o"].as_string().unwrap())
+            .collect();
+        assert_eq!(operations, ["init", "complete", "init", "complete"]);
+        assert_ne!(requests[0]["A2k"], requests[2]["A2k"]);
+        server.abort();
+        Ok(())
+    }
+
+    fn fixture_srp_challenge(status: i64) -> Vec<u8> {
+        let reply = Dictionary::from_iter([(
+            "Response",
+            Value::Dictionary(Dictionary::from_iter([
+                (
+                    "Status",
+                    Value::Dictionary(Dictionary::from_iter([("ec", status)])),
+                ),
+                ("s", Value::Data(vec![1; 16])),
+                ("B", Value::Data(vec![3])),
+                ("i", 1.into()),
+                ("c", "fixture challenge".into()),
+            ])),
+        )]);
+        plist_xml(&reply).unwrap().to_vec()
     }
 
     fn fixture_anisette(root: &Path) -> Result<Anisette> {

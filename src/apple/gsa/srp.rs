@@ -56,7 +56,7 @@ impl Exchange {
         public.mod_exp(&generator, &private, &modulus, &mut context)?;
         Ok(Self {
             private,
-            public: public.to_vec(),
+            public: public.to_vec_padded(modulus.num_bytes())?,
         })
     }
 
@@ -101,7 +101,6 @@ impl Exchange {
             server.num_bits() != 0 && server < modulus,
             "Invalid Apple SRP public value"
         );
-        let server_bytes = server.to_vec();
         let generator = BigNum::from_u32(2)?;
         let modulus_bytes = modulus.to_vec();
         let padded_generator = generator.to_vec_padded(modulus.num_bytes())?;
@@ -116,17 +115,11 @@ impl Exchange {
         )?;
         // GrandSlam omits the account name from x but still binds it into M1.
         let identity_hash = Zeroizing::new(hash(&[b":", derived.as_ref()]));
-        let start = identity_hash
-            .iter()
-            .position(|byte| *byte != 0)
-            .unwrap_or(identity_hash.len());
-        let x_hash = Zeroizing::new(hash(&[salt, &identity_hash[start..]]));
+        let x_hash = Zeroizing::new(hash(&[salt, identity_hash.as_ref()]));
         let x = SecretNumber::from_bytes(x_hash.as_ref())?;
         let k = BigNum::from_slice(&hash(&[&modulus_bytes, &padded_generator]))?;
-        let mut padded_public = [0; 256];
-        padded_public[256 - self.public.len()..].copy_from_slice(&self.public);
         let padded_server = server.to_vec_padded(modulus.num_bytes())?;
-        let u = BigNum::from_slice(&hash(&[&padded_public, &padded_server]))?;
+        let u = BigNum::from_slice(&hash(&[&self.public, &padded_server]))?;
         ensure!(u.num_bits() != 0, "Invalid Apple SRP scramble");
 
         let mut context = BigNumContext::new_secure()?;
@@ -144,7 +137,8 @@ impl Exchange {
         let mut premaster = SecretNumber::new()?;
         premaster.mod_exp(&base, &exponent, &modulus, &mut context)?;
 
-        let premaster_bytes = Zeroizing::new(premaster.to_vec());
+        // GrandSlam uses CoreCrypto's SRP-6a hash variant with fixed-width group elements.
+        let premaster_bytes = Zeroizing::new(premaster.to_vec_padded(modulus.num_bytes())?);
         let key = Zeroizing::new(sha256(&premaster_bytes));
         let mut group_hash = sha256(&modulus_bytes);
         for (part, other) in group_hash.iter_mut().zip(sha256(&padded_generator)) {
@@ -155,7 +149,7 @@ impl Exchange {
             &sha256(account.as_bytes()),
             salt,
             &self.public,
-            &server_bytes,
+            &padded_server,
             key.as_ref(),
         ]);
         let server = Zeroizing::new(hash(&[&self.public, &client, key.as_ref()]));
@@ -248,32 +242,34 @@ mod tests {
 
     #[test]
     fn verifies_independent_s2k_and_s2k_fo_server_vectors() -> Result<()> {
-        // These fixtures use a separate Python server-side SRP calculation, with a short
-        // public A and a leading zero in the inner password hash to test the wire encodings.
+        // An independent Python server calculation exercises leading zeros in the group
+        // elements and in the inner password hash for both password derivations.
         let exchange = Exchange::from_private(&[1])?;
-        assert_eq!(exchange.public(), &[2]);
+        let mut public = [0; 256];
+        public[255] = 2;
+        assert_eq!(exchange.public(), public);
         let vectors = [
             (
                 "s2k",
                 "0002f4",
                 concat!(
-                    "9c03017fbc1725fc8863af8d192548ca4d73b498dbec4698af4108bb1308d8c3d9ded5e386202412640450d0af68888da426deb19ef8f257bf1bb8074d3c69111e7ef100b881f7718b8544f256a11578d4be791b640cfed37af23ab708708de7c51c12ed9431b4d5f0f98f5b14f47fedff9fb1b2e27ad0f09dc207b9cdb96746b262",
-                    "399b8430c3c943ca07ec952ac2cf1d71b362849dbaa2402abc371e9611840bcb8fc3971c7a10d981463a18853719651a3f9a3b27aaf335eb8a0c7df6f78a9b2dfa622a34c9a36468549b5a394f0061d0c559972ee2653e7882840aaa946a9085ad4a59c66d93280ff5347aa1c218261c313593115b8082a33f53e95b56d5"
+                    "1e25cf95163eabdf9e90d0f5758acf2ceb076173b54ff052de9904305e7c73d6b5498ee8498d4ba532b55f5119b8765ea82e758b800ef570b8f61335f562ac0c27d17b08f7963f176b8871b06655bb9b9f4fae66d5852c10aa5bceecf38d4b81091f9d6182688a36ade2c3a4e29b4399f6693018518f102c424993a6fde33110",
+                    "1fc9e3ad98ad209d96d4feea0e700a70e4a8119d253d074a480831e4bdccc55034d46aef455817472628eaa660060288a8b475476e149e4c9e5865d72931f04d2a834338b5c90f595dd56243552281f87ac7692ca71607be1e26f65f0aa2d83d795415df47550fbbfa3b368feecafa82351b49e5a11e43a457f1db6784eec20b"
                 ),
-                "fc95a2aeb48774fd6fc3f39c5ac32f113d95ca51a90ab7be6cf3ca8413008b57",
-                "a48d693cf29a8a5fdbbbe83f1db0da04bf2a2fd203a34fa4e84a3851245276b0",
-                "34aeda19b7446d3268b3a3b42a93c6edb0e859af4d509cdd0a7e0f701bd038d9",
+                "ba710caac30494bed62a43144b699d751d45428c602c821d36499856f6a3f4cd",
+                "181e80e42b010a8ff14e0eadba9579aedb8face2482e448cf2aeb13beb36a83e",
+                "f0f76d52ffd071a485f6ece3c801cc7f02102c8a4716b7cf734bcc0ecffadda4",
             ),
             (
                 "s2k_fo",
                 "00004d",
                 concat!(
-                    "3c07afa23b518c141033090adeebaaa35df4d4589e1f481aa43e628a4cbbf0b2ebea901a54c5ced4c9e71877d3883552585da8a0857651829e84054ebaa49d2f794bc3290d6ffe7427a18a86f183a87a55f9aea0d02f4c19e20741deb95f76a075435fb5fb29cc56755f30b0da6389afbc4d6c7c8f28fc791a18f944250",
-                    "ba84f967daa58e842c8d5a342fe7ae0c8bc97e096958d44df32dbc2bf84c952fff2cd56844811869e3e5c8d2f4ef0a2f25207210cbb78c6f00150f1a1e14de3af9f033a6b06f00d513a15bfd9c5c17a451b7a23a4ab95aceb61a5a94cd25087d3fd56f1f5389925253e1d8eae3fb3239b987ebf395f685531c6c3fb83a722dbd0ee17"
+                    "0077218f3271eb3d4e86e0599dd840f021aa6805f9111cc1311c5ac8f7cde04cff363fc6a17afe27b5633b3548c1a89d18bd9d4a4fc01aaffa0ee80b2cc6d90625f71702abcc750bdbf5ed1c87d6605ace55d377ee533c51f2749294edb3593aa8194f8fd6deb4146896624c1675e50e2561c7f94bbb88b5d19ed3baf60c2b40",
+                    "35732a24d134ac6442793888ead29f2be287187fbd65b25a3d085255983d01aa41a25c4270aeb26ea3e7b10ce22c1df2363be0db5d55408961eb25e2400857770935ad28648d3cbcc22e4adbd6f3bd964c06ce4f1d51236a42035d756d23c33f35634135bba35145e96bca57194e3cb192fe95655fd3108b8229444ec011ccd1"
                 ),
-                "841c9adcd30a0a4fdd14746e7e9cf66e0690cbf8e34684cf63e62eb4b6a2d9d6",
-                "d9e084b98500f05aa26a28416dfc29bf42574d14123b2a02d9871e68d4fb66ee",
-                "c4501e854d624823c016f23bed29526438e3a02980a53be704c26a3a65d58b05",
+                "b6334f77b3ea29e3cc626c543d12b10c51552157b9fea8d3597305e9a4a88a3f",
+                "0e19979fb1f807f7ff7dd07771ab4a70c3ca0e30832041271617eec69d8bf4b5",
+                "0c033ddf54e2d98c179989c284985abb66279eb10a4164a40e4d9e5d4c5fa51f",
             ),
         ];
         for (protocol, salt, public_b, m1, m2, cipher) in vectors {

@@ -46,6 +46,7 @@ pub(super) struct MacSetup {
     error: Option<String>,
     worker: Option<Worker>,
     focus_code: bool,
+    focus_password: bool,
     focus_ssh: bool,
 }
 
@@ -65,6 +66,7 @@ enum Step {
         answer: oneshot::Sender<usize>,
     },
     Code(CodePrompt),
+    ApplePassword(oneshot::Sender<Zeroizing<String>>),
     Ssh(SshPrompt, oneshot::Sender<Zeroizing<String>>),
     Saving,
     RetrySave(oneshot::Sender<()>),
@@ -85,6 +87,7 @@ enum Event {
     Progress(&'static str),
     Phone(Vec<String>, oneshot::Sender<usize>),
     Code(CodePrompt),
+    ApplePassword(oneshot::Sender<Zeroizing<String>>),
     Ssh(SshPrompt, oneshot::Sender<Zeroizing<String>>),
     Save(oneshot::Sender<()>),
     StorageError(anyhow::Error, oneshot::Sender<()>),
@@ -120,6 +123,7 @@ impl MacSetup {
             error: None,
             worker: None,
             focus_code: false,
+            focus_password: false,
             focus_ssh: false,
         }
     }
@@ -205,6 +209,18 @@ impl MacSetup {
                         submit = valid && response.lost_focus()
                             && ui.input(|input| input.key_pressed(egui::Key::Enter));
                         ("Verify", valid)
+                    }
+                    Step::ApplePassword(_) => {
+                        ui.label("Apple did not accept the sign-in. Enter your current Apple Account password to try again.");
+                        let response = edit(ui, "Apple Account password", &mut self.password, "", true);
+                        if self.focus_password {
+                            response.request_focus();
+                            self.focus_password = false;
+                        }
+                        let valid = !self.password.is_empty();
+                        submit = valid && response.lost_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                        ("Sign In", valid)
                     }
                     Step::Ssh(SshPrompt::VerifyHost { host, fingerprint }, _) => {
                         ui.label(format!("Verify this Mac's SSH fingerprint for {host}."));
@@ -414,6 +430,10 @@ impl MacSetup {
                 };
                 let _ = answer.send(response);
             }
+            Step::ApplePassword(answer) => {
+                self.step = Step::Working("Signing in to your Apple Account…");
+                let _ = answer.send(std::mem::take(&mut self.password));
+            }
             Step::Ssh(prompt, answer) => {
                 let value = match prompt {
                     SshPrompt::VerifyHost { .. } => Zeroizing::new("yes".to_owned()),
@@ -467,6 +487,10 @@ impl MacSetup {
                 self.focus_code = true;
                 self.step = Step::Code(answer);
             }
+            Ok(Event::ApplePassword(answer)) => {
+                self.focus_password = true;
+                self.step = Step::ApplePassword(answer);
+            }
             Ok(Event::Ssh(prompt, answer)) => {
                 self.ssh_answer = Zeroizing::default();
                 self.focus_ssh = true;
@@ -508,6 +532,7 @@ impl Worker {
                 send,
                 context,
                 mac_password: std::mem::take(&mut request.mac_password),
+                remembered_password: None,
                 contacts_grant: None,
             };
             let result = run(&root, request, &mut prompts, canceled);
@@ -552,11 +577,7 @@ fn run(
             .context("Enter your Apple Account password")?
             .password;
     }
-    let remembered = if remember_password {
-        password.clone()
-    } else {
-        Zeroizing::default()
-    };
+    prompts.remembered_password = remember_password.then(|| password.clone());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -588,7 +609,7 @@ fn run(
         .context("Missing Apple session")?;
     let mut saved = storage::SavedAppleAccount {
         account: account.to_owned(),
-        password: remembered,
+        password: prompts.remembered_password.take().unwrap_or_default(),
         contacts,
     };
     let (permit, mut confirmed) = oneshot::channel();
@@ -636,6 +657,7 @@ struct GuiPrompts {
     send: Sender<Event>,
     context: egui::Context,
     mac_password: Zeroizing<String>,
+    remembered_password: Option<Zeroizing<String>>,
     contacts_grant: Option<IcloudContactsGrant>,
 }
 
@@ -695,6 +717,16 @@ impl SmsPrompts for GuiPrompts {
         let (answer, code) = oneshot::channel();
         self.emit(Event::Code(CodePrompt::TrustedDevice(answer)))?;
         code.await.context("Apple account setup canceled")
+    }
+
+    async fn retry_apple_password(&mut self) -> Result<Option<Zeroizing<String>>> {
+        let (answer, response) = oneshot::channel();
+        self.emit(Event::ApplePassword(answer))?;
+        let password = response.await.context("Apple account setup canceled")?;
+        if let Some(remembered) = &mut self.remembered_password {
+            *remembered = password.clone();
+        }
+        Ok(Some(password))
     }
 
     fn prefers_ssh_password(&self) -> bool {
@@ -760,6 +792,7 @@ mod tests {
             send,
             context: egui::Context::default(),
             mac_password: Zeroizing::new("fixture mac password".to_owned()),
+            remembered_password: None,
             contacts_grant: None,
         };
         let host = "fixture@mac.local".to_owned();
