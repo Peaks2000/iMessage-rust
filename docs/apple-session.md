@@ -16,6 +16,8 @@ The Linux app generates Anisette with its installed local ADI library and stores
 
 If Apple sends a sign-in alert to your iPhone or another trusted device, tap **Allow** and enter the six-digit code in iMessage. Choose **Use SMS** if you prefer a text message to a trusted phone number.
 
+Setup requests iMessage and FaceTime registration in the same sign-in. Apple can grant iMessage access independently. If Apple rejects the combined request, setup retries iMessage with a new validation proof when the device helper can generate one.
+
 With **Remember Apple Account password** selected, Linux Secret Service keeps the Apple Account credentials for later sign-in. The desktop also requests iCloud Contacts access from the same sign-in. Once authorized, Contacts syncs directly from iCloud whenever the app opens.
 
 For a source build, install the local Anisette library with `bash tools/build-local-adi.sh "$HOME/.local/lib/linux-imessage"`. The script uses Git, CMake, a C++20 compiler and the mbed TLS development libraries.
@@ -40,6 +42,7 @@ The plist is a dictionary with the following keys.
 | `push-token` | 32-byte APNs device token |
 | `push-certificate`, `push-private-key` | Matching DER X.509 certificate and RSA private key for the APNs session |
 | `ids-certificate`, `ids-private-key` | Matching DER X.509 certificate and RSA private key registered for the iMessage service and the same device |
+| `facetime-certificates` | Optional dictionary of DER X.509 certificates issued for `com.apple.private.alloy.facetime.multi` and `com.apple.ess`. Both use the same `ids-private-key`. |
 | `signing-private-key` | DER P-256 private key registered as the legacy iMessage signing identity |
 | `encryption-private-key` | DER 1280-bit RSA private key registered as the legacy iMessage encryption identity |
 | `protocol-version` | Integer for the provisioned Apple's device IDS protocol version |

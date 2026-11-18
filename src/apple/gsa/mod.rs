@@ -18,6 +18,7 @@ use zeroize::Zeroizing;
 
 use super::{
     http::{apple_client, plist_xml, read_response},
+    provisioning::Proofs,
     registration::{DeviceRegistration, register},
 };
 pub(super) use anisette::Anisette;
@@ -94,7 +95,7 @@ pub(super) fn validate_login(account: &str, password: &str) -> Result<()> {
 pub(super) async fn login(
     device: &mut DeviceRegistration,
     anisette: &mut Anisette,
-    proofs: Option<super::provisioning::Proofs<'_>>,
+    proofs: Option<Proofs<'_>>,
     account: &str,
     password: Zeroizing<String>,
     prompts: &mut impl SmsPrompts,
@@ -119,10 +120,14 @@ pub(super) async fn login(
         device.validate()?;
     }
     let auth = super::ids_auth::authenticate(&client, device, account, &session, headers).await?;
+    let fresh_proof_provider = match &proofs {
+        Some(Proofs::Provider(provider)) => Some(*provider),
+        _ => None,
+    };
     if let Some(proofs) = proofs {
         device.validation_data = proofs.registration().await?;
     }
-    let registration = register(&client, device, auth).await?;
+    let registration = register(&client, device, auth, fresh_proof_provider).await?;
     if prompts.request_icloud_contacts() {
         let grant = super::icloud_contacts::authorize(account, &session, anisette).await;
         prompts.received_icloud_contacts(grant);
