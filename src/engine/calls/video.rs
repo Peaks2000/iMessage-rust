@@ -3,7 +3,9 @@ mod format;
 mod linux;
 mod session;
 
-pub use linux::{DecodedFrames, HevcCamera, HevcDecoder, VIDEO_HEIGHT, VIDEO_WIDTH, VideoFrame};
+pub use linux::{
+    DecodedFrames, HevcCamera, HevcDecoder, VIDEO_HEIGHT, VIDEO_WIDTH, VideoFrame, prepare_camera,
+};
 pub use session::VideoCallOptions;
 pub(super) use session::VideoSession;
 
@@ -13,9 +15,9 @@ use anyhow::{Context, Result, ensure};
 use openssl::rand::rand_bytes;
 use zeroize::Zeroizing;
 
-use crate::apple::CallRtpHeader as RtpHeader;
+use crate::apple::{CallRtpHeader as RtpHeader, HEVC_FEATURE_BITS};
 
-pub const HEVC_PAYLOAD_TYPE: u8 = 100;
+pub const HEVC_PAYLOAD_TYPE: u8 = crate::apple::HEVC_PT;
 pub const FRAME_RATE: u32 = 15;
 const CLOCK_RATE: u32 = 90_000;
 const MAX_PAYLOAD: usize = 1024;
@@ -30,7 +32,7 @@ const LANDSCAPE_VIDEO_CONTROL: u16 = 0x8301;
 pub struct HevcFeatures(u8);
 
 impl HevcFeatures {
-    pub const SUPPORTED: u8 = 0x3c;
+    pub const SUPPORTED: u8 = HEVC_FEATURE_BITS;
 
     /// Intersect the peer's enabled feature byte with the locally offered features.
     pub fn negotiate(peer_features: u8) -> Self {
@@ -127,6 +129,11 @@ impl HevcPacketizer {
             frame_number: u16::from_be_bytes([seed[6], seed[7]]),
             features,
         })
+    }
+
+    fn advance_clock(&mut self, pause: std::time::Duration) {
+        let skipped = (pause.as_micros() * u128::from(CLOCK_RATE)) / 1_000_000;
+        self.timestamp = self.timestamp.wrapping_add(skipped as u32);
     }
 
     /// Packetize one Annex-B frame, including a QuickTime description on keyframes.

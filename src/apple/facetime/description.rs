@@ -31,8 +31,14 @@ const AAD: [u8; 9] = [VERSION, 0, 0, 0, 0, 0, 0, 0, 0];
 
 pub(crate) const AAC_ELD_PT: u8 = 104;
 pub(crate) const AUDIO_RED_PT: u8 = 20;
+pub(crate) const HEVC_PT: u8 = 100;
+pub(crate) const HEVC_FEATURE_BITS: u8 = 0x3c; // CH1, CR, CF, FA.
 #[cfg(feature = "desktop")]
 pub(crate) const AAC_ELD_SAMPLE_RATE: u32 = 24_000;
+#[cfg(feature = "desktop")]
+pub(crate) const CAMERA_WIDTH: u16 = 848;
+#[cfg(feature = "desktop")]
+pub(crate) const CAMERA_HEIGHT: u16 = 480;
 
 #[cfg(feature = "desktop")]
 pub(crate) struct CallDevice {
@@ -63,19 +69,25 @@ impl CallDevice {
         })
     }
 
-    pub(crate) fn audio_description(&self) -> Result<Vec<u8>> {
-        let mut identifiers = [0u8; 8];
+    pub(crate) fn description(&self, mode: CallMode) -> Result<Vec<u8>> {
+        let mut identifiers = [0u8; 12];
         rand_bytes(&mut identifiers)?;
-        let [a, b, c, d, e, f, g, h] = identifiers;
+        let [a, b, c, d, e, f, g, h, i, j, k, l] = identifiers;
         let audio_ssrc = u32::from_be_bytes([a, b, c, d]).max(1);
         let call_id = u32::from_be_bytes([e, f, g, h]).max(1);
+        let candidate = u32::from_be_bytes([i, j, k, l]).max(1);
+        let camera_ssrc = (mode == CallMode::Video).then_some(if candidate == audio_ssrc {
+            candidate.wrapping_add(1).max(1)
+        } else {
+            candidate
+        });
         let encodable = 1; // AAC-ELD.
         let receivable = encodable | 8; // RED can carry AAC-ELD in the primary block.
         let time = SystemTime::now().duration_since(UNIX_EPOCH)?;
         let ntp_seconds = time.as_secs().wrapping_add(2_208_988_800) as u32;
         let ntp_fraction = (u64::from(time.subsec_nanos()) << 32) / 1_000_000_000;
         let ntp_time = (u64::from(ntp_seconds) << 32) | ntp_fraction;
-        let v2 = V2Description {
+        let mut v2 = V2Description {
             general: Some(V2General { ntp_time }),
             microphone: Some(Microphone {
                 ssrc: audio_ssrc,
@@ -84,7 +96,10 @@ impl CallDevice {
             }),
             groups: vec![StreamGroup {
                 id: 2,
-                direct: Some(StreamSsrc { ssrc: audio_ssrc }),
+                direct: Some(StreamSsrc {
+                    ssrc: audio_ssrc,
+                    features: Vec::new(),
+                }),
                 payloads: [AAC_ELD_PT, AUDIO_RED_PT]
                     .into_iter()
                     .map(|pt| Payload {
@@ -94,8 +109,25 @@ impl CallDevice {
                     })
                     .collect(),
             }],
-            camera: None,
+            camera: camera_ssrc.map(Camera::offer),
         };
+        if let Some(ssrc) = camera_ssrc {
+            v2.groups.push(StreamGroup {
+                id: 1,
+                direct: Some(StreamSsrc {
+                    ssrc,
+                    features: vec![PerPayloadFeatures {
+                        rtp: u32::from(HEVC_PT),
+                        bits: hevc_offer_features(),
+                    }],
+                }),
+                payloads: vec![Payload {
+                    rtp: u32::from(HEVC_PT),
+                    packet_time_ms: None,
+                    sample_rate: Some(90_000),
+                }],
+            });
+        }
         let v1 = V1Description {
             microphone: Some(V1Microphone {
                 ssrc: audio_ssrc,
@@ -103,7 +135,7 @@ impl CallDevice {
                 payloads: receivable,
                 use_sbr: Some(false),
             }),
-            camera: None,
+            camera: camera_ssrc.map(V1Camera::offer),
             user_agent: Some("Viceroy 1.7.0".into()),
             ntp_time: Some(ntp_time),
             blob_version: Some(2),
@@ -161,6 +193,27 @@ pub struct CallMediaDescription {
 pub struct CallRtpDescription {
     pub ssrc: u32,
     pub payload_types: Vec<u8>,
+    pub(crate) hevc_features: HevcFeatureBits,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HevcFeatureBits {
+    pub(crate) enabled: u8,
+    pub(crate) supported: u8,
+}
+
+impl HevcFeatureBits {
+    fn from_wire(data: &[u8]) -> Option<Self> {
+        Some(Self {
+            enabled: *data.first()? & HEVC_FEATURE_BITS,
+            supported: *data.get(2)? & HEVC_FEATURE_BITS,
+        })
+    }
+}
+
+#[cfg(feature = "desktop")]
+fn hevc_offer_features() -> Vec<u8> {
+    vec![HEVC_FEATURE_BITS, 0, HEVC_FEATURE_BITS, 0]
 }
 
 impl CallKeyOffer {
@@ -388,12 +441,21 @@ impl V2Description {
             let payloads = group
                 .payloads
                 .iter()
+                .filter(|payload| payload.rtp != 0)
                 .filter_map(|p| u8::try_from(p.rtp).ok());
             let legacy = base
                 .as_ref()
                 .into_iter()
                 .flat_map(|d| d.payload_types.iter().copied());
-            Ok(Some(rtp_stream(settings.ssrc, payloads.chain(legacy))?))
+            let mut stream = rtp_stream(settings.ssrc, payloads.chain(legacy))?;
+            stream.hevc_features = settings
+                .features
+                .iter()
+                .find(|codec| codec.rtp == u32::from(HEVC_PT))
+                .and_then(|codec| HevcFeatureBits::from_wire(&codec.bits))
+                .or_else(|| base.map(|stream| stream.hevc_features))
+                .unwrap_or_default();
+            Ok(Some(stream))
         };
         let audio = self.microphone.map(|mic| mic.stream()).transpose()?;
         let video = self.camera.map(|cam| cam.stream()).transpose()?;
@@ -423,16 +485,40 @@ struct Camera {
     ssrc: u32,
     #[prost(message, repeated, tag = "2")]
     codecs: Vec<VideoCodec>,
+    #[prost(int32, optional, tag = "9")]
+    cipher_suites: Option<i32>,
 }
 
 impl Camera {
+    #[cfg(feature = "desktop")]
+    fn offer(ssrc: u32) -> Self {
+        Self {
+            ssrc,
+            codecs: vec![VideoCodec {
+                kind: 2,
+                parameter_set: Some(14),
+                encode_formats: Some(1 << 9), // 848×480 at 15 fps.
+                decode_formats: Some((1 << 9) | (1 << 14) | (1 << 18) | (1 << 20) | (1 << 25)),
+                features: hevc_offer_features(),
+            }],
+            cipher_suites: Some(3),
+        }
+    }
+
     fn stream(self) -> Result<CallRtpDescription> {
-        rtp_stream(
+        let mut stream = rtp_stream(
             self.ssrc,
             self.codecs
-                .into_iter()
+                .iter()
                 .filter_map(|codec| video_payload(codec.kind)),
-        )
+        )?;
+        stream.hevc_features = self
+            .codecs
+            .iter()
+            .find(|codec| codec.kind == 2)
+            .and_then(|codec| HevcFeatureBits::from_wire(&codec.features))
+            .unwrap_or_default();
+        Ok(stream)
     }
 }
 
@@ -440,6 +526,14 @@ impl Camera {
 struct VideoCodec {
     #[prost(uint32, tag = "1")]
     kind: u32,
+    #[prost(uint32, optional, tag = "2")]
+    parameter_set: Option<u32>,
+    #[prost(uint32, optional, tag = "3")]
+    encode_formats: Option<u32>,
+    #[prost(uint32, optional, tag = "4")]
+    decode_formats: Option<u32>,
+    #[prost(bytes = "vec", tag = "5")]
+    features: Vec<u8>,
 }
 
 #[derive(Message)]
@@ -466,6 +560,16 @@ struct Payload {
 struct StreamSsrc {
     #[prost(uint32, tag = "1")]
     ssrc: u32,
+    #[prost(message, repeated, tag = "2")]
+    features: Vec<PerPayloadFeatures>,
+}
+
+#[derive(Message)]
+struct PerPayloadFeatures {
+    #[prost(uint32, tag = "1")]
+    rtp: u32,
+    #[prost(bytes = "vec", tag = "2")]
+    bits: Vec<u8>,
 }
 
 #[derive(Message)]
@@ -528,17 +632,67 @@ struct V1Camera {
     #[prost(uint32, tag = "1")]
     ssrc: u32,
     #[prost(message, repeated, tag = "3")]
-    codecs: Vec<VideoCodec>,
+    codecs: Vec<V1VideoPayload>,
+    #[prost(uint32, optional, tag = "4")]
+    width: Option<u32>,
+    #[prost(uint32, optional, tag = "5")]
+    height: Option<u32>,
+}
+
+#[derive(Message)]
+struct V1VideoPayload {
+    #[prost(uint32, tag = "1")]
+    payload: u32,
+    #[prost(string, optional, tag = "3")]
+    features: Option<String>,
+    #[prost(uint32, optional, tag = "4")]
+    parameter_set: Option<u32>,
 }
 
 impl V1Camera {
+    #[cfg(feature = "desktop")]
+    fn offer(ssrc: u32) -> Self {
+        Self {
+            ssrc,
+            codecs: vec![V1VideoPayload {
+                payload: u32::from(HEVC_PT),
+                features: Some("FLS2;CH1;CR;CF;FA;".to_owned()),
+                parameter_set: Some(14),
+            }],
+            width: Some(u32::from(CAMERA_WIDTH)),
+            height: Some(u32::from(CAMERA_HEIGHT)),
+        }
+    }
+
     fn stream(self) -> Result<CallRtpDescription> {
-        rtp_stream(
+        let mut stream = rtp_stream(
             self.ssrc,
-            self.codecs
-                .into_iter()
-                .filter_map(|codec| video_payload(codec.kind)),
-        )
+            self.codecs.iter().filter_map(|codec| match codec.payload {
+                100 | 123 => u8::try_from(codec.payload).ok(),
+                index => video_payload(index),
+            }),
+        )?;
+        if let Some(features) = self
+            .codecs
+            .iter()
+            .find(|codec| matches!(codec.payload, 2 | 100))
+            .and_then(|codec| codec.features.as_deref())
+        {
+            let bits = features.split(';').fold(0, |bits, feature| {
+                bits | match feature.split(':').next().unwrap_or_default() {
+                    "CH1" => 4,
+                    "CR" => 8,
+                    "CF" => 16,
+                    "FA" => 32,
+                    _ => 0,
+                }
+            });
+            stream.hevc_features = HevcFeatureBits {
+                enabled: bits,
+                supported: bits,
+            };
+        }
+        Ok(stream)
     }
 }
 
@@ -557,7 +711,7 @@ fn audio_payloads(flags: u32) -> impl Iterator<Item = u8> {
 fn video_payload(kind: u32) -> Option<u8> {
     match kind {
         0 | 1 => Some(123),
-        2 => Some(100),
+        2 => Some(HEVC_PT),
         _ => None,
     }
 }
@@ -570,6 +724,7 @@ fn rtp_stream(ssrc: u32, numbers: impl Iterator<Item = u8>) -> Result<CallRtpDes
     Ok(CallRtpDescription {
         ssrc,
         payload_types,
+        hevc_features: HevcFeatureBits::default(),
     })
 }
 
@@ -721,7 +876,7 @@ pub(super) mod tests {
         assert_eq!(device.model, "Mac14,2");
         assert!(CallDevice::from_ids_user_agent("[macOS,15.7.5,24G624,]").is_none());
         assert!(CallDevice::from_ids_user_agent("local").is_none());
-        let offer = device.audio_description()?;
+        let offer = device.description(CallMode::Audio)?;
         let modern = CallMediaDescription::parse(&offer, Some(CallMode::Audio))?;
         assert_ne!(modern.audio.ssrc, 0);
         assert_eq!(modern.audio.payload_types, [AUDIO_RED_PT, AAC_ELD_PT]);
@@ -750,8 +905,42 @@ pub(super) mod tests {
         assert_eq!(legacy.session_id, modern.session_id);
         assert_eq!(legacy.audio.ssrc, modern.audio.ssrc);
         assert_eq!(legacy.audio.payload_types, modern.audio.payload_types);
-        let second = CallMediaDescription::parse(&device.audio_description()?, None)?;
+        let second = CallMediaDescription::parse(&device.description(CallMode::Audio)?, None)?;
         assert_ne!(second.session_id, modern.session_id);
+        Ok(())
+    }
+
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn video_offer_announces_hevc_with_distinct_streams_in_both_avc_formats() -> Result<()> {
+        let device = CallDevice::from_ids_user_agent("[macOS,15.7.5,24G624,Mac14,2]").unwrap();
+        let offer = device.description(CallMode::Video)?;
+        let parsed = CallMediaDescription::parse(&offer, Some(CallMode::Video))?;
+        let video = parsed.video.context("Missing the HEVC camera stream")?;
+        assert_ne!(video.ssrc, parsed.audio.ssrc);
+        assert_eq!(video.payload_types, [HEVC_PT]);
+        assert_eq!(video.hevc_features.enabled, HEVC_FEATURE_BITS);
+        assert_eq!(video.hevc_features.supported, HEVC_FEATURE_BITS);
+
+        let mut plist: plist::Dictionary = plist::from_bytes(&offer)?;
+        let gd = plist.remove("b2n").unwrap();
+        let v2 = V2Description::decode(gd.as_data().unwrap())?;
+        let camera = v2.camera.unwrap();
+        assert_eq!(camera.ssrc, video.ssrc);
+        assert_eq!(camera.cipher_suites, Some(3));
+        assert_eq!(camera.codecs[0].encode_formats, Some(1 << 9));
+        let camera_group = v2.groups.iter().find(|group| group.id == 1).unwrap();
+        assert_eq!(camera_group.direct.as_ref().unwrap().ssrc, video.ssrc);
+        assert_eq!(camera_group.payloads[0].sample_rate, Some(90_000));
+
+        let mut old = Vec::new();
+        plist::to_writer_binary(&mut old, &plist)?;
+        let old = CallMediaDescription::parse(&old, Some(CallMode::Video))?;
+        let old_video = old.video.unwrap();
+        assert_eq!(old.audio.ssrc, parsed.audio.ssrc);
+        assert_eq!(old_video.ssrc, video.ssrc);
+        assert_eq!(old_video.payload_types, video.payload_types);
+        assert_eq!(old_video.hevc_features, video.hevc_features);
         Ok(())
     }
 }

@@ -22,7 +22,7 @@ use zeroize::{Zeroize, Zeroizing};
 use super::{
     attachments::{self, AttachmentId, DraftFile, LoadedFile, Preview, TranscriptMedia},
     clipboard::Clipboard,
-    connection::{Action, AudioCallControls, Connection, Event, Mode, OlderRefresh, Settings},
+    connection::{Action, CallControls, Connection, Event, Mode, OlderRefresh, Settings},
     contacts::Contacts,
     links::MessageText,
     mac_setup::{MacSetup, Outcome as MacOutcome},
@@ -86,7 +86,8 @@ pub struct MessagesApp {
 struct DesktopCall {
     offer: IncomingCall,
     connected_at: Option<Instant>,
-    controls: AudioCallControls,
+    controls: CallControls,
+    video_texture: Option<egui::TextureHandle>,
 }
 
 #[derive(Default)]
@@ -1585,6 +1586,13 @@ impl MessagesApp {
     fn call_panel(&mut self, ctx: &egui::Context) {
         if let Some(call) = &mut self.active_call {
             let name = self.contacts.name(&call.offer.caller);
+            let mode = call.controls.mode();
+            let is_video = mode == CallMode::Video;
+            let (title, symbol, width) = if is_video {
+                ("FaceTime Video", Icon::Video, 440.)
+            } else {
+                ("FaceTime Audio", Icon::Phone, 245.)
+            };
             let (detail, end_label) = if call.controls.ending() {
                 ("Ending…".to_owned(), "End")
             } else if let Some(start) = call.connected_at {
@@ -1595,7 +1603,7 @@ impl MessagesApp {
                 ));
                 (
                     format!(
-                        "FaceTime Audio · {}:{:02}",
+                        "{title} · {}:{:02}",
                         elapsed_seconds / 60,
                         elapsed_seconds % 60
                     ),
@@ -1604,18 +1612,50 @@ impl MessagesApp {
             } else {
                 ("Connecting…".to_owned(), "Cancel")
             };
-            call_card(ctx, name, &detail, Icon::Phone, |ui| {
+            if let Some(frame) = call.controls.next_video_frame() {
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [usize::from(frame.width), usize::from(frame.height)],
+                    &frame.rgba,
+                );
+                if let Some(texture) = &mut call.video_texture {
+                    texture.set(image, egui::TextureOptions::LINEAR);
+                } else {
+                    call.video_texture = Some(ctx.load_texture(
+                        "FaceTime remote video",
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
+            }
+            call_card(ctx, name, &detail, symbol, width, |ui| {
+                if is_video && call.connected_at.is_some() {
+                    let size = vec2(ui.available_width(), ui.available_width() * 9. / 16.);
+                    if let Some(texture) = &call.video_texture {
+                        ui.add(egui::Image::new((texture.id(), size)).corner_radius(9));
+                    } else {
+                        let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+                        ui.painter().rect_filled(rect, 9, Color32::from_gray(26));
+                        ui.painter().text(
+                            rect.center(),
+                            Align2::CENTER_CENTER,
+                            "Waiting for video…",
+                            FontId::proportional(13.),
+                            Color32::WHITE,
+                        );
+                    }
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let enabled = !call.controls.ending();
                     if ui
-                        .add_enabled(!call.controls.ending(), call_button(end_label, DANGER))
+                        .add_enabled(enabled, call_button(end_label, DANGER))
                         .clicked()
                     {
                         call.controls.hang_up();
                     }
-                    if call.connected_at.is_some()
-                        && ui
+                    if call.connected_at.is_some() {
+                        if ui
                             .add_enabled(
-                                !call.controls.ending(),
+                                enabled,
                                 egui::Button::new(if call.controls.muted() {
                                     "Unmute"
                                 } else {
@@ -1624,8 +1664,24 @@ impl MessagesApp {
                                 .min_size(vec2(72., 27.)),
                             )
                             .clicked()
-                    {
-                        call.controls.toggle_mute();
+                        {
+                            call.controls.toggle_mute();
+                        }
+                        if let Some(camera_enabled) = call.controls.camera_enabled()
+                            && ui
+                                .add_enabled(
+                                    enabled,
+                                    egui::Button::new(if camera_enabled {
+                                        "Camera Off"
+                                    } else {
+                                        "Camera On"
+                                    })
+                                    .min_size(vec2(86., 27.)),
+                                )
+                                .clicked()
+                        {
+                            call.controls.toggle_camera();
+                        }
                     }
                 });
             });
@@ -1641,69 +1697,83 @@ impl MessagesApp {
             self.call_error = None;
             return;
         };
+        let call = call.clone();
         let name = self.contacts.name(&call.caller);
         let (heading, icon) = match call.mode {
             Some(CallMode::Audio) => ("FaceTime Audio", Icon::Phone),
             Some(CallMode::Video) => ("FaceTime Video", Icon::Video),
             None => ("FaceTime", Icon::Video),
         };
-        let call = call.clone();
         ctx.request_repaint_after(Duration::from_millis((call.expires_ms - now) as u64));
         let can_answer = self.config.mode == Mode::Local
             && self
                 .status
                 .as_ref()
                 .is_some_and(|status| status.connected && status.facetime_registered);
-        call_card(ctx, name, heading, icon, |ui| {
+        let show_video = can_answer && call.mode == Some(CallMode::Video);
+        let width = if show_video { 340. } else { 245. };
+        let available = self.declining_call.is_none() && self.connection.is_some();
+        let mut accept = None;
+        let mut decline = false;
+        call_card(ctx, name, heading, icon, width, |ui| {
             if let Some((id, error)) = &self.call_error
                 && *id == call.id
             {
                 ui.label(RichText::new(error).size(11.).color(DANGER));
             }
-            let available = self.declining_call.is_none() && self.connection.is_some();
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if can_answer
+                if show_video
                     && ui
-                        .add_enabled(
-                            available,
-                            call_button(
-                                if call.mode == Some(CallMode::Audio) {
-                                    "Answer"
-                                } else {
-                                    "Answer as Audio"
-                                },
-                                CALL_GREEN,
-                            ),
-                        )
+                        .add_enabled(available, call_button("Answer Video", CALL_GREEN))
                         .clicked()
-                    && let Some(connection) = &self.connection
                 {
-                    match connection.answer_audio(call.id) {
-                        Ok(controls) => {
-                            self.active_call = Some(DesktopCall {
-                                offer: call.clone(),
-                                connected_at: None,
-                                controls,
-                            });
-                            self.call_error = None;
-                        }
-                        Err(error) => self.call_error = Some((call.id, error.to_string())),
+                    accept = Some(CallMode::Video);
+                }
+                if can_answer {
+                    let audio = if call.mode == Some(CallMode::Audio) {
+                        "Answer"
+                    } else {
+                        "Answer as Audio"
+                    };
+                    let button = if show_video {
+                        egui::Button::new(audio).min_size(vec2(72., 27.))
+                    } else {
+                        call_button(audio, CALL_GREEN)
+                    };
+                    if ui.add_enabled(available, button).clicked() {
+                        accept = Some(CallMode::Audio);
                     }
                 }
-                if ui
+                decline = ui
                     .add_enabled(available, call_button("Decline", DANGER))
-                    .clicked()
-                    && let Some(connection) = &self.connection
-                    && connection
-                        .actions
-                        .send(Action::DeclineCall(call.id))
-                        .is_ok()
-                {
-                    self.declining_call = Some(call.id);
-                    self.call_error = None;
-                }
+                    .clicked();
             });
         });
+        let Some(connection) = &self.connection else {
+            return;
+        };
+        if let Some(mode) = accept {
+            match connection.answer_call(call.id, mode) {
+                Ok(controls) => {
+                    self.active_call = Some(DesktopCall {
+                        offer: call,
+                        connected_at: None,
+                        controls,
+                        video_texture: None,
+                    });
+                    self.call_error = None;
+                }
+                Err(error) => self.call_error = Some((call.id, error.to_string())),
+            }
+        } else if decline
+            && connection
+                .actions
+                .send(Action::DeclineCall(call.id))
+                .is_ok()
+        {
+            self.declining_call = Some(call.id);
+            self.call_error = None;
+        }
     }
 
     fn conversation_deleted(&mut self, chat: &str) {
@@ -2058,6 +2128,7 @@ fn call_card(
     name: &str,
     detail: &str,
     icon: Icon,
+    width: f32,
     controls: impl FnOnce(&mut Ui),
 ) {
     egui::Area::new(egui::Id::new("facetime-call"))
@@ -2065,7 +2136,7 @@ fn call_card(
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
             chrome::sheet().show(ui, |ui| {
-                ui.set_width(245.);
+                ui.set_width(width.min(ui.ctx().content_rect().width() - 70.));
                 ui.horizontal(|ui| {
                     let (rect, _) = ui.allocate_exact_size(vec2(36., 36.), Sense::hover());
                     ui.painter().circle_filled(rect.center(), 17., CALL_GREEN);
@@ -2566,7 +2637,18 @@ mod call_panel_tests {
     use super::*;
 
     #[test]
-    fn ringing_audio_can_be_answered_muted_and_ended_in_the_desktop_card() -> anyhow::Result<()> {
+    fn incoming_call_card_answers_audio_video_and_video_as_audio() -> anyhow::Result<()> {
+        for (offered, answer, label) in [
+            (CallMode::Audio, CallMode::Audio, "Answer"),
+            (CallMode::Video, CallMode::Video, "Answer Video"),
+            (CallMode::Video, CallMode::Audio, "Answer as Audio"),
+        ] {
+            exercise_call(offered, answer, label)?;
+        }
+        Ok(())
+    }
+
+    fn exercise_call(offered: CallMode, answer: CallMode, label: &str) -> anyhow::Result<()> {
         let ctx = egui::Context::default();
         let root = tempfile::tempdir()?;
         // Bypass starting a real session. All incoming status and action events use test channels.
@@ -2586,7 +2668,7 @@ mod call_panel_tests {
         let ring = IncomingCall {
             id,
             caller: "mailto:peer@example.org".into(),
-            mode: Some(CallMode::Audio),
+            mode: Some(offered),
             received_ms: now,
             expires_ms: now + 45_000,
         };
@@ -2605,44 +2687,65 @@ mod call_panel_tests {
                 },
             )
         };
-        let mut click = |label| {
-            frame(Vec::new()); // The area's first frame measures its content.
-            let shapes = frame(Vec::new()).shapes;
-            let position = shapes
-                .iter()
-                .find_map(|shape| label_position(&shape.shape, label))
-                .unwrap_or_else(|| panic!("Missing FaceTime button {label}"));
-            for pressed in [true, false] {
-                frame(vec![
-                    egui::Event::PointerMoved(position),
-                    egui::Event::PointerButton {
-                        pos: position,
-                        button: egui::PointerButton::Primary,
-                        pressed,
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                ]);
-            }
-        };
-
-        click("Answer");
-        let Action::AnswerAudio {
+        click(&mut frame, label);
+        let Action::AnswerCall {
             id: accepted,
             muted,
             mut hang_up,
+            video,
         } = actions.try_recv()?
         else {
-            panic!("Expected an audio answer");
+            panic!("Expected a call answer");
         };
         assert_eq!(accepted, id);
+        assert_eq!(video.is_some(), answer == CallMode::Video);
         assert!(!*muted.borrow());
         assert!(report.send(Event::CallConnected(id)).is_ok());
         assert!(report.send(Event::IncomingCalls(Vec::new())).is_ok());
-        click("Mute");
+        if let Some(video) = video {
+            assert!(*video.camera_enabled.borrow());
+            video.frames.send_replace(Some(std::sync::Arc::new(
+                linux_imessage::engine::video::VideoFrame {
+                    width: 2,
+                    height: 2,
+                    rgba: Zeroizing::new([20, 120, 220, 255].repeat(4)),
+                },
+            )));
+            let output = frame(Vec::new());
+            assert!(output.textures_delta.set.iter().any(|(_, texture)| {
+                let egui::ImageData::Color(image) = &texture.image;
+                image.size == [2, 2] && image.pixels[0] == Color32::from_rgb(20, 120, 220)
+            }));
+            click(&mut frame, "Camera Off");
+            assert!(!*video.camera_enabled.borrow());
+            click(&mut frame, "Camera On");
+            assert!(*video.camera_enabled.borrow());
+        }
+        click(&mut frame, "Mute");
         assert!(*muted.borrow());
-        click("End");
+        click(&mut frame, "End");
         hang_up.try_recv()?;
         Ok(())
+    }
+
+    fn click(frame: &mut impl FnMut(Vec<egui::Event>) -> egui::FullOutput, label: &str) {
+        frame(Vec::new()); // The area's first frame measures its content.
+        let shapes = frame(Vec::new()).shapes;
+        let position = shapes
+            .iter()
+            .find_map(|shape| label_position(&shape.shape, label))
+            .unwrap_or_else(|| panic!("Missing FaceTime button {label}"));
+        for pressed in [true, false] {
+            frame(vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+        }
     }
 
     fn label_position(shape: &egui::Shape, label: &str) -> Option<egui::Pos2> {

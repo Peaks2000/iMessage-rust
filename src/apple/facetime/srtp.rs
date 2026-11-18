@@ -446,10 +446,12 @@ mod tests {
             audio: CallRtpDescription {
                 ssrc: AUDIO_SSRC,
                 payload_types: vec![104],
+                hevc_features: Default::default(),
             },
             video: Some(CallRtpDescription {
                 ssrc: VIDEO_SSRC,
                 payload_types: vec![123],
+                hevc_features: Default::default(),
             }),
         }
     }
@@ -481,6 +483,7 @@ mod tests {
             let stream = CallRtpDescription {
                 ssrc,
                 payload_types: vec![header.payload_type],
+                hevc_features: Default::default(),
             };
             let mut sender = RtpSender {
                 stream: stream.clone(),

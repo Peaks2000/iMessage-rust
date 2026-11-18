@@ -1,4 +1,13 @@
-use std::{os::unix::fs::FileTypeExt, path::Path, process::Stdio};
+use std::{
+    fs::OpenOptions,
+    os::{
+        fd::AsRawFd,
+        unix::fs::{FileTypeExt, OpenOptionsExt},
+    },
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, ensure};
 use tokio::{
@@ -8,10 +17,95 @@ use tokio::{
 use zeroize::Zeroizing;
 
 use super::{FRAME_RATE, MAX_FRAME};
+use crate::apple::{CAMERA_HEIGHT, CAMERA_WIDTH};
 
 pub const VIDEO_WIDTH: u16 = 640;
 pub const VIDEO_HEIGHT: u16 = 360;
 const RGBA_BYTES: usize = VIDEO_WIDTH as usize * VIDEO_HEIGHT as usize * 4;
+
+/// Check local codec support and select a capture device without starting a camera stream.
+pub async fn prepare_camera() -> Result<PathBuf> {
+    let camera = default_camera()?;
+    let encoder = tokio::time::timeout(
+        Duration::from_secs(3),
+        ffmpeg()
+            .args(["-h", "encoder=libx265"])
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await
+    .context("Checking the Linux video encoder timed out")?
+    .context("FaceTime video needs FFmpeg with the libx265 encoder")?;
+    ensure!(
+        encoder.status.success() && encoder.stdout.starts_with(b"Encoder libx265 "),
+        "FaceTime video needs FFmpeg with the libx265 encoder"
+    );
+    Ok(camera)
+}
+
+fn default_camera() -> Result<PathBuf> {
+    let mut devices = std::fs::read_dir("/dev")
+        .context("Looking for Linux cameras")?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let number = entry
+                .file_name()
+                .to_str()?
+                .strip_prefix("video")?
+                .parse::<u32>()
+                .ok()?;
+            entry
+                .file_type()
+                .ok()?
+                .is_char_device()
+                .then(|| (number, entry.path()))
+        })
+        .collect::<Vec<_>>();
+    devices.sort_unstable_by_key(|(number, _)| *number);
+    devices
+        .into_iter()
+        .map(|(_, path)| path)
+        .find(|path| is_capture_device(path))
+        .context("No accessible Linux camera was found")
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct V4l2Capabilities {
+    driver: [u8; 16],
+    card: [u8; 32],
+    bus: [u8; 32],
+    version: u32,
+    capabilities: u32,
+    device_capabilities: u32,
+    reserved: [u32; 3],
+}
+
+fn is_capture_device(path: &Path) -> bool {
+    const VIDEO_CAPTURE: u32 = 1;
+    const DEVICE_CAPABILITIES: u32 = 0x8000_0000;
+    // VIDIOC_QUERYCAP is _IOR('V', 0, struct v4l2_capability) in the Linux UAPI.
+    const QUERY: libc::c_ulong =
+        (2 << 30) | ((size_of::<V4l2Capabilities>() as libc::c_ulong) << 16) | 0x5600;
+    let Ok(device) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    else {
+        return false;
+    };
+    let mut caps = V4l2Capabilities::default();
+    // This ioctl fills the fixed-size V4L2 capability record and starts no stream.
+    if unsafe { libc::ioctl(device.as_raw_fd(), QUERY as _, &mut caps) } < 0 {
+        return false;
+    }
+    let flags = if caps.capabilities & DEVICE_CAPABILITIES != 0 {
+        caps.device_capabilities
+    } else {
+        caps.capabilities
+    };
+    flags & VIDEO_CAPTURE != 0
+}
 
 /// A Linux V4L2 camera encoded by a local FFmpeg process. Dropping it closes the device.
 pub struct HevcCamera {
@@ -37,7 +131,7 @@ impl HevcCamera {
     fn from_source(mut source: Command) -> Result<Self> {
         source
             .args(["-map", "0:v:0", "-an", "-sn", "-dn", "-filter_threads", "1", "-vf"])
-            .arg(format!("fps={FRAME_RATE},{}", scale()))
+            .arg(format!("fps={FRAME_RATE},{}", scale(CAMERA_WIDTH, CAMERA_HEIGHT)))
             .args([
                 "-pix_fmt", "yuv420p", "-c:v", "libx265", "-preset", "ultrafast",
                 "-tune", "zerolatency", "-maxrate", "700k", "-bufsize", "350k",
@@ -123,7 +217,7 @@ impl HevcDecoder {
                 "1",
                 "-vf",
             ])
-            .arg(scale())
+            .arg(scale(VIDEO_WIDTH, VIDEO_HEIGHT))
             .args([
                 "-threads",
                 "1",
@@ -206,9 +300,9 @@ fn ffmpeg() -> Command {
     command
 }
 
-fn scale() -> String {
+fn scale(width: u16, height: u16) -> String {
     format!(
-        "scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=decrease,pad={VIDEO_WIDTH}:{VIDEO_HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1"
+        "scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1"
     )
 }
 
@@ -315,7 +409,7 @@ mod tests {
         ]);
         let mut camera = HevcCamera::from_source(source)?;
         let features = HevcFeatures::negotiate(HevcFeatures::SUPPORTED);
-        let mut packetizer = HevcPacketizer::new(1204, VIDEO_WIDTH, VIDEO_HEIGHT, features)?;
+        let mut packetizer = HevcPacketizer::new(1204, CAMERA_WIDTH, CAMERA_HEIGHT, features)?;
         let mut receiver = HevcReceiver::new(1204, features);
         let mut decoder = HevcDecoder::start()?;
         let (input, output) = decoder.streams();

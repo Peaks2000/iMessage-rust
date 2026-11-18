@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc, vec::IntoIter};
+use std::{future::pending, path::PathBuf, sync::Arc, time::Instant, vec::IntoIter};
 
 use anyhow::{Context, Result, ensure};
 use tokio::{
@@ -8,22 +8,25 @@ use tokio::{
 };
 use zeroize::Zeroizing;
 
-use crate::apple::CallRtpDescription;
+use crate::apple::{CAMERA_HEIGHT, CAMERA_WIDTH, CallRtpDescription};
 
 use super::{
     HEVC_PAYLOAD_TYPE, HevcCamera, HevcDecoder, HevcFeatures, HevcPacketizer, HevcReceiver,
-    VIDEO_HEIGHT, VIDEO_WIDTH, VideoFrame,
+    VideoFrame,
 };
 
 /// A local camera and the display stream for a negotiated one-to-one video call.
 pub struct VideoCallOptions {
     pub camera: PathBuf,
-    pub features: HevcFeatures,
+    pub camera_enabled: watch::Receiver<bool>,
     pub frames: watch::Sender<Option<Arc<VideoFrame>>>,
 }
 
 pub(in crate::engine::calls) struct VideoSession {
-    camera: HevcCamera,
+    camera_path: PathBuf,
+    camera_enabled: watch::Receiver<bool>,
+    camera: Option<HevcCamera>,
+    paused_at: Option<Instant>,
     packetizer: HevcPacketizer,
     outgoing: IntoIter<Zeroizing<Vec<u8>>>,
     receiver: HevcReceiver,
@@ -42,16 +45,22 @@ impl VideoSession {
                 && peer.payload_types.contains(&HEVC_PAYLOAD_TYPE),
             "The call did not negotiate the supported FaceTime video codec"
         );
-        let camera = HevcCamera::start(&options.camera)?;
         let player = HevcDecoder::start()?;
+        let sending_features =
+            HevcFeatures::negotiate(local.hevc_features.enabled & peer.hevc_features.supported);
+        let receiving_features =
+            HevcFeatures::negotiate(peer.hevc_features.enabled & local.hevc_features.supported);
         let packetizer =
-            HevcPacketizer::new(local.ssrc, VIDEO_WIDTH, VIDEO_HEIGHT, options.features)?;
-        let receiver = HevcReceiver::new(peer.ssrc, options.features);
+            HevcPacketizer::new(local.ssrc, CAMERA_WIDTH, CAMERA_HEIGHT, sending_features)?;
+        let receiver = HevcReceiver::new(peer.ssrc, receiving_features);
         let (decode, frames) = mpsc::channel(3);
         let mut decoder = JoinSet::new();
         decoder.spawn(play_video(player, frames, FramePublisher(options.frames)));
         Ok(Self {
-            camera,
+            camera_path: options.camera,
+            camera_enabled: options.camera_enabled,
+            camera: None,
+            paused_at: None,
             packetizer,
             outgoing: Vec::new().into_iter(),
             receiver,
@@ -60,31 +69,59 @@ impl VideoSession {
         })
     }
 
+    pub(in crate::engine::calls) fn camera_switch(&self) -> watch::Receiver<bool> {
+        self.camera_enabled.clone()
+    }
+
+    fn stop_capture(&mut self) {
+        if self.camera.take().is_some() {
+            self.paused_at = Some(Instant::now());
+        }
+        self.outgoing = Vec::new().into_iter();
+    }
+
     pub(in crate::engine::calls) async fn next_packet(&mut self) -> Result<Zeroizing<Vec<u8>>> {
-        let packet = async {
-            if let Some(packet) = self.outgoing.next() {
-                return Ok(packet);
+        loop {
+            let changed = self.camera_enabled.has_changed();
+            let can_change = changed.is_ok();
+            let enabled = can_change && *self.camera_enabled.borrow_and_update();
+            if !enabled || changed.unwrap_or(false) {
+                self.stop_capture();
             }
-            let frame = self
-                .camera
-                .next_frame()
-                .await?
-                .context("The FaceTime camera stopped")?;
-            self.outgoing = self.packetizer.packetize(&frame)?.into_iter();
-            self.outgoing
-                .next()
-                .context("The FaceTime camera produced an empty frame")
-        };
-        tokio::select! {
-            biased;
-            completed = self.decoder.join_next() => {
-                let status = completed
-                    .context("The FaceTime video decoder stopped")?
-                    .context("The FaceTime video decoder task stopped")?;
-                status?;
-                anyhow::bail!("The FaceTime video decoder stopped");
+            if enabled && self.camera.is_none() {
+                self.camera = Some(HevcCamera::start(&self.camera_path)?);
+                if let Some(paused) = self.paused_at.take() {
+                    self.packetizer.advance_clock(paused.elapsed());
+                }
             }
-            result = packet => result,
+            let packet = async {
+                let Some(camera) = &mut self.camera else {
+                    return pending().await;
+                };
+                if let Some(packet) = self.outgoing.next() {
+                    return Ok(packet);
+                }
+                let frame = camera
+                    .next_frame()
+                    .await?
+                    .context("The FaceTime camera stopped")?;
+                self.outgoing = self.packetizer.packetize(&frame)?.into_iter();
+                self.outgoing
+                    .next()
+                    .context("The FaceTime camera produced an empty frame")
+            };
+            tokio::select! {
+                biased;
+                _ = self.camera_enabled.changed(), if can_change => self.stop_capture(),
+                completed = self.decoder.join_next() => {
+                    let status = completed
+                        .context("The FaceTime video decoder stopped")?
+                        .context("The FaceTime video decoder task stopped")?;
+                    status?;
+                    anyhow::bail!("The FaceTime video decoder stopped");
+                }
+                result = packet => return result,
+            }
         }
     }
 
@@ -130,5 +167,42 @@ async fn play_video(
     tokio::select! {
         result = feed => result,
         result = render => result,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn camera_off_discards_queued_video_without_opening_a_device() -> Result<()> {
+        let (camera, enabled) = watch::channel(true);
+        let spooled = Zeroizing::new(vec![0x90, HEVC_PAYLOAD_TYPE]);
+        let (decode, _frames) = mpsc::channel(1);
+        let mut decoder = JoinSet::new();
+        decoder.spawn(pending::<Result<()>>());
+        let mut session = VideoSession {
+            camera_path: PathBuf::from("/dev/null"),
+            camera_enabled: enabled,
+            camera: None,
+            paused_at: None,
+            packetizer: HevcPacketizer::new(
+                1,
+                CAMERA_WIDTH,
+                CAMERA_HEIGHT,
+                HevcFeatures::default(),
+            )?,
+            outgoing: vec![spooled].into_iter(),
+            receiver: HevcReceiver::new(2, HevcFeatures::default()),
+            decode,
+            decoder,
+        };
+        camera.send_replace(false);
+        let mut next = Box::pin(session.next_packet());
+        assert!(futures_util::poll!(&mut next).is_pending());
+        drop(next);
+        assert!(session.outgoing.as_slice().is_empty());
+        assert!(session.camera.is_none());
+        Ok(())
     }
 }

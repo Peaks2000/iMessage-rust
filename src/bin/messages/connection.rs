@@ -11,7 +11,12 @@ use anyhow::{Context, Result, ensure};
 use eframe::egui;
 use linux_imessage::{
     CallMode, Conversation, FILE_LIMIT, IncomingCall, Message, PAGE_SIZE, SendText, SetTapback,
-    Status, Tapback, api, display_address, engine::Engine, now_ms, storage,
+    Status, Tapback, api, display_address,
+    engine::{
+        Engine,
+        video::{VideoCallOptions, VideoFrame, prepare_camera},
+    },
+    now_ms, storage,
 };
 use reqwest::{Client, Method, RequestBuilder, StatusCode, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -86,10 +91,11 @@ pub enum Action {
         request: SetTapback,
     },
     DeclineCall(uuid::Uuid),
-    AnswerAudio {
+    AnswerCall {
         id: Uuid,
         muted: watch::Receiver<bool>,
         hang_up: oneshot::Receiver<()>,
+        video: Option<VideoAnswer>,
     },
     DeleteConversation(String),
     Attachment {
@@ -152,12 +158,23 @@ pub struct Connection {
     worker: std::thread::JoinHandle<()>,
 }
 
-pub struct AudioCallControls {
-    mute: watch::Sender<bool>,
-    end: Option<oneshot::Sender<()>>,
+pub struct VideoAnswer {
+    pub camera_enabled: watch::Receiver<bool>,
+    pub frames: watch::Sender<Option<Arc<VideoFrame>>>,
 }
 
-impl AudioCallControls {
+struct VideoControls {
+    camera_enabled: watch::Sender<bool>,
+    frames: watch::Receiver<Option<Arc<VideoFrame>>>,
+}
+
+pub struct CallControls {
+    mute: watch::Sender<bool>,
+    end: Option<oneshot::Sender<()>>,
+    video: Option<VideoControls>,
+}
+
+impl CallControls {
     pub fn muted(&self) -> bool {
         *self.mute.borrow()
     }
@@ -168,6 +185,36 @@ impl AudioCallControls {
 
     pub fn ending(&self) -> bool {
         self.end.is_none()
+    }
+
+    pub fn mode(&self) -> CallMode {
+        if self.video.is_some() {
+            CallMode::Video
+        } else {
+            CallMode::Audio
+        }
+    }
+
+    pub fn camera_enabled(&self) -> Option<bool> {
+        self.video
+            .as_ref()
+            .map(|video| *video.camera_enabled.borrow())
+    }
+
+    pub fn toggle_camera(&self) {
+        if let Some(video) = &self.video {
+            video
+                .camera_enabled
+                .send_modify(|enabled| *enabled = !*enabled);
+        }
+    }
+
+    pub fn next_video_frame(&mut self) -> Option<Arc<VideoFrame>> {
+        let video = self.video.as_mut()?;
+        if !video.frames.has_changed().unwrap_or(false) {
+            return None;
+        }
+        video.frames.borrow_and_update().clone()
     }
 
     pub fn hang_up(&mut self) {
@@ -227,15 +274,37 @@ impl Connection {
         }
     }
 
-    pub fn answer_audio(&self, id: Uuid) -> Result<AudioCallControls> {
+    pub fn answer_call(&self, id: Uuid, mode: CallMode) -> Result<CallControls> {
         let (mute, muted) = watch::channel(false);
         let (end, hang_up) = oneshot::channel();
+        let (video, controls) = if mode == CallMode::Video {
+            let (camera, camera_enabled) = watch::channel(true);
+            let (publish, frames) = watch::channel(None);
+            (
+                Some(VideoAnswer {
+                    camera_enabled,
+                    frames: publish,
+                }),
+                Some(VideoControls {
+                    camera_enabled: camera,
+                    frames,
+                }),
+            )
+        } else {
+            (None, None)
+        };
         self.actions
-            .send(Action::AnswerAudio { id, muted, hang_up })
+            .send(Action::AnswerCall {
+                id,
+                muted,
+                hang_up,
+                video,
+            })
             .map_err(|_| anyhow::anyhow!("The connection is closed"))?;
-        Ok(AudioCallControls {
+        Ok(CallControls {
             mute,
             end: Some(end),
+            video: controls,
         })
     }
 }
@@ -406,10 +475,11 @@ async fn work(
                 let result = backend.decline_call(id).await;
                 Event::CallDeclined { id, result }
             }
-            Action::AnswerAudio {
+            Action::AnswerCall {
                 id,
                 muted,
                 mut hang_up,
+                video,
             } => {
                 let backend = backend.clone();
                 let events = events.clone();
@@ -417,12 +487,37 @@ async fn work(
                 tokio::spawn(async move {
                     let call = async {
                         let Backend::Local(engine) = backend.as_ref() else {
-                            anyhow::bail!("FaceTime audio uses the Apple session on this computer");
+                            anyhow::bail!(
+                                "Answer FaceTime using the Apple session on this computer"
+                            );
                         };
-                        let accepted = engine.answer_audio_call(id).await?;
-                        accepted
-                            .run_audio(muted, || emit(&events, &context, Event::CallConnected(id)))
-                            .await
+                        let ready = || emit(&events, &context, Event::CallConnected(id));
+                        if let Some(video) = video {
+                            let camera = prepare_camera().await?;
+                            let accepted = engine.answer_desktop_call(id, CallMode::Video).await?;
+                            let mut frames = video.frames.subscribe();
+                            let update = async {
+                                while frames.changed().await.is_ok() {
+                                    context.request_repaint();
+                                }
+                                std::future::pending::<Result<()>>().await
+                            };
+                            let options = VideoCallOptions {
+                                camera,
+                                camera_enabled: video.camera_enabled,
+                                frames: video.frames,
+                            };
+                            tokio::select! {
+                                result = accepted.run_video(muted, options, ready) => result,
+                                result = update => result,
+                            }
+                        } else {
+                            engine
+                                .answer_desktop_call(id, CallMode::Audio)
+                                .await?
+                                .run_audio(muted, ready)
+                                .await
+                        }
                     };
                     let result = tokio::select! {
                         biased;
@@ -726,11 +821,12 @@ mod tests {
     async fn desktop_call_controls_are_scoped_to_the_answer_and_close_on_drop() -> Result<()> {
         let (connection, mut requests, _report) = Connection::test_channels();
         let id = Uuid::new_v4();
-        let mut controls = connection.answer_audio(id)?;
-        let Some(Action::AnswerAudio {
+        let mut controls = connection.answer_call(id, CallMode::Audio)?;
+        let Some(Action::AnswerCall {
             id: answered,
             mut muted,
             hang_up,
+            video: None,
         }) = requests.recv().await
         else {
             panic!("Expected a call answer");
@@ -745,8 +841,8 @@ mod tests {
         hang_up.await?;
         assert!(controls.ending());
 
-        let controls = connection.answer_audio(Uuid::new_v4())?;
-        let Some(Action::AnswerAudio { hang_up, .. }) = requests.recv().await else {
+        let controls = connection.answer_call(Uuid::new_v4(), CallMode::Audio)?;
+        let Some(Action::AnswerCall { hang_up, .. }) = requests.recv().await else {
             panic!("Expected a call answer");
         };
         drop(controls);

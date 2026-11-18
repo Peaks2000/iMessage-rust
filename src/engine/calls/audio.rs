@@ -124,7 +124,19 @@ impl AnsweredCall {
                         } else {
                             std::future::pending::<Result<Zeroizing<Vec<u8>>>>().await
                         }
-                    } => self.send_rtp(packet?.as_slice()).await?,
+                    } => {
+                        let packet = packet?;
+                        if let Some(video) = &video {
+                            let mut camera = video.camera_switch();
+                            if *camera.borrow() && camera.has_changed().is_ok_and(|changed| !changed) {
+                                tokio::select! {
+                                    biased;
+                                    _ = camera.changed() => (),
+                                    result = self.send_rtp(&packet) => result?,
+                                }
+                            }
+                        }
+                    },
                     frame = input.next_frame() => {
                         let mut frame = frame?;
                         let mute_changed = muted.has_changed().unwrap_or(false);

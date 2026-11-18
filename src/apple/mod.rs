@@ -31,7 +31,10 @@ pub(crate) use facetime::decode as decode_call_fixture;
 #[cfg(test)]
 pub(crate) use facetime::relay::tests::parsed_allocation as call_relay_fixture;
 #[cfg(feature = "desktop")]
-pub(crate) use facetime::{AAC_ELD_PT, AAC_ELD_SAMPLE_RATE, AUDIO_RED_PT, CallDevice};
+pub(crate) use facetime::{
+    AAC_ELD_PT, AAC_ELD_SAMPLE_RATE, AUDIO_RED_PT, CAMERA_HEIGHT, CAMERA_WIDTH, CallDevice,
+    HEVC_FEATURE_BITS, HEVC_PT,
+};
 pub use facetime::{
     CallAvcMaterial, CallKey, CallKeyOffer, CallMediaDescription, CallMediaHandshake, CallMediaKey,
     CallPeerKeys, CallRelayAllocation, CallRelayBinding, CallRelayConnection, CallRelayKeys,

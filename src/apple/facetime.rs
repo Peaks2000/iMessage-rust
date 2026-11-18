@@ -11,7 +11,10 @@ use uuid::Uuid;
 use crate::{CallMode, IncomingCall, address, now_ms};
 
 #[cfg(feature = "desktop")]
-pub(crate) use description::{AAC_ELD_PT, AAC_ELD_SAMPLE_RATE, AUDIO_RED_PT, CallDevice};
+pub(crate) use description::{
+    AAC_ELD_PT, AAC_ELD_SAMPLE_RATE, AUDIO_RED_PT, CAMERA_HEIGHT, CAMERA_WIDTH, CallDevice,
+    HEVC_FEATURE_BITS, HEVC_PT,
+};
 pub use description::{CallAvcMaterial, CallMediaDescription, CallRtpDescription};
 pub use media::{CallKey, CallKeyOffer, CallMediaHandshake, CallMediaKey, CallPeerKeys};
 pub(crate) use media::{CallMediaExchange, PeerKeyOffer, PeerMediaOffer, PeerPrekey};

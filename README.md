@@ -27,6 +27,8 @@ The desktop opens a registered iMessage session from Linux Secret Service and co
 
 The engine supports one-to-one text and attachments with devices that accept the legacy iMessage format. A message can contain up to eight attachments and 32 MiB of attachment data. **Sent** indicates that Apple’s courier accepted the send.
 
+Incoming FaceTime calls appear in the desktop call card when the local Apple session has FaceTime registration. For a video ring, choose **Answer Video** or **Answer as Audio**. During a call, **Camera Off** stops local video capture. FaceTime audio uses the PulseAudio-compatible `parec` and `pacat` tools. Video uses a V4L2 camera and FFmpeg with `libx265`.
+
 ## Sync iCloud Contacts
 
 The Linux desktop uses the Apple Account from local iMessage setup to authorize iCloud Contacts. If you already signed in with an older build or imported a session, open **Settings → iCloud Contacts → Authorize Contacts…** once. You can also connect Contacts with an [app-specific password from Apple](https://support.apple.com/en-us/102654) when you use Server mode without a local Apple session.
