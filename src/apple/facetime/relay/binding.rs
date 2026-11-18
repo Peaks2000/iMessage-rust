@@ -3,6 +3,11 @@ use openssl::rand::rand_bytes;
 use prost::Message;
 use zeroize::Zeroizing;
 
+use crate::apple::facetime::{
+    CallAvcMaterial, CallMediaDescription, CallPeerKeys,
+    description::{open_description, valid_ciphertext},
+};
+
 use super::{
     CallRelayConnection,
     http3::RelayHttp3,
@@ -13,6 +18,8 @@ const SERVICE_ID: u32 = 4096;
 const WILDCARD_CHANNEL_BINDING: u32 = 512;
 const AVC: i32 = 0;
 const IDS: i32 = 1;
+const AVC_MATERIAL: i32 = 12;
+const MAX_PEER_DESCRIPTIONS: usize = 8;
 
 /// Device and media capabilities advertised during this call's registration.
 pub struct CallRelayProfile<'a> {
@@ -31,6 +38,7 @@ pub struct CallRelayBinding {
     control: RelayHttp3,
     media: Pod,
     signaling: Pod,
+    peer_descriptions: Vec<MaterialInfo>,
     pub channel_id: u16,
     pub link_id: u32,
     pub avc: RelayChannel,
@@ -41,6 +49,26 @@ impl CallRelayBinding {
     /// Use the TLS exporter of the connection that authenticated and bound these channels.
     pub fn export_keying_material(&self, output: &mut [u8], label: &str) -> Result<()> {
         self.control.transport.export_keying_material(output, label)
+    }
+
+    /// Read the description matching the caller's current authenticated session key.
+    pub fn peer_description(&self, keys: &CallPeerKeys) -> Result<Option<CallMediaDescription>> {
+        let Some(key) = keys.session.as_ref() else {
+            return Ok(None);
+        };
+        let mut matching = self
+            .peer_descriptions
+            .iter()
+            .filter(|material| material.content.starts_with(&key.identifier));
+        let Some(description) = matching.next() else {
+            return Ok(None);
+        };
+        ensure!(
+            matching.next().is_none(),
+            "Ambiguous FaceTime peer descriptions for this key"
+        );
+        let call = self.control.transport.call;
+        open_description(call.id, call.peer, key, &description.content).map(Some)
     }
 
     /// Send a call-protocol datagram over the relay. The call layer encrypts peer payloads.
@@ -73,7 +101,40 @@ impl CallRelayBinding {
 
 impl CallRelayConnection {
     /// Bind one authenticated connection to the relay's audio/video and signaling channels.
-    pub async fn bind(mut self, profile: CallRelayProfile<'_>) -> Result<CallRelayBinding> {
+    pub async fn bind(self, profile: CallRelayProfile<'_>) -> Result<CallRelayBinding> {
+        self.bind_channels(profile, Vec::new()).await
+    }
+
+    /// Bind and publish this device's encrypted media description in the same request.
+    pub async fn bind_with_description(
+        self,
+        profile: CallRelayProfile<'_>,
+        offer: &CallAvcMaterial,
+    ) -> Result<CallRelayBinding> {
+        ensure!(
+            self.call.id == offer.call_id && self.call.local == offer.participant,
+            "FaceTime relay and media description belong to different calls"
+        );
+        self.bind_channels(
+            profile,
+            vec![Material {
+                owner: Some(0),    // Apple resolves zero to this connection's participant ID.
+                receiver: Some(0), // Visible to the call, encrypted to the authenticated peer.
+                entries: vec![MaterialInfo {
+                    id: offer.material_id.to_vec(),
+                    kind: AVC_MATERIAL,
+                    content: offer.ciphertext.clone(),
+                }],
+            }],
+        )
+        .await
+    }
+
+    async fn bind_channels(
+        mut self,
+        profile: CallRelayProfile<'_>,
+        materials: Vec<Material>,
+    ) -> Result<CallRelayBinding> {
         ensure!(
             !profile.os_version.is_empty()
                 && profile.os_version.len() <= 128
@@ -107,6 +168,7 @@ impl CallRelayConnection {
                 ],
                 state_flags: 6,
                 reason: 1,
+                materials,
             }),
             response: None,
         };
@@ -129,18 +191,59 @@ impl CallRelayConnection {
             .context("Invalid FaceTime relay channel")?;
         let link_id = binding.link_id.context("Missing FaceTime relay link ID")?;
         let (avc, ids) = bound_channels(&binding.connections, avc, ids)?;
+        let call = control.transport.call;
+        let peer_descriptions =
+            collect_peer_descriptions(binding.materials, call.peer, call.local)?;
         let media = Pod::new(&control.transport, avc, RelayDatagramChannel::Media)?;
         let signaling = Pod::new(&control.transport, ids, RelayDatagramChannel::Signaling)?;
         Ok(CallRelayBinding {
             control,
             media,
             signaling,
+            peer_descriptions,
             channel_id,
             link_id,
             avc,
             ids,
         })
     }
+}
+
+fn collect_peer_descriptions(
+    materials: Vec<Material>,
+    peer: u64,
+    local: u64,
+) -> Result<Vec<MaterialInfo>> {
+    let mut accepted: Vec<MaterialInfo> = Vec::new();
+    for group in materials {
+        if group.owner != Some(peer)
+            || !matches!(group.receiver, None | Some(0)) && group.receiver != Some(local)
+        {
+            continue;
+        }
+        for entry in group.entries {
+            if entry.kind != AVC_MATERIAL {
+                continue;
+            }
+            ensure!(
+                entry.id.len() == 20 && valid_ciphertext(&entry.content),
+                "Invalid FaceTime relay description material"
+            );
+            if let Some(previous) = accepted.iter().find(|previous| previous.id == entry.id) {
+                ensure!(
+                    previous.content == entry.content,
+                    "Conflicting FaceTime relay description material"
+                );
+            } else {
+                ensure!(
+                    accepted.len() < MAX_PEER_DESCRIPTIONS,
+                    "Too many FaceTime relay descriptions"
+                );
+                accepted.push(entry);
+            }
+        }
+    }
+    Ok(accepted)
 }
 
 fn new_connection_id(kind: i32) -> Result<[u8; 4]> {
@@ -215,6 +318,8 @@ struct BindRequest {
     state_flags: u32,
     #[prost(int32, tag = "14")]
     reason: i32,
+    #[prost(message, repeated, tag = "15")]
+    materials: Vec<Material>,
 }
 
 #[derive(Message)]
@@ -225,6 +330,28 @@ struct BindResponse {
     link_id: Option<u32>,
     #[prost(message, repeated, tag = "11")]
     connections: Vec<ConnectionInfo>,
+    #[prost(message, repeated, tag = "15")]
+    materials: Vec<Material>,
+}
+
+#[derive(Message)]
+struct Material {
+    #[prost(uint64, optional, tag = "1")]
+    owner: Option<u64>,
+    #[prost(uint64, optional, tag = "2")]
+    receiver: Option<u64>,
+    #[prost(message, repeated, tag = "3")]
+    entries: Vec<MaterialInfo>,
+}
+
+#[derive(Message)]
+struct MaterialInfo {
+    #[prost(bytes = "vec", tag = "1")]
+    id: Vec<u8>,
+    #[prost(int32, tag = "2")]
+    kind: i32,
+    #[prost(bytes = "vec", tag = "3")]
+    content: Vec<u8>,
 }
 
 #[derive(Message)]

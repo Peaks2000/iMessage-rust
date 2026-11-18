@@ -15,6 +15,7 @@ use openssl::{
 };
 use plist::{Dictionary, Value};
 use tokio::sync::watch;
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::IncomingCall;
@@ -151,6 +152,16 @@ pub struct CallKey {
     pub identifier: [u8; 16],
     pub short_identifier_len: u8,
     pub key: CallMediaKey,
+    pub(super) call_id: Uuid,
+    pub(super) participant: u64,
+    pub(super) kind: CallKeyKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum CallKeyKind {
+    LocalSession,
+    PeerSession,
+    Media,
 }
 
 pub struct CallKeyOffer {
@@ -191,8 +202,12 @@ impl CallMediaExchange {
     /// Install newer keys only after the engine matches the IDS sender to the call.
     pub(crate) fn receive(&self, offer: PeerKeyOffer) -> Result<()> {
         let current = self.received.borrow().clone();
-        let session = self.open_newer(offer.session, current.session.as_deref())?;
-        let media = self.open_newer(offer.media, current.media.as_deref())?;
+        let session = self.open_newer(
+            offer.session,
+            current.session.as_deref(),
+            CallKeyKind::PeerSession,
+        )?;
+        let media = self.open_newer(offer.media, current.media.as_deref(), CallKeyKind::Media)?;
         if session.is_some() || media.is_some() {
             self.received.send_replace(CallPeerKeys {
                 session: session.or(current.session),
@@ -206,6 +221,7 @@ impl CallMediaExchange {
         &self,
         wrapped: Option<WrappedCallKey>,
         current: Option<&CallKey>,
+        kind: CallKeyKind,
     ) -> Result<Option<Arc<CallKey>>> {
         let Some(wrapped) = wrapped.filter(|wrapped| {
             current.is_none_or(|current| wrapped.generation > current.generation)
@@ -218,6 +234,9 @@ impl CallMediaExchange {
             identifier: wrapped.identifier,
             short_identifier_len: wrapped.short_identifier_len,
             key,
+            call_id: self.handshake.call.id,
+            participant: wrapped.participant,
+            kind,
         })))
     }
 
@@ -300,12 +319,18 @@ impl CallMediaHandshake {
             identifier: session_id,
             short_identifier_len: 0,
             key: session,
+            call_id: self.call.id,
+            participant: local_participant,
+            kind: CallKeyKind::LocalSession,
         };
         let media = CallKey {
             generation: 1,
             identifier: media_id,
             short_identifier_len: 2,
             key: media,
+            call_id: self.call.id,
+            participant: local_participant,
+            kind: CallKeyKind::Media,
         };
         let common = || {
             Dictionary::from_iter([
@@ -379,9 +404,21 @@ impl CallMediaKey {
         &self.salt
     }
 
+    pub(super) fn derive<const N: usize>(&self, info: &[&[u8]]) -> Result<Zeroizing<[u8; N]>> {
+        hkdf(self.secret.as_ref(), &self.salt, info)
+    }
+
     /// Derive the 16-byte SRTP master key and 14-byte master salt for an SSRC.
     pub fn srtp_key(&self, ssrc: u32) -> Result<Zeroizing<[u8; 30]>> {
-        hkdf(self.secret.as_ref(), &self.salt, &[&ssrc.to_le_bytes()])
+        self.derive(&[&ssrc.to_le_bytes()])
+    }
+
+    #[cfg(test)]
+    pub(super) fn fixture(secret: [u8; SECRET_LEN], salt: [u8; 16]) -> Self {
+        Self {
+            secret: Zeroizing::new(secret),
+            salt,
+        }
     }
 }
 

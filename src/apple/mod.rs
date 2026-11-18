@@ -26,13 +26,14 @@ pub use ssh_setup::{SshPrompt, run_ssh_askpass};
 use anyhow::{Context, Result, ensure};
 #[cfg(test)]
 pub(crate) use facetime::decode as decode_call_fixture;
+pub use facetime::{
+    CallAvcMaterial, CallKey, CallKeyOffer, CallMediaDescription, CallMediaHandshake, CallMediaKey,
+    CallPeerKeys, CallRelayAllocation, CallRelayBinding, CallRelayConnection, CallRelayKeys,
+    CallRelayProfile, CallRelayStream, CallRtpDescription, RelayChannel, RelayDatagramChannel,
+    RelayStreamDirection,
+};
 pub(crate) use facetime::{
     CallEndpoint, CallMediaExchange, CallSignal, PeerMediaOffer, PeerPrekey,
-};
-pub use facetime::{
-    CallKey, CallKeyOffer, CallMediaHandshake, CallMediaKey, CallPeerKeys, CallRelayAllocation,
-    CallRelayBinding, CallRelayConnection, CallRelayKeys, CallRelayProfile, CallRelayStream,
-    RelayChannel, RelayDatagramChannel, RelayStreamDirection,
 };
 pub(crate) use madrid::{Incoming, Madrid, Notification};
 use openssl::{

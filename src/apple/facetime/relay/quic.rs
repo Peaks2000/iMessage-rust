@@ -27,7 +27,7 @@ use tokio::{
 use zeroize::Zeroizing;
 
 use self::datagram::DatagramBridge;
-use super::{CallRelayAllocation, CallRelayKeys, pod::RelayDatagramChannel};
+use super::{CallRelayAllocation, CallRelayKeys, RelayCall, pod::RelayDatagramChannel};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 const STREAM_TIMEOUT: Duration = Duration::from_secs(8);
@@ -207,6 +207,7 @@ pub struct CallRelayConnection {
     socket: Arc<AsyncFd<UdpSocket>>,
     api: &'static QuicApi,
     keys: CallRelayKeys,
+    pub(super) call: RelayCall,
 }
 
 pub struct CallRelayStream {
@@ -218,12 +219,21 @@ pub struct CallRelayStream {
 impl CallRelayAllocation {
     /// Connect to the allocated relay using the per-call external PSK and HTTP/3 ALPN.
     pub async fn connect(&self) -> Result<CallRelayConnection> {
-        CallRelayConnection::connect(self.endpoint, self.derive_keys()?).await
+        CallRelayConnection::connect(
+            self.endpoint,
+            self.derive_keys()?,
+            RelayCall {
+                id: self.call_id,
+                local: self.local_participant,
+                peer: self.caller_participant,
+            },
+        )
+        .await
     }
 }
 
 impl CallRelayConnection {
-    async fn connect(peer: SocketAddr, keys: CallRelayKeys) -> Result<Self> {
+    async fn connect(peer: SocketAddr, keys: CallRelayKeys, call: RelayCall) -> Result<Self> {
         let api = quic_api()?;
         let index = PSK_SLOT
             .get_or_init(SslContext::new_ex_index)
@@ -277,6 +287,7 @@ impl CallRelayConnection {
             socket,
             api,
             keys,
+            call,
         };
         connection
             .retry(HANDSHAKE_TIMEOUT, |ssl| {

@@ -1,5 +1,6 @@
 use super::super::{CallRelayProfile, pod::Pod};
 use super::*;
+use crate::apple::facetime::description::tests as description;
 use compcol::qpack::QpackDecoder;
 use openssl::{
     memcmp,
@@ -49,6 +50,14 @@ fn test_keys() -> CallRelayKeys {
         tls_psk: Zeroizing::new([0x25; 32]),
         hop_keys: Zeroizing::new([0; 64]),
         session_keys: Zeroizing::new([0; 48]),
+    }
+}
+
+fn test_call() -> RelayCall {
+    RelayCall {
+        id: description::CALL,
+        local: description::LOCAL,
+        peer: description::CALLER,
     }
 }
 
@@ -122,6 +131,7 @@ fn loopback_listener() -> Result<Option<(SocketAddr, CallRelayConnection, Listen
             socket,
             api,
             keys,
+            call: test_call(),
         },
         accept_connection,
     )))
@@ -171,6 +181,8 @@ async fn read_exact(
 struct TestBindEnvelope {
     #[prost(message, optional, tag = "1")]
     request: Option<TestBindRequest>,
+    #[prost(message, optional, tag = "2")]
+    response: Option<TestBindResponse>,
 }
 
 #[derive(Message)]
@@ -181,6 +193,40 @@ struct TestBindRequest {
     capabilities: u64,
     #[prost(message, repeated, tag = "11")]
     connections: Vec<TestBindConnection>,
+    #[prost(message, repeated, tag = "15")]
+    materials: Vec<TestParticipantMaterial>,
+}
+
+#[derive(Message)]
+struct TestBindResponse {
+    #[prost(uint32, tag = "2")]
+    channel: u32,
+    #[prost(uint32, tag = "6")]
+    link: u32,
+    #[prost(message, repeated, tag = "11")]
+    connections: Vec<TestBindConnection>,
+    #[prost(message, repeated, tag = "15")]
+    materials: Vec<TestParticipantMaterial>,
+}
+
+#[derive(Message)]
+struct TestParticipantMaterial {
+    #[prost(uint64, optional, tag = "1")]
+    owner: Option<u64>,
+    #[prost(uint64, optional, tag = "2")]
+    receiver: Option<u64>,
+    #[prost(message, repeated, tag = "3")]
+    entries: Vec<TestAvcMaterial>,
+}
+
+#[derive(Message)]
+struct TestAvcMaterial {
+    #[prost(bytes = "vec", tag = "1")]
+    id: Vec<u8>,
+    #[prost(int32, tag = "2")]
+    kind: i32,
+    #[prost(bytes = "vec", tag = "3")]
+    ciphertext: Vec<u8>,
 }
 
 #[derive(Message)]
@@ -222,12 +268,47 @@ async fn exchanges_media_and_signaling_on_the_bound_http3_socket() -> Result<()>
     const SERVER_SETTINGS: &[u8] = &[0, 4, 0];
     const SERVER_AVC: [u8; 4] = [0, 0x90, 0, 1];
     const SERVER_IDS: [u8; 4] = [0x10, 0x90, 0, 2];
-    // Static QPACK :status 200, then a protobuf QuickRelay H3 envelope with the channel
-    // number, link ID, and four-byte server identifiers for AVC and IDS.
-    const RESPONSE: &[u8] = &[
-        1, 3, 0, 0, 0xd9, 0, 26, 0x12, 24, 0x10, 0x88, 0x80, 1, 0x30, 1, 0x5a, 6, 0x12, 4, 0, 0x90,
-        0, 1, 0x5a, 8, 8, 1, 0x12, 4, 0x10, 0x90, 0, 2,
-    ];
+    let incoming = |owner, receiver, ciphertext| TestParticipantMaterial {
+        owner: Some(owner),
+        receiver: Some(receiver),
+        entries: vec![TestAvcMaterial {
+            id: vec![7; 20],
+            kind: 12,
+            ciphertext,
+        }],
+    };
+    let body = TestBindEnvelope {
+        request: None,
+        response: Some(TestBindResponse {
+            channel: 0x4008,
+            link: 1,
+            connections: vec![
+                TestBindConnection {
+                    kind: 0,
+                    id: SERVER_AVC.to_vec(),
+                },
+                TestBindConnection {
+                    kind: 1,
+                    id: SERVER_IDS.to_vec(),
+                },
+            ],
+            materials: vec![
+                incoming(description::LOCAL, 0, vec![0]),
+                incoming(description::CALLER, 123, vec![0]),
+                incoming(
+                    description::CALLER,
+                    description::LOCAL,
+                    description::opaque_peer_offer()?,
+                ),
+            ],
+        }),
+    }
+    .encode_to_vec();
+    // Static QPACK :status 200 followed by one DATA frame.
+    let mut response = vec![1, 3, 0, 0, 0xd9, 0];
+    super::super::wire::write_varint(&mut response, body.len());
+    response.extend_from_slice(&body);
+    let local_description = description::local_offer()?;
 
     let (local_address, received_address) = tokio::sync::oneshot::channel();
     let server = async {
@@ -280,6 +361,17 @@ async fn exchanges_media_and_signaling_on_the_bound_http3_socket() -> Result<()>
             .context("No bind request")?;
         assert_eq!(bind.service, 4096);
         assert_eq!(bind.capabilities, 0x1234);
+        let [material] = bind.materials.as_slice() else {
+            anyhow::bail!("The client did not publish one local description");
+        };
+        let [entry] = material.entries.as_slice() else {
+            anyhow::bail!("Unexpected description material");
+        };
+        assert_eq!(material.owner, Some(0));
+        assert_eq!(material.receiver, Some(0));
+        assert_eq!(entry.kind, 12);
+        assert_eq!(entry.id, local_description.material_id);
+        assert_eq!(entry.ciphertext, local_description.ciphertext);
         assert_eq!(bind.connections.len(), 2);
         assert_eq!(bind.connections[0].kind, 0);
         assert_eq!(bind.connections[1].kind, 1);
@@ -313,7 +405,7 @@ async fn exchanges_media_and_signaling_on_the_bound_http3_socket() -> Result<()>
                 .await?;
             assert_eq!(sent, data.len());
         }
-        require_send(relay.write_all(&mut request, RESPONSE)).await?;
+        require_send(relay.write_all(&mut request, &response)).await?;
         relay.finish_stream(&mut request)?;
 
         let mut buffer = [0; 2048];
@@ -350,7 +442,12 @@ async fn exchanges_media_and_signaling_on_the_bound_http3_socket() -> Result<()>
     };
 
     let client = async {
-        let conn = require_send(CallRelayConnection::connect(endpoint, test_keys())).await?;
+        let conn = require_send(CallRelayConnection::connect(
+            endpoint,
+            test_keys(),
+            test_call(),
+        ))
+        .await?;
         local_address
             .send(conn.socket.get_ref().local_addr()?)
             .map_err(|_| anyhow::anyhow!("Fixture relay dropped the address channel"))?;
@@ -359,11 +456,21 @@ async fn exchanges_media_and_signaling_on_the_bound_http3_socket() -> Result<()>
             hardware_version: "fixture",
             capabilities: 0x1234,
         };
-        let mut binding = require_send(conn.bind(profile)).await?;
+        let mut binding =
+            require_send(conn.bind_with_description(profile, &local_description)).await?;
         assert_eq!(binding.channel_id, 0x4008);
         assert_eq!(binding.link_id, 1);
         assert_eq!(binding.avc.server_connection_id, SERVER_AVC);
         assert_eq!(binding.ids.server_connection_id, SERVER_IDS);
+        assert!(binding.peer_description(&Default::default())?.is_none());
+        let peer = binding
+            .peer_description(&description::remote_keys())?
+            .context("The caller description was not received")?;
+        assert_eq!(peer.audio.ssrc, 0x1020_3040);
+        assert_eq!(
+            peer.video.context("Missing camera offer")?.ssrc,
+            0x5060_7080
+        );
         let (kind, data) = require_send(binding.receive_datagram()).await?;
         assert_eq!(kind, RelayDatagramChannel::Signaling);
         assert_eq!(data.as_slice(), b"relay signaling");
@@ -392,7 +499,7 @@ async fn rejects_a_relay_with_a_different_key() -> Result<()> {
     wrong_keys.tls_psk[0] ^= 1;
     let (server, client) = tokio::join!(
         accept_relay(&mut relay, accept_connection),
-        CallRelayConnection::connect(endpoint, wrong_keys)
+        CallRelayConnection::connect(endpoint, wrong_keys, test_call())
     );
     let Err(server_failure) = server else {
         anyhow::bail!("The mock relay accepted the wrong key")

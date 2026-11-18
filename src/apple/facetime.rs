@@ -1,3 +1,4 @@
+mod description;
 mod media;
 pub(super) mod relay;
 
@@ -8,6 +9,7 @@ use uuid::Uuid;
 
 use crate::{CallMode, IncomingCall, address, now_ms};
 
+pub use description::{CallAvcMaterial, CallMediaDescription, CallRtpDescription};
 pub use media::{CallKey, CallKeyOffer, CallMediaHandshake, CallMediaKey, CallPeerKeys};
 pub(crate) use media::{CallMediaExchange, PeerKeyOffer, PeerMediaOffer, PeerPrekey};
 pub use relay::{

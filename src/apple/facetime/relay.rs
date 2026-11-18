@@ -67,6 +67,13 @@ pub struct CallRelayAllocation {
     shared_key: Zeroizing<Vec<u8>>,
 }
 
+#[derive(Clone, Copy)]
+struct RelayCall {
+    id: Uuid,
+    local: u64,
+    peer: u64,
+}
+
 /// Fresh authentication and packet keys for one relay connection attempt.
 pub struct CallRelayKeys {
     pub identity: Zeroizing<Vec<u8>>,
