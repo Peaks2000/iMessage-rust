@@ -41,7 +41,7 @@ enum OutgoingProgress {
 pub(in crate::engine) struct OutgoingAnswer {
     handshake: Arc<CallMediaHandshake>,
     endpoint: CallEndpoint,
-    local_keys: Arc<CallKeyOffer>,
+    delivery: CallKeyDelivery,
     lifetime: AnswerLifetime,
 }
 
@@ -389,13 +389,12 @@ impl IncomingCalls {
             .await
     }
 
-    pub(in crate::engine) async fn finish_outgoing(
+    pub(in crate::engine) fn finish_outgoing(
         &mut self,
         identity: &Identity,
-        madrid: &mut Madrid,
         id: Uuid,
         relay_prekey: Option<(CallEndpoint, PeerPrekey)>,
-    ) -> Result<OutgoingAnswer> {
+    ) -> Result<(OutgoingAnswer, CourierKeyDelivery)> {
         let pending = self
             .outgoing
             .as_mut()
@@ -441,17 +440,19 @@ impl IncomingCalls {
             let _ = exchange.receive(offer);
         }
         let handshake = exchange.handshake.clone();
-        let lifetime = self.connect_call(call, device.endpoint, relay.clone(), exchange, true);
         let local_keys = Arc::new(handshake.build_key_offer(relay.local_participant)?);
-        madrid
-            .publish_call_keys(identity, &handshake, device.endpoint, &local_keys)
-            .await?;
-        Ok(OutgoingAnswer {
-            handshake,
-            endpoint: device.endpoint,
-            local_keys,
-            lifetime,
-        })
+        let (delivery, courier) =
+            CallKeyDelivery::prepare(identity, handshake.clone(), device.endpoint, local_keys)?;
+        let lifetime = self.connect_call(call, device.endpoint, relay, exchange, true);
+        Ok((
+            OutgoingAnswer {
+                handshake,
+                endpoint: device.endpoint,
+                delivery,
+                lifetime,
+            },
+            courier,
+        ))
     }
 }
 
@@ -510,7 +511,7 @@ impl Engine {
         let OutgoingAnswer {
             handshake,
             endpoint,
-            local_keys,
+            delivery,
             mut lifetime,
         } = match answer {
             Ok(answer) => answer,
@@ -524,13 +525,15 @@ impl Engine {
             .mode
             .context("The other device did not select a call mode")?;
         local_description.mode = Some(mode);
+        let local_keys = delivery.offer.clone();
         let description = local_keys.seal_description(config.avc_plist, mode)?;
-        let bound = tokio::select! {
+        let mut bound = pending_relay.into_bound()?;
+        tokio::select! {
             biased;
             _ = lifetime.ended.changed() => anyhow::bail!("The FaceTime call has ended"),
-            result = timeout(MEDIA_SETUP_TIMEOUT, pending_relay.join(&description)) =>
+            result = timeout(MEDIA_SETUP_TIMEOUT, delivery.publish(&mut bound, &description)) =>
                 result.context("The FaceTime relay did not confirm the media offer")??,
-        };
+        }
         complete_media(
             self,
             handshake,

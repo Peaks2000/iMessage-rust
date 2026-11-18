@@ -3,7 +3,10 @@ mod calls;
 use calls::outgoing::{DialRequest, OutgoingAnswer, OutgoingAttempt, PendingOutgoing};
 #[cfg(feature = "desktop")]
 pub use calls::video;
-use calls::{AnswerAttempt, AnswerLease, AnswerLifetime, ConnectedCall, JoinAnswer};
+use calls::{
+    AnswerAttempt, AnswerLease, AnswerLifetime, CallKeyDelivery, ConnectedCall, CourierKeyDelivery,
+    JoinAnswer,
+};
 pub use calls::{AnsweredCall, CallAnswerConfig};
 
 use std::{
@@ -70,7 +73,7 @@ enum Request {
     },
     PublishCallKeys {
         id: uuid::Uuid,
-        reply: oneshot::Sender<Result<Arc<CallKeyOffer>>>,
+        reply: oneshot::Sender<Result<CallKeyDelivery>>,
     },
     BeginCallAnswer {
         id: uuid::Uuid,
@@ -241,6 +244,13 @@ impl Engine {
     /// Exchange the local prekey and wrapped keys with the verified device on a ringing call.
     /// Use this after the local answer action has prepared media and obtained a relay.
     pub async fn publish_call_keys(&self, id: uuid::Uuid) -> Result<Arc<CallKeyOffer>> {
+        let delivery = self.prepare_key_delivery(id).await?;
+        let offer = delivery.offer.clone();
+        delivery.wait_for_ids().await?;
+        Ok(offer)
+    }
+
+    async fn prepare_key_delivery(&self, id: uuid::Uuid) -> Result<CallKeyDelivery> {
         let (reply, answer) = oneshot::channel();
         self.requests
             .try_send(Request::PublishCallKeys { id, reply })
@@ -496,20 +506,26 @@ async fn online(
                         });
                         let _ = reply.send(result);
                     }
-                    Request::PublishCallKeys { id, mut reply } => {
+                    Request::PublishCallKeys { id, reply } => {
                         for notification in madrid.take_queued() {
                             receive_notification(identity, state, madrid, status, calls, notification).await?;
                         }
-                        let result = tokio::select! {
-                            biased;
-                            _ = reply.closed() => continue,
-                            result = calls.publish_keys(identity, madrid, status, id) => result,
-                        };
-                        for notification in madrid.take_queued() {
-                            receive_notification(identity, state, madrid, status, calls, notification).await?;
+                        if reply.is_closed() {
+                            continue;
                         }
-                        let result = result.and_then(|offer| active_call(&status.borrow(), id).map(|_| offer));
-                        let _ = reply.send(result);
+                        let result = calls.prepare_keys(identity, &status.borrow(), id);
+                        match result {
+                            Ok((delivery, courier)) => {
+                                if reply.send(Ok(delivery)).is_ok() {
+                                    let sent = courier.send(identity, madrid).await;
+                                    for notification in madrid.take_queued() {
+                                        receive_notification(identity, state, madrid, status, calls, notification).await?;
+                                    }
+                                    courier.finish(sent.and_then(|()| active_call(&status.borrow(), id).map(|_| ())));
+                                }
+                            }
+                            Err(error) => { let _ = reply.send(Err(error)); }
+                        }
                     }
                     Request::BeginCallAnswer { id, reply } => {
                         if !reply.is_closed() {
@@ -561,15 +577,21 @@ async fn online(
                         if reply.is_closed() {
                             continue;
                         }
-                        let result = calls.finish_outgoing(identity, madrid, id, relay_prekey).await;
-                        for notification in madrid.take_queued() {
-                            receive_notification(identity, state, madrid, status, calls, notification).await?;
+                        match calls.finish_outgoing(identity, id, relay_prekey) {
+                            Ok((answer, courier)) => {
+                                if reply.send(Ok(answer)).is_ok() {
+                                    let sent = courier.send(identity, madrid).await;
+                                    for notification in madrid.take_queued() {
+                                        receive_notification(identity, state, madrid, status, calls, notification).await?;
+                                    }
+                                    courier.finish(sent.and_then(|()| {
+                                        ensure!(calls.connected.as_ref().is_some_and(|active| active.call.id == id), "The FaceTime call has ended");
+                                        Ok(())
+                                    }));
+                                }
+                            }
+                            Err(error) => { let _ = reply.send(Err(error)); }
                         }
-                        let result = result.and_then(|answer| {
-                            ensure!(calls.connected.as_ref().is_some_and(|active| active.call.id == id), "The FaceTime call has ended");
-                            Ok(answer)
-                        });
-                        let _ = reply.send(result);
                     }
                     Request::InstallRelayKeys { id, offer } => {
                         if let Some(active) = &calls.connected
@@ -696,14 +718,13 @@ impl IncomingCalls {
         Ok(Arc::new(relay))
     }
 
-    async fn publish_keys(
+    fn prepare_keys(
         &mut self,
         identity: &Identity,
-        madrid: &mut Madrid,
-        status: &watch::Sender<Status>,
+        status: &Status,
         id: uuid::Uuid,
-    ) -> Result<Arc<CallKeyOffer>> {
-        let _ = active_call(&status.borrow(), id)?;
+    ) -> Result<(CallKeyDelivery, CourierKeyDelivery)> {
+        let _ = active_call(status, id)?;
         let details = self
             .details
             .get_mut(&id)
@@ -732,10 +753,12 @@ impl IncomingCalls {
             .offer
             .as_ref()
             .context("Missing FaceTime key offer")?;
-        madrid
-            .publish_call_keys(identity, &exchange.handshake, details.endpoint, offer)
-            .await?;
-        Ok(offer.clone())
+        CallKeyDelivery::prepare(
+            identity,
+            exchange.handshake.clone(),
+            details.endpoint,
+            offer.clone(),
+        )
     }
 
     fn expire(&mut self, status: &mut Status, now: i64) -> bool {

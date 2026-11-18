@@ -20,9 +20,9 @@ use super::{Engine, IncomingCalls, Request, active_call};
 use crate::{
     CallMode, IncomingCall, Status,
     apple::{
-        CallEndpoint, CallKeyOffer, CallMediaDescription, CallMediaExchange, CallMediaHandshake,
-        CallPeerKeys, CallRelayAllocation, CallRelayBinding, CallRelayProfile, CallRtpProtection,
-        Identity, Madrid, PeerPrekey, RelayPeerUpdate,
+        CallAvcMaterial, CallEndpoint, CallKeyOffer, CallMediaDescription, CallMediaExchange,
+        CallMediaHandshake, CallPeerKeys, CallRelayAllocation, CallRelayBinding, CallRelayProfile,
+        CallRtpProtection, Identity, Madrid, PeerPrekey, RelayPeerUpdate, SignedRelayKeys,
     },
     now_ms,
 };
@@ -155,6 +155,74 @@ pub(super) struct AnswerLifetime {
     ended: watch::Receiver<()>,
 }
 
+pub(super) struct CallKeyDelivery {
+    pub(super) offer: Arc<CallKeyOffer>,
+    signed: Option<SignedRelayKeys>,
+    ids: oneshot::Receiver<Result<()>>,
+}
+
+pub(super) struct CourierKeyDelivery {
+    handshake: Arc<CallMediaHandshake>,
+    endpoint: CallEndpoint,
+    offer: Arc<CallKeyOffer>,
+    receipt: oneshot::Sender<Result<()>>,
+}
+
+impl CallKeyDelivery {
+    pub(super) fn prepare(
+        identity: &Identity,
+        handshake: Arc<CallMediaHandshake>,
+        endpoint: CallEndpoint,
+        offer: Arc<CallKeyOffer>,
+    ) -> Result<(Self, CourierKeyDelivery)> {
+        let signed = identity.sign_relay_keys(&offer, endpoint)?;
+        let (receipt, ids) = oneshot::channel();
+        let courier = CourierKeyDelivery {
+            handshake,
+            endpoint,
+            offer: offer.clone(),
+            receipt,
+        };
+        Ok((Self { offer, signed, ids }, courier))
+    }
+
+    pub(super) async fn wait_for_ids(self) -> Result<()> {
+        self.ids
+            .await
+            .context("The Apple engine stopped while exchanging keys")?
+    }
+
+    async fn publish(
+        mut self,
+        relay: &mut CallRelayBinding,
+        description: &CallAvcMaterial,
+    ) -> Result<()> {
+        if let Some(keys) = self.signed.take() {
+            match relay.publish_media(description, Some(&keys)).await {
+                Ok(()) => return Ok(()),
+                Err(error) => self.wait_for_ids().await.with_context(|| {
+                    format!("Could not publish FaceTime keys through the relay: {error:#}")
+                })?,
+            }
+        } else {
+            self.wait_for_ids().await?;
+        }
+        relay.publish_media(description, None).await
+    }
+}
+
+impl CourierKeyDelivery {
+    pub(super) async fn send(&self, identity: &Identity, madrid: &mut Madrid) -> Result<()> {
+        madrid
+            .publish_call_keys(identity, &self.handshake, self.endpoint, &self.offer)
+            .await
+    }
+
+    pub(super) fn finish(self, result: Result<()>) {
+        let _ = self.receipt.send(result);
+    }
+}
+
 pub(super) struct ConnectedCall {
     pub(super) call: IncomingCall,
     pub(super) endpoint: CallEndpoint,
@@ -228,18 +296,32 @@ impl Engine {
                 let handshake = self.wait_for_answer_media(id, &lease, &mut relay).await?;
                 (handshake, Some(relay))
             };
-            let local_keys = self.publish_call_keys(id).await?;
+            let delivery = self.prepare_key_delivery(id).await?;
+            let local_keys = delivery.offer.clone();
             let description = local_keys.seal_description(config.avc_plist, config.mode)?;
-            let relay = if let Some(mut relay) = early_relay {
-                relay.publish_description(&description).await?;
-                relay
-            } else {
+            let relay = if early_relay.is_none() && delivery.signed.is_none() {
+                delivery.wait_for_ids().await?;
                 let mut relay = allocation
                     .connect()
                     .await?
                     .bind_with_description(config.relay_profile, &description)
                     .await?;
                 relay.subscribe_to_descriptions().await?;
+                relay
+            } else {
+                let mut relay = match early_relay {
+                    Some(relay) => relay,
+                    None => {
+                        let mut relay = allocation
+                            .connect()
+                            .await?
+                            .bind(config.relay_profile)
+                            .await?;
+                        relay.subscribe_to_descriptions().await?;
+                        relay
+                    }
+                };
+                delivery.publish(&mut relay, &description).await?;
                 relay
             };
             Ok::<_, anyhow::Error>((

@@ -366,7 +366,6 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
     };
     let answered = CallEndpoint::new([7; 32], Some(description::CALLER));
     let other = CallEndpoint::new([8; 32], Some(description::CALLER + 1));
-    let offer = description::local_offer()?;
     let (signing, verification) = fixture_signer()?;
     let call = IncomingCall {
         id: description::CALL,
@@ -392,6 +391,13 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
         &PeerPrekey::parse(1, remote.handshake.public_prekey())?,
         local_prekey,
     );
+    let local_keys = local_exchange
+        .handshake
+        .build_key_offer(description::LOCAL)?;
+    let offer =
+        local_keys.seal_description(&description::signed_avc_fixture()?, CallMode::Video)?;
+    let signed_keys = relay_signer.sign_keys(&local_keys, description::CALLER)?;
+    let wrong_target = relay_signer.sign_keys(&local_keys, description::CALLER + 1)?;
     let remote_offer = remote.handshake.build_key_offer(description::CALLER)?;
     let payload: plist::Dictionary = plist::from_bytes(&remote_offer.payload)?;
     let mut media_key = Vec::new();
@@ -574,8 +580,9 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
         let submitted = TestMaterialEnvelope::decode(body.as_slice())?
             .request
             .context("Missing PutMaterial")?;
-        let [material] = submitted.materials.as_slice() else {
-            anyhow::bail!("Expected one encrypted media offer");
+        let [material, media_key_material, session_key_material] = submitted.materials.as_slice()
+        else {
+            anyhow::bail!("Expected one encrypted description and two wrapped keys");
         };
         let [entry] = material.entries.as_slice() else {
             anyhow::bail!("Expected one encrypted AVC description");
@@ -585,6 +592,58 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
         assert_eq!(entry.id, offer.material_id);
         assert_eq!(entry.kind, 12);
         assert_eq!(entry.ciphertext, offer.ciphertext);
+        for (record, kind, identifier) in [
+            (media_key_material, 13, local_keys.media.identifier),
+            (session_key_material, 14, local_keys.session.identifier),
+        ] {
+            assert_eq!(
+                (record.owner, record.receiver),
+                (Some(0), Some(description::CALLER))
+            );
+            let [entry] = record.entries.as_slice() else {
+                anyhow::bail!("Missing wrapped key in relay request");
+            };
+            assert_eq!(entry.kind, kind);
+            assert_eq!(entry.id, identifier);
+            let body = our_directory_key.verify_material(description::CALL, &entry.ciphertext)?;
+            let key = crate::apple::PeerKeyOffer::from_relay(
+                &body,
+                kind == 13,
+                &entry.id,
+                description::LOCAL,
+            )
+            .context("Could not read the signed wrapped key")?;
+            remote.receive(key)?;
+        }
+        {
+            let received = remote.handshake.watch_peer_keys();
+            let keys = received.borrow();
+            assert_eq!(
+                keys.media
+                    .as_ref()
+                    .context("Missing local sender's media key")?
+                    .identifier,
+                local_keys.media.identifier
+            );
+            let session = keys
+                .session
+                .as_ref()
+                .context("Missing local sender's session key")?;
+            let opened = crate::apple::facetime::description::open_description(
+                description::CALL,
+                description::LOCAL,
+                session,
+                &offer.ciphertext,
+            )?;
+            assert_eq!(opened.audio.ssrc, 0x1020_3040);
+            assert_eq!(
+                opened
+                    .video
+                    .context("Missing local sender's video stream")?
+                    .ssrc,
+                0x5060_7080
+            );
+        }
         fixture_response(&mut relay, publish, &[0xca, 1, 0]).await?;
 
         indication_chunk(&mut relay, &mut indications, &media).await?;
@@ -654,7 +713,14 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
             .await?
             .context("Missing relay-signed prekey")?;
         assert!(prekey.same_as(&PeerPrekey::parse(1, remote.handshake.public_prekey())?));
-        let mut connection = waiting.join(&offer).await?;
+        let mut connection = waiting.into_bound()?;
+        assert!(
+            connection
+                .publish_media(&offer, Some(&wrong_target))
+                .await
+                .is_err()
+        );
+        connection.publish_media(&offer, Some(&signed_keys)).await?;
         assert_eq!(connection.channel_id, 0x4008);
 
         assert!(matches!(

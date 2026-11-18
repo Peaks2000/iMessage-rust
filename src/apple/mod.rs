@@ -46,7 +46,7 @@ pub use facetime::{
 pub(crate) use facetime::{
     CallEndpoint, CallMediaExchange, CallRtpProtection, CallSignal, LocalCallPrekey, OutgoingRelay,
     PeerKeyOffer, PeerMediaOffer, PeerPrekey, RING_TIMEOUT_MS, RelayPeerUpdate, RingingRelay,
-    SignedRelayPrekey,
+    SignedRelayKeys, SignedRelayPrekey,
 };
 pub(crate) use madrid::{Incoming, Madrid, Notification, OutgoingCallTargets};
 use openssl::{
@@ -135,6 +135,22 @@ impl Identity {
         self.facetime_relay_signing
             .as_ref()
             .map(|key| key.sign_prekey(call, prekey))
+            .transpose()
+    }
+
+    pub(crate) fn sign_relay_keys(
+        &self,
+        offer: &CallKeyOffer,
+        endpoint: CallEndpoint,
+    ) -> Result<Option<SignedRelayKeys>> {
+        self.facetime_relay_signing
+            .as_ref()
+            .map(|key| {
+                let receiver = endpoint
+                    .participant()
+                    .context("Missing FaceTime receiving participant")?;
+                key.sign_keys(offer, receiver)
+            })
             .transpose()
     }
 

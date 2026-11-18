@@ -10,7 +10,9 @@ use zeroize::Zeroizing;
 
 use crate::apple::facetime::{
     CallAvcMaterial, CallEndpoint, CallMediaDescription, CallPeerKeys, PeerKeyOffer, PeerPrekey,
+    SignedRelayKeys,
     description::{open_description, valid_ciphertext},
+    signed_material::SignedRelayKey,
 };
 
 use super::{
@@ -143,23 +145,48 @@ impl RingingRelay {
         self.binding.wait_for_peer_prekey().await
     }
 
-    pub(crate) async fn join(mut self, offer: &CallAvcMaterial) -> Result<CallRelayBinding> {
-        self.binding.publish_description(offer).await?;
+    pub(crate) fn into_bound(self) -> Result<CallRelayBinding> {
+        ensure!(
+            self.binding.control.transport.call.peer != 0,
+            "Missing FaceTime answering participant"
+        );
         Ok(self.binding)
     }
 }
 
 impl CallRelayBinding {
-    pub(crate) async fn publish_description(&mut self, offer: &CallAvcMaterial) -> Result<()> {
+    pub(crate) async fn publish_media(
+        &mut self,
+        offer: &CallAvcMaterial,
+        keys: Option<&SignedRelayKeys>,
+    ) -> Result<()> {
         let call = self.control.transport.call;
         ensure!(
             call.peer != 0 && call.id == offer.call_id && call.local == offer.participant,
             "FaceTime relay and media description belong to different calls"
         );
+        let mut materials = vec![avc_material(offer, call.peer)];
+        if let Some(keys) = keys {
+            ensure!(
+                keys.call == call.id && keys.owner == call.local && keys.receiver == call.peer,
+                "FaceTime relay and wrapped keys belong to different devices or calls"
+            );
+            let material = |key: &SignedRelayKey, kind| Material {
+                owner: Some(0),
+                receiver: Some(call.peer),
+                entries: vec![MaterialInfo {
+                    id: key.id.to_vec(),
+                    kind,
+                    content: key.contents.clone(),
+                }],
+            };
+            materials.extend([
+                material(&keys.media, MEDIA_KEY_MATERIAL),
+                material(&keys.session, SESSION_KEY_MATERIAL),
+            ]);
+        }
         let request = PutMaterialEnvelope {
-            request: Some(PutMaterialRequest {
-                materials: vec![avc_material(offer, call.peer)],
-            }),
+            request: Some(PutMaterialRequest { materials }),
         };
         let response = self
             .control

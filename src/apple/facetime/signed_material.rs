@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use super::CallKeyOffer;
+
 const KEYING_CONTEXT: &[u8] = b"com.apple.FaceTime.QRKeying";
 const MAX_DIRECTORY_KEY: usize = 1024;
 const MAX_KEY_MATERIAL: usize = 4096;
@@ -24,6 +26,19 @@ const KT_VERSION: u32 = 5;
 pub(crate) struct SignedRelayPrekey {
     pub(super) call: Uuid,
     pub(super) material_id: [u8; 20],
+    pub(super) contents: Vec<u8>,
+}
+
+pub(crate) struct SignedRelayKeys {
+    pub(super) call: Uuid,
+    pub(super) owner: u64,
+    pub(super) receiver: u64,
+    pub(super) media: SignedRelayKey,
+    pub(super) session: SignedRelayKey,
+}
+
+pub(super) struct SignedRelayKey {
+    pub(super) id: [u8; 16],
     pub(super) contents: Vec<u8>,
 }
 
@@ -94,6 +109,44 @@ impl RelaySigningKey {
             call,
             material_id,
             contents: sign_material(&self.0, call, payload)?,
+        })
+    }
+
+    pub(in crate::apple) fn sign_keys(
+        &self,
+        offer: &CallKeyOffer,
+        receiver: u64,
+    ) -> Result<SignedRelayKeys> {
+        let call = offer.session.call_id;
+        let owner = offer.session.participant;
+        ensure!(
+            owner != 0
+                && receiver != 0
+                && owner != receiver
+                && offer.media.call_id == call
+                && offer.media.participant == owner,
+            "FaceTime keys and receiver belong to different calls"
+        );
+        // Both carriers use the exact same per-peer ciphertext, generation and key identifiers.
+        let fields: plist::Dictionary = plist::from_bytes(&offer.payload)?;
+        let sign_key = |name, id| -> Result<_> {
+            let key = fields
+                .get(name)
+                .and_then(plist::Value::as_dictionary)
+                .context("Missing wrapped FaceTime key")?;
+            let mut bytes = Vec::new();
+            plist::to_writer_binary(&mut bytes, key)?;
+            Ok(SignedRelayKey {
+                id,
+                contents: sign_material(&self.0, call, bytes)?,
+            })
+        };
+        Ok(SignedRelayKeys {
+            call,
+            owner,
+            receiver,
+            media: sign_key("rtmkm", offer.media.identifier)?,
+            session: sign_key("rtskm", offer.session.identifier)?,
         })
     }
 }
