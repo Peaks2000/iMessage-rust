@@ -20,6 +20,7 @@ const MKI_LEN: usize = 2;
 const ROC_SIZE: usize = 4;
 const RTP_MAX_ROC: u32 = 0x00ff_ffff;
 const BAD_TAG_LIMIT: u16 = 256;
+const MEDIA_KEY_LOOKAHEAD: usize = 2;
 
 /// One set of sequence numbers and replay windows for each negotiated stream of a call.
 pub(crate) struct CallRtpProtection {
@@ -55,7 +56,9 @@ impl CallRtpProtection {
             .map(|(track, stream)| RtpReceiver {
                 stream: stream.clone(),
                 track,
-                current: None,
+                anchor: None,
+                candidates: Vec::new(),
+                cutover: None,
                 replay: PacketWindow::default(),
             })
             .collect();
@@ -94,18 +97,7 @@ impl CallRtpProtection {
         let Some(stream) = self.receive.iter_mut().find(|s| s.stream.ssrc == rtp.ssrc) else {
             return Ok(None);
         };
-        if stream
-            .current
-            .as_ref()
-            .is_none_or(|current| !Arc::ptr_eq(&current.material, &key))
-        {
-            let keys = RtpKeys::for_stream(&key, rtp.ssrc)?;
-            stream.current = Some(RtpReceiveKeys {
-                material: key,
-                keys,
-                bad_tags: 0,
-            });
-        }
+        stream.install(key)?;
         stream.open(rtp, packet)
     }
 }
@@ -237,7 +229,9 @@ impl RtpSender {
 struct RtpReceiver {
     stream: CallRtpDescription,
     track: CallMode,
-    current: Option<RtpReceiveKeys>,
+    anchor: Option<Arc<CallKey>>,
+    candidates: Vec<RtpReceiveKeys>,
+    cutover: Option<(u32, u64)>,
     replay: PacketWindow,
 }
 
@@ -245,26 +239,86 @@ struct RtpReceiveKeys {
     material: Arc<CallKey>,
     keys: RtpKeys,
     bad_tags: u16,
+    last_index: Option<u64>,
 }
 
 impl RtpReceiver {
+    fn install(&mut self, anchor: Arc<CallKey>) -> Result<()> {
+        if self
+            .anchor
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &anchor))
+        {
+            return Ok(());
+        }
+
+        let mut materials = vec![anchor.clone()];
+        let mut last = anchor.clone();
+        for _ in 0..MEDIA_KEY_LOOKAHEAD {
+            let Some(next) = last.next_media_key()? else {
+                break;
+            };
+            last = Arc::new(next);
+            materials.push(last.clone());
+        }
+
+        let mut active = Vec::with_capacity(materials.len() + 1);
+        for material in materials {
+            if let Some(index) = self
+                .candidates
+                .iter()
+                .position(|key| key.material.same_material(&material))
+            {
+                let mut confirmed = self.candidates.swap_remove(index);
+                confirmed.last_index = None;
+                active.push(confirmed);
+            } else {
+                active.push(RtpReceiveKeys {
+                    keys: RtpKeys::for_stream(&material, self.stream.ssrc)?,
+                    material,
+                    bad_tags: 0,
+                    last_index: None,
+                });
+            }
+        }
+
+        // Only the immediately preceding key can survive a new signed offer. It can fill holes
+        // in the replay window, and the first authenticated newer packet fixes the cutover.
+        if let Some(latest) = self.replay.latest
+            && let Some(index) = self.candidates.iter().position(|old| {
+                old.material.generation.checked_add(1) == Some(anchor.generation)
+                    && active.iter().all(|key| key.keys.mki != old.keys.mki)
+            })
+        {
+            let mut previous = self.candidates.swap_remove(index);
+            previous.last_index = Some(latest.saturating_add(u64::from(u128::BITS)));
+            active.push(previous);
+        }
+        self.candidates = active;
+        self.anchor = Some(anchor);
+        Ok(())
+    }
+
     fn open(&mut self, header: RtpHeader, packet: &[u8]) -> Result<Option<Zeroizing<Vec<u8>>>> {
         if !self.stream.payload_types.contains(&header.payload_type) {
             return Ok(None);
         }
-        let state = self
-            .current
-            .as_mut()
-            .context("Missing FaceTime receive key")?;
         let tag_size = tag_length(self.track);
         let hint_size = hint_length(header.sequence);
         let Some(body_size) = packet.len().checked_sub(MKI_LEN + hint_size + tag_size) else {
             return Ok(None);
         };
         let (ciphertext, tail) = packet.split_at(body_size);
-        if body_size < header.size || !memcmp::eq(&state.keys.mki, &tail[..MKI_LEN]) {
+        if body_size < header.size {
             return Ok(None);
         }
+        let Some(state) = self
+            .candidates
+            .iter_mut()
+            .find(|state| memcmp::eq(&state.keys.mki, &tail[..MKI_LEN]))
+        else {
+            return Ok(None);
+        };
         let index = if hint_size > 0 {
             let hint = &tail[MKI_LEN..MKI_LEN + ROC_SIZE];
             if hint[3] & 0x20 == 0 {
@@ -278,6 +332,14 @@ impl RtpReceiver {
         let Some(index) = index.filter(|index| !self.replay.contains(*index)) else {
             return Ok(None);
         };
+        let generation = state.material.generation;
+        if state.last_index.is_some_and(|last| index > last)
+            || self
+                .cutover
+                .is_some_and(|(newer, start)| generation < newer && index >= start)
+        {
+            return Ok(None);
+        }
         ensure!(
             state.bad_tags < BAD_TAG_LIMIT,
             "FaceTime media integrity limit reached"
@@ -288,6 +350,13 @@ impl RtpReceiver {
             return Ok(None);
         }
         self.replay.record(index);
+        match self.cutover {
+            Some((newer, _)) if generation < newer => (),
+            Some((same, start)) if generation == same => {
+                self.cutover = Some((generation, start.min(index)))
+            }
+            _ => self.cutover = Some((generation, index)),
+        }
         let mut plaintext = Zeroizing::new(ciphertext.to_vec());
         state
             .keys
@@ -428,6 +497,9 @@ mod tests {
     fn media_key(participant: u64, kind: CallKeyKind, generation: u32, secret: u8) -> CallKey {
         let mut identifier = [0; 16];
         identifier[1] = 0x10;
+        let encoded = participant.to_be_bytes();
+        identifier[2..6].copy_from_slice(&encoded[..4]);
+        identifier[7..11].copy_from_slice(&encoded[4..]);
         CallKey {
             generation,
             identifier,
@@ -495,11 +567,14 @@ mod tests {
             let mut receiver = RtpReceiver {
                 stream,
                 track,
-                current: Some(RtpReceiveKeys {
+                anchor: None,
+                candidates: vec![RtpReceiveKeys {
                     material: Arc::new(media_key(PEER, CallKeyKind::PeerMedia, 1, 1)),
                     keys: RtpKeys::derive(&key, &salt, mki)?,
                     bad_tags: 0,
-                }),
+                    last_index: None,
+                }],
+                cutover: None,
                 replay: PacketWindow::default(),
             };
             let opened = receiver.open(RtpHeader::parse(&protected).unwrap(), &protected)?;
@@ -520,6 +595,90 @@ mod tests {
         packet.extend_from_slice(&AUDIO_SSRC.to_be_bytes());
         packet.extend_from_slice(b"encoded audio");
         packet
+    }
+
+    #[test]
+    fn opens_audio_and_video_across_a_reordered_key_rotation() -> Result<()> {
+        let local = description();
+        let remote = description();
+        let local_key = media_key(LOCAL, CallKeyKind::LocalMedia, 1, 0x51);
+        let initial = Arc::new(media_key(PEER, CallKeyKind::PeerMedia, 1, 0x32));
+        let next = Arc::new(initial.next_media_key()?.context("Missing next key")?);
+        let following = next.next_media_key()?.context("Missing following key")?;
+        let later = following.next_media_key()?.context("Missing later key")?;
+        let mut protection = CallRtpProtection::new(CALL, PEER, &local_key, &local, &remote)?;
+        let protect = |key: &CallKey, clear: &[u8], stream: &CallRtpDescription, track| {
+            RtpSender {
+                stream: stream.clone(),
+                track,
+                keys: RtpKeys::for_stream(key, stream.ssrc)?,
+                latest: None,
+            }
+            .protect(
+                RtpHeader::parse(clear).context("Invalid RTP fixture")?,
+                clear,
+            )
+        };
+        let audio =
+            |key: &CallKey, clear: &[u8]| protect(key, clear, &remote.audio, CallMode::Audio);
+        let first = audio_packet(4_998);
+        assert_eq!(
+            protection
+                .open(initial.clone(), &audio(&initial, &first)?)?
+                .as_deref(),
+            Some(&first)
+        );
+        let switched = audio_packet(5_000);
+        let encrypted = audio(&next, &switched)?;
+        assert_eq!(
+            protection.open(initial.clone(), &encrypted)?.as_deref(),
+            Some(&switched)
+        );
+
+        let mut video = audio_packet(5_001);
+        video[1] = 123;
+        video[8..12].copy_from_slice(&VIDEO_SSRC.to_be_bytes());
+        let encrypted_video = protect(
+            &following,
+            &video,
+            remote.video.as_ref().unwrap(),
+            CallMode::Video,
+        )?;
+        assert_eq!(
+            protection
+                .open(initial.clone(), &encrypted_video)?
+                .as_deref(),
+            Some(&video)
+        );
+        let future = audio_packet(5_002);
+        let encrypted_future = audio(&later, &future)?;
+        assert!(
+            protection
+                .open(initial.clone(), &encrypted_future)?
+                .is_none()
+        );
+
+        // Confirmation of the ratchet must preserve per-stream replay state and allow a late
+        // packet below the authenticated cutover to fill a hole in the receive window.
+        assert!(protection.open(next.clone(), &encrypted)?.is_none());
+        assert!(protection.open(next.clone(), &encrypted_video)?.is_none());
+        let late = audio_packet(4_999);
+        let encrypted_late = audio(&initial, &late)?;
+        assert_eq!(
+            protection.open(next.clone(), &encrypted_late)?.as_deref(),
+            Some(&late)
+        );
+        assert!(protection.open(next.clone(), &encrypted_late)?.is_none());
+        assert!(
+            protection
+                .open(next.clone(), &audio(&initial, &audio_packet(5_001))?)?
+                .is_none()
+        );
+        assert_eq!(
+            protection.open(next, &encrypted_future)?.as_deref(),
+            Some(&future)
+        );
+        Ok(())
     }
 
     #[test]

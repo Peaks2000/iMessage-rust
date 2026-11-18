@@ -10,7 +10,7 @@ use openssl::{
     md::Md,
     nid::Nid,
     pkey::{Id, PKey, Private, Public},
-    pkey_ctx::PkeyCtx,
+    pkey_ctx::{HkdfMode, PkeyCtx},
     rand::rand_bytes,
 };
 use plist::{Dictionary, Value};
@@ -199,6 +199,54 @@ pub(super) enum CallKeyKind {
     PeerSession,
     LocalMedia,
     PeerMedia,
+}
+
+impl CallKey {
+    /// The next MKI within a short-identifier rotation. A new rotation needs a signed offer.
+    pub(super) fn next_media_key(&self) -> Result<Option<Self>> {
+        let mut identifier = self.identifier;
+        let participant = self.participant.to_be_bytes();
+        if !matches!(self.kind, CallKeyKind::LocalMedia | CallKeyKind::PeerMedia)
+            || self.short_identifier_len != 2
+            || identifier[2..6] != participant[..4]
+            || identifier[6] != 0
+            || identifier[7..11] != participant[4..]
+            || identifier[11..] != [0; 5]
+            || identifier[1] & 0x0f == 0x0f
+        {
+            return Ok(None);
+        }
+        let Some(generation) = self.generation.checked_add(1) else {
+            return Ok(None);
+        };
+        identifier[1] += 1;
+        let group = self.call_id.hyphenated().to_string().to_ascii_uppercase();
+        let info = [group.as_bytes()];
+        let mut salt_prk = Zeroizing::new([0; SECRET_LEN]);
+        salt_prk[..self.key.salt.len()].copy_from_slice(&self.key.salt);
+        let salt = *derive_hkdf(&*salt_prk, None, &info)?;
+        let secret = hkdf(self.key.secret.as_ref(), &[], &info)?;
+        Ok(Some(Self {
+            generation,
+            identifier,
+            short_identifier_len: self.short_identifier_len,
+            key: CallMediaKey { secret, salt },
+            call_id: self.call_id,
+            participant: self.participant,
+            kind: self.kind,
+        }))
+    }
+
+    pub(super) fn same_material(&self, other: &Self) -> bool {
+        self.identifier == other.identifier
+            && self.generation == other.generation
+            && self.short_identifier_len == other.short_identifier_len
+            && self.call_id == other.call_id
+            && self.participant == other.participant
+            && self.kind == other.kind
+            && openssl::memcmp::eq(self.key.secret.as_ref(), other.key.secret.as_ref())
+            && openssl::memcmp::eq(&self.key.salt, &other.key.salt)
+    }
 }
 
 pub struct CallKeyOffer {
@@ -538,11 +586,23 @@ pub(super) fn hkdf<const N: usize>(
     salt: &[u8],
     info: &[&[u8]],
 ) -> Result<Zeroizing<[u8; N]>> {
+    derive_hkdf(input, Some(salt), info)
+}
+
+fn derive_hkdf<const N: usize>(
+    input: &[u8],
+    salt: Option<&[u8]>,
+    info: &[&[u8]],
+) -> Result<Zeroizing<[u8; N]>> {
     let mut kdf = PkeyCtx::new_id(Id::HKDF)?;
     kdf.derive_init()?;
     kdf.set_hkdf_md(Md::sha256())?;
+    if let Some(salt) = salt {
+        kdf.set_hkdf_salt(salt)?;
+    } else {
+        kdf.set_hkdf_mode(HkdfMode::EXPAND_ONLY)?;
+    }
     kdf.set_hkdf_key(input)?;
-    kdf.set_hkdf_salt(salt)?;
     for field in info {
         kdf.add_hkdf_info(field)?;
     }
@@ -576,6 +636,49 @@ mod tests {
     use openssl::bn::BigNum;
 
     use super::*;
+
+    #[test]
+    fn derives_face_time_short_mki_rotations_with_the_wire_call_uuid() -> Result<()> {
+        let mut identifier = [0; 16];
+        identifier[1] = 0x10;
+        identifier[10] = 7;
+        let anchor = CallKey {
+            generation: 1,
+            identifier,
+            short_identifier_len: 2,
+            key: CallMediaKey::fixture([0x32; 32], [0xaf; 16]),
+            call_id: Uuid::parse_str("6159B337-C2F2-4467-9E19-DFC68F4E5659")?,
+            participant: 7,
+            kind: CallKeyKind::PeerMedia,
+        };
+        // HKDF-SHA256 results generated independently with Python's HMAC implementation.
+        let mut key = anchor;
+        for (offset, (secret, salt)) in [
+            (
+                "24f38394d472db509661482b3ab58c4914091274e8cce0d99d6625e46e010d6d",
+                "3fb3529da047c1fb0a4b647f91940578",
+            ),
+            (
+                "e93f8a33e11ad916d64edf018f2534e290d44842c11175cd11fc65f45ac8292c",
+                "f6109675772ca410b729856ae712be8f",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            key = key.next_media_key()?.context("Missing next media key")?;
+            assert_eq!(key.generation, offset as u32 + 2);
+            assert_eq!(key.identifier[1], 0x11 + offset as u8);
+            assert_eq!(key.key.secret.as_slice(), hex::decode(secret)?);
+            assert_eq!(key.key.salt.as_slice(), hex::decode(salt)?);
+        }
+        key.identifier[1] = 0x1f;
+        assert!(key.next_media_key()?.is_none());
+        key.identifier[1] = 0x10;
+        key.identifier[10] ^= 1;
+        assert!(key.next_media_key()?.is_none());
+        Ok(())
+    }
 
     fn synthetic_call() -> IncomingCall {
         IncomingCall {
