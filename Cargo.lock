@@ -931,6 +931,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "compcol"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1484689ce40c89ace4c8ae957f2b1b786c0201c6001c874f428d66f8310b3803"
+
+[[package]]
 name = "concurrent-queue"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2441,6 +2447,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "compcol",
  "directories",
  "eframe",
  "flate2",

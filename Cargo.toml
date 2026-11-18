@@ -33,6 +33,7 @@ base64 = "0.22"
 bytes = "1"
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
+compcol = { version = "0.7.3", default-features = false, features = ["qpack"] }
 directories = "6"
 eframe = { version = "0.33.3", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"], optional = true }
 flate2 = "1"

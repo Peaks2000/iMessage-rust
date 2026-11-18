@@ -313,6 +313,10 @@ impl CallRelayConnection {
         &self.keys
     }
 
+    pub(super) fn peer_addr(&self) -> Result<SocketAddr> {
+        Ok(self.socket.get_ref().peer_addr()?)
+    }
+
     pub fn export_keying_material(&self, output: &mut [u8], label: &str) -> Result<()> {
         self.ssl.export_keying_material(output, label, None)?;
         Ok(())

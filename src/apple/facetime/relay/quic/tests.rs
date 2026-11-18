@@ -1,8 +1,11 @@
+use super::super::CallRelayProfile;
 use super::*;
+use compcol::qpack::QpackDecoder;
 use openssl::{
     memcmp,
     ssl::{AlpnError, select_next_proto},
 };
+use prost::Message;
 
 type ServerPsk = unsafe extern "C" fn(SslPtr, *const u8, usize, *mut SessionPtr) -> c_int;
 type Method = unsafe extern "C" fn() -> *const ffi::SSL_METHOD;
@@ -149,33 +152,78 @@ async fn accept_relay(
     Ok(listener)
 }
 
+async fn read_exact(
+    conn: &mut CallRelayConnection,
+    stream: &mut CallRelayStream,
+    mut target: &mut [u8],
+) -> Result<()> {
+    while !target.is_empty() {
+        let count = conn.read(stream, target).await?;
+        ensure!(count > 0, "Unexpected end of QUIC stream");
+        target = &mut target[count..];
+    }
+    Ok(())
+}
+
+#[derive(Message)]
+struct TestBindEnvelope {
+    #[prost(message, optional, tag = "1")]
+    request: Option<TestBindRequest>,
+}
+
+#[derive(Message)]
+struct TestBindRequest {
+    #[prost(uint32, tag = "1")]
+    service: u32,
+    #[prost(uint64, tag = "4")]
+    capabilities: u64,
+    #[prost(message, repeated, tag = "11")]
+    connections: Vec<TestBindConnection>,
+}
+
+#[derive(Message)]
+struct TestBindConnection {
+    #[prost(int32, tag = "1")]
+    kind: i32,
+    #[prost(bytes = "vec", tag = "2")]
+    id: Vec<u8>,
+}
+
+async fn read_fixture_frame(
+    relay: &mut CallRelayConnection,
+    request: &mut CallRelayStream,
+    kind: u8,
+) -> Result<Vec<u8>> {
+    let mut prefix = [0; 2];
+    read_exact(relay, request, &mut prefix).await?;
+    assert_eq!(prefix[0], kind);
+    let length = match prefix[1] >> 6 {
+        0 => usize::from(prefix[1]),
+        1 => {
+            let mut tail = [0];
+            read_exact(relay, request, &mut tail).await?;
+            usize::from(u16::from_be_bytes([prefix[1] & 0x3f, tail[0]]))
+        }
+        _ => anyhow::bail!("Unexpected fixture frame length"),
+    };
+    let mut payload = vec![0; length];
+    read_exact(relay, request, &mut payload).await?;
+    Ok(payload)
+}
+
 #[tokio::test]
-async fn negotiates_external_psk_and_exchanges_http3_streams() -> Result<()> {
+async fn binds_authenticated_http3_and_exports_the_same_channel_key_material() -> Result<()> {
     let Some((endpoint, mut relay, accept_connection)) = loopback_listener()? else {
         return Ok(());
     };
-    // HTTP/3 unidirectional control stream followed by a SETTINGS frame with an empty body.
-    const SETTINGS: &[u8] = &[0, 4, 0];
-    // HEADERS with static QPACK :method GET, :scheme https, :path / and literal :authority.
-    const REQUEST: &[u8] = &[
-        1, 16, 0, 0, 0xd1, 0xd7, 0xc1, 0x50, 9, b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's',
-        b't',
+    const CLIENT_SETTINGS: &[u8] = &[0, 4, 3, 6, 0x60, 0];
+    const SERVER_SETTINGS: &[u8] = &[0, 4, 0];
+    // Static QPACK :status 200, then a protobuf QuickRelay H3 envelope with the channel
+    // number, link ID, and four-byte server identifiers for AVC and IDS.
+    const RESPONSE: &[u8] = &[
+        1, 3, 0, 0, 0xd9, 0, 26, 0x12, 24, 0x10, 0x88, 0x80, 1, 0x30, 1, 0x5a, 6, 0x12, 4, 0, 0x90,
+        0, 1, 0x5a, 8, 8, 1, 0x12, 4, 0x10, 0x90, 0, 2,
     ];
-    // HEADERS with static QPACK :status 200, followed by a DATA frame.
-    const RESPONSE: &[u8] = &[1, 3, 0, 0, 0xd9, 0, 2, b'o', b'k'];
-
-    async fn read_exact(
-        conn: &mut CallRelayConnection,
-        stream: &mut CallRelayStream,
-        mut target: &mut [u8],
-    ) -> Result<()> {
-        while !target.is_empty() {
-            let count = conn.read(stream, target).await?;
-            ensure!(count > 0, "Unexpected end of QUIC stream");
-            target = &mut target[count..];
-        }
-        Ok(())
-    }
 
     let server = async {
         let _listener = accept_relay(&mut relay, accept_connection).await?;
@@ -184,57 +232,86 @@ async fn negotiates_external_psk_and_exchanges_http3_streams() -> Result<()> {
             .await
             .context("Relay waiting for client settings stream")?;
         assert_eq!(relay.stream_id(&control)? % 4, 2);
-        let mut settings = [0; SETTINGS.len()];
+        let mut settings = [0; CLIENT_SETTINGS.len()];
         read_exact(&mut relay, &mut control, &mut settings).await?;
-        assert_eq!(settings, SETTINGS);
+        assert_eq!(settings, CLIENT_SETTINGS);
         assert!(relay.ssl.session_reused());
+        let mut server_encoder = relay
+            .open_stream(RelayStreamDirection::Unidirectional)
+            .await?;
+        relay.write_all(&mut server_encoder, &[2]).await?;
         let mut response_control = relay
             .open_stream(RelayStreamDirection::Unidirectional)
             .await?;
-        relay.write_all(&mut response_control, SETTINGS).await?;
+        relay
+            .write_all(&mut response_control, SERVER_SETTINGS)
+            .await?;
 
         let mut request = relay.accept_stream().await?;
         assert_eq!(relay.stream_id(&request)? % 4, 0);
-        let mut data = [0; REQUEST.len()];
-        read_exact(&mut relay, &mut request, &mut data).await?;
-        assert_eq!(data, REQUEST);
+        let header_block = read_fixture_frame(&mut relay, &mut request, 1).await?;
+        let fields = QpackDecoder::with_max_table_capacity(0)
+            .decode_field_section(&header_block)
+            .expect("valid fixture QPACK block");
+        let field = |name: &[u8]| {
+            fields
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| f.value.as_slice())
+        };
+        assert_eq!(field(b":method"), Some(b"PUT".as_slice()));
+        assert_eq!(field(b":scheme"), Some(b"https".as_slice()));
+        assert_eq!(field(b":path"), Some(b"/QR/AllocBind".as_slice()));
+        assert_eq!(field(b":authority"), Some(endpoint.to_string().as_bytes()));
+        assert_eq!(field(b"version"), Some(b"1.1".as_slice()));
+        assert_eq!(field(b"user-agent"), Some(b"GFT/2.0".as_slice()));
+        let payload = read_fixture_frame(&mut relay, &mut request, 0).await?;
+        assert_eq!(
+            field(b"content-length"),
+            Some(payload.len().to_string().as_bytes())
+        );
+        let bind = TestBindEnvelope::decode(payload.as_slice())?
+            .request
+            .context("No bind request")?;
+        assert_eq!(bind.service, 4096);
+        assert_eq!(bind.capabilities, 0x1234);
+        assert_eq!(bind.connections.len(), 2);
+        assert_eq!(bind.connections[0].kind, 0);
+        assert_eq!(bind.connections[1].kind, 1);
+        let avc: [u8; 4] = bind.connections[0].id.as_slice().try_into()?;
+        let ids: [u8; 4] = bind.connections[1].id.as_slice().try_into()?;
+        assert_eq!(u32::from_be_bytes(avc) & 0xf080_0000, 0x0080_0000);
+        assert_eq!(u32::from_be_bytes(ids) & 0xf080_0000, 0x1080_0000);
         let mut end = [0; 1];
         assert_eq!(relay.read(&mut request, &mut end).await?, 0);
-        relay.write_all(&mut request, RESPONSE).await?;
+        require_send(relay.write_all(&mut request, RESPONSE)).await?;
         relay.finish_stream(&mut request)?;
         let mut material = Zeroizing::new([0; 32]);
         relay.export_keying_material(material.as_mut(), "AVC client")?;
-        Ok::<_, anyhow::Error>(material)
+        Ok::<_, anyhow::Error>((material, avc, ids))
     };
 
     let client = async {
-        let mut conn = require_send(CallRelayConnection::connect(endpoint, test_keys())).await?;
-        let mut control = conn
-            .open_stream(RelayStreamDirection::Unidirectional)
-            .await?;
-        conn.write_all(&mut control, SETTINGS).await?;
-        let mut response_control = conn
-            .accept_stream()
-            .await
-            .context("Client waiting for relay settings stream")?;
-        assert_eq!(conn.stream_id(&response_control)? % 4, 3);
-        let mut settings = [0; SETTINGS.len()];
-        read_exact(&mut conn, &mut response_control, &mut settings).await?;
-        assert_eq!(settings, SETTINGS);
-        let mut request = conn
-            .open_stream(RelayStreamDirection::Bidirectional)
-            .await?;
-        require_send(conn.write_all(&mut request, REQUEST)).await?;
-        conn.finish_stream(&mut request)?;
-        let mut response = [0; RESPONSE.len()];
-        read_exact(&mut conn, &mut request, &mut response).await?;
-        assert_eq!(response, RESPONSE);
+        let conn = require_send(CallRelayConnection::connect(endpoint, test_keys())).await?;
+        let profile = CallRelayProfile {
+            os_version: "testOS,0.0,fixture",
+            hardware_version: "fixture",
+            capabilities: 0x1234,
+        };
+        let binding = require_send(conn.bind(profile)).await?;
+        assert_eq!(binding.channel_id, 0x4008);
+        assert_eq!(binding.link_id, 1);
+        assert_eq!(binding.avc.server_connection_id, [0, 0x90, 0, 1]);
+        assert_eq!(binding.ids.server_connection_id, [0x10, 0x90, 0, 2]);
         let mut material = Zeroizing::new([0; 32]);
-        conn.export_keying_material(material.as_mut(), "AVC client")?;
-        Ok::<_, anyhow::Error>(material)
+        binding.export_keying_material(material.as_mut(), "AVC client")?;
+        Ok::<_, anyhow::Error>((material, binding.avc, binding.ids))
     };
-    let (server_export, client_export) = tokio::try_join!(server, client)?;
+    let ((server_export, avc, ids), (client_export, client_avc, client_ids)) =
+        tokio::try_join!(server, client)?;
     assert!(memcmp::eq(server_export.as_ref(), client_export.as_ref()));
+    assert_eq!(client_avc.client_connection_id, avc);
+    assert_eq!(client_ids.client_connection_id, ids);
     Ok(())
 }
 
