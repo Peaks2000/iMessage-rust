@@ -19,7 +19,10 @@ use crate::{
     TEXT_LIMIT, Tapback, TapbackEvent, TapbackKind, address, now_ms, now_ns,
 };
 use crate::{
-    apple::{CallEndpoint, CallSignal, Identity, Incoming, Madrid},
+    apple::{
+        CallEndpoint, CallMediaHandshake, CallSignal, Identity, Incoming, Madrid, PeerMediaOffer,
+        PeerPrekey,
+    },
     history::History,
 };
 
@@ -45,6 +48,10 @@ enum Request {
     DeclineCall {
         id: uuid::Uuid,
         reply: oneshot::Sender<Result<()>>,
+    },
+    PrepareCallMedia {
+        id: uuid::Uuid,
+        reply: oneshot::Sender<Result<CallMediaHandshake>>,
     },
     Download {
         id: uuid::Uuid,
@@ -151,6 +158,18 @@ impl Engine {
         answer
             .await
             .context("The Apple engine stopped during the call response")?
+    }
+
+    /// Prepare ephemeral key material for a verified, still-ringing call.
+    /// Callers should invoke this after an explicit local answer action.
+    pub async fn prepare_call_media(&self, id: uuid::Uuid) -> Result<CallMediaHandshake> {
+        let (reply, answer) = oneshot::channel();
+        self.requests
+            .try_send(Request::PrepareCallMedia { id, reply })
+            .context("The Apple engine is busy or stopped")?;
+        answer
+            .await
+            .context("The Apple engine stopped during media preparation")?
     }
 
     pub async fn send(&self, mut request: SendText) -> Result<Message> {
@@ -267,6 +286,9 @@ async fn run_apple(
                         Request::DeclineCall { reply, .. } => {
                             let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
                         }
+                        Request::PrepareCallMedia { reply, .. } => {
+                            let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
+                        }
                     }
                 }
             }
@@ -334,6 +356,9 @@ async fn online(
                         }
                         let _ = reply.send(result);
                     }
+                    Request::PrepareCallMedia { id, reply } => {
+                        let _ = reply.send(calls.prepare_media(&status.borrow(), id));
+                    }
                 }
             }
             _ = status.closed() => return Ok(()),
@@ -343,28 +368,70 @@ async fn online(
 
 #[derive(Default)]
 struct IncomingCalls {
-    endpoints: HashMap<uuid::Uuid, CallEndpoint>,
+    details: HashMap<uuid::Uuid, IncomingCallDetails>,
     ended: HashMap<uuid::Uuid, i64>,
+}
+
+struct IncomingCallDetails {
+    endpoint: CallEndpoint,
+    description: Option<Vec<u8>>,
+    prekey: Option<PeerPrekey>,
+}
+
+impl IncomingCallDetails {
+    fn learn_prekey(&mut self, key: PeerPrekey) {
+        // One caller prekey per ringing attempt. An established call negotiates rekeys separately.
+        if self.prekey.as_ref().is_none_or(|known| known.same_as(&key)) {
+            self.prekey = Some(key);
+        }
+    }
+
+    fn learn_media(&mut self, media: Option<PeerMediaOffer>) {
+        if let Some(offer) = media {
+            if let Some(key) = offer.prekey {
+                self.learn_prekey(key);
+            }
+            self.description.get_or_insert(offer.description);
+        }
+    }
 }
 
 impl IncomingCalls {
     fn expire(&mut self, status: &mut Status, now: i64) -> bool {
         let previous = status.incoming_calls.len();
         status.incoming_calls.retain(|call| call.expires_ms > now);
-        self.endpoints
+        self.details
             .retain(|id, _| status.incoming_calls.iter().any(|call| call.id == *id));
         self.ended.retain(|_, expires_ms| *expires_ms > now);
         status.incoming_calls.len() != previous
     }
 
     fn end(&mut self, id: uuid::Uuid, now: i64) {
-        self.endpoints.remove(&id);
+        self.details.remove(&id);
         if self.ended.len() >= 256
             && let Some((&oldest, _)) = self.ended.iter().min_by_key(|(_, expiry)| *expiry)
         {
             self.ended.remove(&oldest);
         }
         self.ended.insert(id, now + 120_000);
+    }
+
+    fn prepare_media(&self, status: &Status, id: uuid::Uuid) -> Result<CallMediaHandshake> {
+        let call = status
+            .incoming_calls
+            .iter()
+            .find(|call| call.id == id && call.expires_ms > now_ms())
+            .context("This FaceTime call has ended")?;
+        let details = self.details.get(&id).context("Missing caller details")?;
+        let description = details
+            .description
+            .as_deref()
+            .context("The caller has not sent a media description")?;
+        let prekey = details
+            .prekey
+            .as_ref()
+            .context("The caller has not sent a supported media prekey")?;
+        CallMediaHandshake::prepare(call.clone(), description, prekey)
     }
 
     fn update(&mut self, status: &watch::Sender<Status>, own: &str, signal: CallSignal) {
@@ -376,16 +443,16 @@ impl IncomingCalls {
                 CallSignal::Ring {
                     call: offer,
                     endpoint,
+                    media,
                 } if offer.expires_ms > now && !self.ended.contains_key(&offer.id) => {
                     if let Some(existing) = calls.iter_mut().find(|call| call.id == offer.id) {
                         // Bind a standalone invitation to its join without extending the original ring.
                         if existing.caller == offer.caller
-                            && self
-                                .endpoints
-                                .get(&offer.id)
-                                .is_some_and(|first| first.matches(endpoint))
+                            && let Some(details) = self.details.get_mut(&offer.id)
+                            && details.endpoint.matches(endpoint)
                         {
-                            self.endpoints.insert(offer.id, endpoint);
+                            details.endpoint = endpoint;
+                            details.learn_media(media);
                             if existing.mode.is_none() && offer.mode.is_some() {
                                 existing.mode = offer.mode;
                                 return true;
@@ -394,11 +461,33 @@ impl IncomingCalls {
                         return expired;
                     }
                     if calls.len() >= 16 {
-                        self.endpoints.remove(&calls.remove(0).id);
+                        self.details.remove(&calls.remove(0).id);
                     }
-                    self.endpoints.insert(offer.id, endpoint);
+                    let mut details = IncomingCallDetails {
+                        endpoint,
+                        description: None,
+                        prekey: None,
+                    };
+                    details.learn_media(media);
+                    self.details.insert(offer.id, details);
                     calls.push(offer);
                     true
+                }
+                CallSignal::Prekey {
+                    id,
+                    sender,
+                    endpoint,
+                    key,
+                } => {
+                    if calls
+                        .iter()
+                        .any(|call| call.id == id && call.caller == sender)
+                        && let Some(details) = self.details.get_mut(&id)
+                        && details.endpoint.same_device(endpoint)
+                    {
+                        details.learn_prekey(key);
+                    }
+                    expired
                 }
                 CallSignal::End {
                     id,
@@ -411,9 +500,9 @@ impl IncomingCalls {
                             Some(leaving) => {
                                 sender == call.caller
                                     && self
-                                        .endpoints
+                                        .details
                                         .get(&id)
-                                        .is_some_and(|first| first.matches(leaving))
+                                        .is_some_and(|details| details.endpoint.matches(leaving))
                             }
                             None => sender == own || sender == call.caller,
                         };
@@ -624,6 +713,7 @@ mod tests {
         let ring = |call, token, participant| CallSignal::Ring {
             call,
             endpoint: CallEndpoint::new([token; 32], participant),
+            media: None,
         };
         let leave = |token, participant| CallSignal::End {
             id,
@@ -672,6 +762,87 @@ mod tests {
             },
         );
         assert!(reader.borrow().incoming_calls.is_empty());
+    }
+
+    #[test]
+    fn media_preparation_uses_only_the_authenticated_ringing_device() -> Result<()> {
+        let point = hex::decode(concat!(
+            "043ed113b7883b4c590638379db0c21cda16742ed0255048bf433391d374bc21d190",
+            "99209accc4c8a224c843afa4f4c68a090d04da5e9889dae2f8eefce82a3740"
+        ))?;
+        let key = PeerPrekey::parse(1, &point)?;
+        let stranger = PeerPrekey::parse(
+            1,
+            &hex::decode(concat!(
+                "0447776904c0f1cc3a9c0984b66f75301a5fa68678f0d64af8ba1abce34738a73e",
+                "aa005ee6b5b957286231856577648e8381b2804428d5733f32f787ff71f1fcdc"
+            ))?,
+        )?;
+        let now = now_ms();
+        let id = uuid::Uuid::new_v4();
+        let own = "mailto:receiver@example.org";
+        let caller = "mailto:caller@example.org";
+        let (status, reader) = watch::channel(Status {
+            connected: true,
+            detail: String::new(),
+            facetime_registered: true,
+            incoming_calls: Vec::new(),
+        });
+        let mut incoming = IncomingCalls::default();
+        incoming.update(
+            &status,
+            own,
+            CallSignal::Ring {
+                call: crate::IncomingCall {
+                    id,
+                    caller: caller.into(),
+                    mode: Some(crate::CallMode::Audio),
+                    received_ms: now,
+                    expires_ms: now + 45_000,
+                },
+                endpoint: CallEndpoint::new([1; 32], Some(7)),
+                media: Some(PeerMediaOffer {
+                    description: b"signed media description".to_vec(),
+                    prekey: None,
+                }),
+            },
+        );
+        let prekey = |sender: &str, token, id, key: &PeerPrekey| CallSignal::Prekey {
+            id,
+            sender: sender.into(),
+            endpoint: CallEndpoint::new([token; 32], None),
+            key: key.clone(),
+        };
+        incoming.update(&status, own, prekey(caller, 2, id, &stranger));
+        incoming.update(
+            &status,
+            own,
+            prekey("mailto:stranger@example.org", 1, id, &stranger),
+        );
+        incoming.update(
+            &status,
+            own,
+            prekey(caller, 1, uuid::Uuid::new_v4(), &stranger),
+        );
+        assert!(incoming.prepare_media(&reader.borrow(), id).is_err());
+        incoming.update(&status, own, prekey(caller, 1, id, &key));
+        incoming.update(&status, own, prekey(caller, 1, id, &stranger));
+        assert!(incoming.details[&id].prekey.as_ref().unwrap().same_as(&key));
+        let handshake = incoming.prepare_media(&reader.borrow(), id)?;
+        assert_eq!(handshake.call().id, id);
+        assert_eq!(handshake.peer_description(), b"signed media description");
+        incoming.update(
+            &status,
+            own,
+            CallSignal::End {
+                id,
+                sender: caller.into(),
+                received_ms: now,
+                endpoint: None,
+            },
+        );
+        assert!(incoming.prepare_media(&reader.borrow(), id).is_err());
+        Ok(())
     }
 
     #[test]

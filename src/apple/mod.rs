@@ -24,7 +24,8 @@ pub use registration::register_device;
 pub use ssh_setup::{SshPrompt, run_ssh_askpass};
 
 use anyhow::{Context, Result, ensure};
-pub(crate) use facetime::{CallEndpoint, CallSignal};
+pub(crate) use facetime::{CallEndpoint, CallSignal, PeerMediaOffer, PeerPrekey};
+pub use facetime::{CallMediaHandshake, CallMediaKey};
 pub(crate) use madrid::{Incoming, Madrid};
 use openssl::{
     hash::MessageDigest,

@@ -617,7 +617,10 @@ impl Madrid {
             matches!(notice.topic, facetime::SIGNALING | facetime::VIDEO)
                 && matches!(
                     *command,
-                    facetime::INVITATION_COMMAND | facetime::JOIN_COMMAND | facetime::LEAVE_COMMAND
+                    facetime::INVITATION_COMMAND
+                        | facetime::JOIN_COMMAND
+                        | facetime::LEAVE_COMMAND
+                        | facetime::PREKEY_COMMAND
                 )
                 && encryption == Some("pair")
         });

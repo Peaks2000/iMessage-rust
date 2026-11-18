@@ -1,3 +1,5 @@
+mod media;
+
 use plist::Value;
 use prost::Message as _;
 use serde::Deserialize;
@@ -5,12 +7,16 @@ use uuid::Uuid;
 
 use crate::{CallMode, IncomingCall, address, now_ms};
 
+pub use media::{CallMediaHandshake, CallMediaKey};
+pub(crate) use media::{PeerMediaOffer, PeerPrekey};
+
 pub(super) const SIGNALING: &str = "com.apple.private.alloy.facetime.multi";
 pub(super) const VIDEO: &str = "com.apple.private.alloy.facetime.video";
 pub(super) const VIDEO_SERVICE: &str = "com.apple.ess";
 pub(super) const INVITATION_COMMAND: u64 = 242;
 pub(super) const JOIN_COMMAND: u64 = 207;
 pub(super) const LEAVE_COMMAND: u64 = 208;
+pub(super) const PREKEY_COMMAND: u64 = 210;
 pub(super) const DECLINE: u64 = 9;
 const RING_TIMEOUT_MS: i64 = 45_000;
 
@@ -29,10 +35,14 @@ impl CallEndpoint {
     }
 
     pub(crate) fn matches(self, other: Self) -> bool {
-        self.push_token == other.push_token
+        self.same_device(other)
             && self
                 .participant
                 .is_none_or(|id| other.participant == Some(id))
+    }
+
+    pub(crate) fn same_device(self, other: Self) -> bool {
+        self.push_token == other.push_token
     }
 }
 
@@ -40,6 +50,13 @@ pub(crate) enum CallSignal {
     Ring {
         call: IncomingCall,
         endpoint: CallEndpoint,
+        media: Option<PeerMediaOffer>,
+    },
+    Prekey {
+        id: Uuid,
+        sender: String,
+        endpoint: CallEndpoint,
+        key: PeerPrekey,
     },
     End {
         id: Uuid,
@@ -76,10 +93,20 @@ struct ParticipantSignal {
     session: String,
     #[serde(rename = "fanout-groupID-key")]
     fanout_group: Option<String>,
-    participant_id_key: Value,
+    participant_id_key: Option<Value>,
     participant_data_key: Option<plist::Data>,
     client_context_data_key: Option<plist::Data>,
     is_initiator_key: Option<bool>,
+    #[serde(rename = "rtmpk")]
+    prekey: Option<plist::Data>,
+    #[serde(rename = "rtmpwm")]
+    wrap_mode: Option<u32>,
+}
+
+impl ParticipantSignal {
+    fn media_prekey(&self) -> Option<PeerPrekey> {
+        PeerPrekey::parse(self.wrap_mode?, self.prekey.as_ref()?.as_ref()).ok()
+    }
 }
 
 #[derive(prost::Message)]
@@ -152,7 +179,7 @@ pub(super) fn decode(
     if received_ms <= 0 || received_ms > now + 5_000 || now >= expires_ms {
         return None;
     }
-    let ring = |id, caller, mode, endpoint| CallSignal::Ring {
+    let ring = |id, caller, mode, endpoint, media| CallSignal::Ring {
         call: IncomingCall {
             id,
             caller,
@@ -161,6 +188,7 @@ pub(super) fn decode(
             expires_ms,
         },
         endpoint,
+        media,
     };
     if command == INVITATION_COMMAND {
         let offer = ConversationSignal::decode(payload).ok()?;
@@ -171,6 +199,7 @@ pub(super) fn decode(
                 sender,
                 offer.call_mode(),
                 CallEndpoint::new(push_token, None),
+                None,
             )),
             6 if sender == own => Some(CallSignal::End {
                 id,
@@ -197,22 +226,29 @@ pub(super) fn decode(
     {
         return None;
     }
-    let participant_id = participant
-        .participant_id_key
+    if sender == own {
+        return None;
+    }
+    if command == PREKEY_COMMAND {
+        return Some(CallSignal::Prekey {
+            id,
+            sender,
+            endpoint: CallEndpoint::new(push_token, None),
+            key: participant.media_prekey()?,
+        });
+    }
+    let field = participant.participant_id_key.as_ref()?;
+    let participant_id = field
         .as_unsigned_integer()
-        .or_else(|| {
-            participant
-                .participant_id_key
-                .as_signed_integer()
-                .map(|id| id as u64)
-        })?;
-    if participant_id == 0 || sender == own {
+        .or_else(|| field.as_signed_integer().map(|id| id as u64))?;
+    if participant_id == 0 {
         return None;
     }
     let endpoint = CallEndpoint::new(push_token, Some(participant_id));
     match command {
         JOIN_COMMAND => {
-            participant
+            let prekey = participant.media_prekey();
+            let description = participant
                 .participant_data_key
                 .filter(|data| !data.as_ref().is_empty())?;
             let context =
@@ -247,7 +283,16 @@ pub(super) fn decode(
                     }
                 })
             });
-            Some(ring(id, sender, mode, endpoint))
+            Some(ring(
+                id,
+                sender,
+                mode,
+                endpoint,
+                Some(PeerMediaOffer {
+                    description: description.into(),
+                    prekey,
+                }),
+            ))
         }
         LEAVE_COMMAND => Some(CallSignal::End {
             id,
@@ -381,7 +426,8 @@ mod tests {
         };
         assert!(
             matches!(parse(JOIN_COMMAND, &context, wire.clone(), peer, own)?,
-            Some(CallSignal::Ring { call, endpoint }) if call.id == id && call.mode == Some(CallMode::Video)
+            Some(CallSignal::Ring { call, endpoint, media: Some(media) }) if call.id == id && call.mode == Some(CallMode::Video)
+                && media.description == [1, 2, 3]
                 && endpoint == CallEndpoint::new([7; 32], Some(-11_i64 as u64)))
         );
         assert!(
@@ -425,6 +471,43 @@ mod tests {
             Value::from(Uuid::new_v4().to_string()),
         );
         assert!(parse(LEAVE_COMMAND, &context, wire, peer, own)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_a_separate_prekey_without_a_participant_id() -> anyhow::Result<()> {
+        let id = Uuid::new_v4();
+        let peer = "mailto:peer@example.org";
+        let own = "mailto:own@example.org";
+        let point = hex::decode(concat!(
+            "043ed113b7883b4c590638379db0c21cda16742ed0255048bf433391d374bc21d190",
+            "99209accc4c8a224c843afa4f4c68a090d04da5e9889dae2f8eefce82a3740"
+        ))?;
+        let mut payload = plist::Dictionary::from_iter([
+            ("s", Value::from(id.to_string())),
+            ("fanout-groupID-key", Value::from(id.to_string())),
+            ("rtmpk", Value::Data(point.clone())),
+            ("rtmpwm", Value::from(1)),
+        ]);
+        let parse = |payload: &plist::Dictionary| -> anyhow::Result<_> {
+            let mut bytes = Vec::new();
+            plist::to_writer_binary(&mut bytes, payload)?;
+            Ok(decode(
+                PREKEY_COMMAND,
+                &bytes,
+                peer.into(),
+                own,
+                [7; 32],
+                now_ms(),
+            ))
+        };
+        assert!(
+            matches!(parse(&payload)?, Some(CallSignal::Prekey { id: parsed, sender, endpoint, key })
+            if parsed == id && sender == peer && endpoint.same_device(CallEndpoint::new([7; 32], Some(2)))
+                && key.same_as(&PeerPrekey::parse(1, &point)?))
+        );
+        payload.insert("rtmpwm".into(), Value::from(9));
+        assert!(parse(&payload)?.is_none());
         Ok(())
     }
 }
