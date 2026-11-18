@@ -615,60 +615,82 @@ async fn work(
                 let events = events.clone();
                 let context = context.clone();
                 tokio::spawn(async move {
+                    let observed_video = video.as_ref().map(|video| {
+                        (
+                            video.frames.subscribe(),
+                            video.preview.subscribe(),
+                            video.status.subscribe(),
+                        )
+                    });
+                    let update = async {
+                        let Some((mut frames, mut preview, mut status)) = observed_video else {
+                            return std::future::pending().await;
+                        };
+                        loop {
+                            tokio::select! {
+                                Ok(()) = frames.changed() => (),
+                                Ok(()) = preview.changed() => (),
+                                Ok(()) = status.changed() => (),
+                                else => return std::future::pending::<Result<()>>().await,
+                            }
+                            context.request_repaint();
+                        }
+                    };
                     let call = async {
                         let Backend::Local(engine) = backend.as_ref() else {
                             anyhow::bail!("Use FaceTime with the Apple session on this computer");
                         };
+                        let mut video = video.map(|video| {
+                            VideoCallOptions {
+                                camera: None,
+                                camera_enabled: video.camera_enabled,
+                                frames: video.frames,
+                                preview: video.preview,
+                                status: video.status,
+                            }
+                            .prepare()
+                        });
                         let mode = if video.is_some() {
                             CallMode::Video
                         } else {
                             CallMode::Audio
                         };
-                        let accepted = match start {
-                            CallStart::Answer => engine.answer_desktop_call(id, mode).await?,
-                            CallStart::Dial(recipient) => {
-                                engine.dial_desktop_call(&recipient, mode).await?
+                        let negotiate = async {
+                            match start {
+                                CallStart::Answer => engine.answer_desktop_call(id, mode).await,
+                                CallStart::Dial(recipient) => {
+                                    engine.dial_desktop_call(&recipient, mode).await
+                                }
                             }
+                        };
+                        let accepted = if let Some(video) = &mut video {
+                            tokio::select! {
+                                result = negotiate => result?,
+                                () = video.preview() => unreachable!("Camera preview runs until negotiation ends"),
+                            }
+                        } else {
+                            negotiate.await?
                         };
                         let mode = accepted
                             .local_description
                             .mode
                             .context("Missing FaceTime media mode")?;
                         let ready = || emit(&events, &context, Event::CallConnected { id, mode });
-                        if let (CallMode::Video, Some(video)) = (mode, video) {
-                            let mut frames = video.frames.subscribe();
-                            let mut preview = video.preview.subscribe();
-                            let mut status = video.status.subscribe();
-                            let update = async {
-                                loop {
-                                    tokio::select! {
-                                        Ok(()) = frames.changed() => (),
-                                        Ok(()) = preview.changed() => (),
-                                        Ok(()) = status.changed() => (),
-                                        else => return std::future::pending::<Result<()>>().await,
-                                    }
-                                    context.request_repaint();
-                                }
-                            };
-                            let options = VideoCallOptions {
-                                camera: None,
-                                camera_enabled: video.camera_enabled,
-                                frames: video.frames,
-                                preview: video.preview,
-                                status: video.status,
-                            };
-                            tokio::select! {
-                                result = accepted.run_video(muted, options, ready) => result,
-                                result = update => result,
+                        match (mode, video) {
+                            (CallMode::Video, Some(video)) => {
+                                accepted.run_prepared_video(muted, video, ready).await
                             }
-                        } else {
-                            accepted.run_audio(muted, ready).await
+                            (_, video) => {
+                                drop(video);
+                                accepted.run_audio(muted, ready).await
+                            }
                         }
                     };
                     let result = tokio::select! {
                         biased;
                         _ = &mut hang_up => Ok(()),
                         result = call => result,
+                        result = update => result,
                     };
                     emit(&events, &context, Event::CallFinished { id, result });
                 });

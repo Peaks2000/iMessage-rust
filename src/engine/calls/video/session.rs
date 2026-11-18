@@ -19,7 +19,7 @@ use crate::apple::{CAMERA_HEIGHT, CAMERA_WIDTH, CallRtpDescription};
 
 use super::{
     HEVC_PAYLOAD_TYPE, HevcCamera, HevcDecoder, HevcFeatures, HevcPacketizer, HevcReceiver,
-    VideoFrame, linux::default_camera,
+    VideoFrame, annex_b_nals, is_keyframe, linux::default_camera,
 };
 
 const CAMERA_FRAME_TIMEOUT: Duration = Duration::from_secs(6);
@@ -45,14 +45,120 @@ struct Capture {
     deadline: TokioInstant,
 }
 
-pub(in crate::engine::calls) struct VideoSession {
-    camera_path: Option<PathBuf>,
-    camera_enabled: watch::Receiver<bool>,
-    camera: Option<Capture>,
+impl VideoCallOptions {
+    pub fn prepare(self) -> PreparedVideoCall {
+        PreparedVideoCall {
+            frames: self.frames,
+            capture: CameraCapture {
+                path: self.camera,
+                enabled: self.camera_enabled,
+                preview: self.preview,
+                status: self.status,
+                camera: None,
+                paused_at: None,
+            },
+        }
+    }
+}
+
+pub struct PreparedVideoCall {
+    frames: watch::Sender<Option<Arc<VideoFrame>>>,
+    capture: CameraCapture,
+}
+
+impl PreparedVideoCall {
+    /// Produce the local self-view while the authenticated media connection is being set up.
+    pub async fn preview(&mut self) {
+        loop {
+            self.capture.next_frame().await;
+        }
+    }
+}
+
+struct CameraCapture {
+    path: Option<PathBuf>,
+    enabled: watch::Receiver<bool>,
     preview: watch::Sender<Option<Arc<VideoFrame>>>,
     status: watch::Sender<VideoStatus>,
+    camera: Option<Capture>,
     paused_at: Option<Instant>,
+}
+
+impl CameraCapture {
+    fn stop(&mut self) {
+        if self.camera.take().is_some() {
+            self.paused_at = Some(Instant::now());
+        }
+    }
+
+    fn poll_switch(&mut self) -> (bool, bool) {
+        let open = self.enabled.has_changed().is_ok();
+        let (enabled, changed) = {
+            let state = self.enabled.borrow_and_update();
+            (open && *state, state.has_changed())
+        };
+        if !enabled || changed {
+            self.stop();
+        }
+        if changed {
+            self.status
+                .send_if_modified(|status| status.camera_error.take().is_some());
+        }
+        (enabled, open)
+    }
+
+    fn open_camera(&self) -> Result<HevcCamera> {
+        let device = self.path.clone().map_or_else(default_camera, Ok)?;
+        HevcCamera::start(&device, self.preview.clone())
+    }
+
+    fn failed(&mut self, error: anyhow::Error) {
+        self.stop();
+        self.status
+            .send_modify(|status| status.camera_error = Some(error.to_string()));
+    }
+
+    async fn next_frame(&mut self) -> Zeroizing<Vec<u8>> {
+        loop {
+            let (enabled, open) = self.poll_switch();
+            if enabled && self.camera.is_none() && self.status.borrow().camera_error.is_none() {
+                match self.open_camera() {
+                    Ok(encoder) => {
+                        self.camera = Some(Capture {
+                            encoder,
+                            deadline: TokioInstant::now() + CAMERA_FRAME_TIMEOUT,
+                        });
+                    }
+                    Err(error) => self.failed(error),
+                }
+            }
+            let frame = async {
+                let Some(camera) = &mut self.camera else {
+                    return pending().await;
+                };
+                let frame = timeout_at(camera.deadline, camera.encoder.next_frame())
+                    .await
+                    .context("The FaceTime camera stopped sending video")??
+                    .context("The FaceTime camera stopped")?;
+                camera.deadline = TokioInstant::now() + CAMERA_FRAME_TIMEOUT;
+                Ok(frame)
+            };
+            tokio::select! {
+                biased;
+                _ = wait_for_camera_change(&self.enabled, open) => (),
+                result = frame => match result {
+                    Ok(frame) => return frame,
+                    Err(error) => self.failed(error),
+                },
+            }
+        }
+    }
+}
+
+pub(in crate::engine::calls) struct VideoSession {
+    capture: CameraCapture,
     packetizer: HevcPacketizer,
+    needs_keyframe: bool,
     outgoing: IntoIter<Zeroizing<Vec<u8>>>,
     receiver: HevcReceiver,
     decode: mpsc::Sender<Zeroizing<Vec<u8>>>,
@@ -63,7 +169,7 @@ impl VideoSession {
     pub(in crate::engine::calls) fn start(
         local: &CallRtpDescription,
         peer: &CallRtpDescription,
-        options: VideoCallOptions,
+        options: PreparedVideoCall,
     ) -> Result<Self> {
         ensure!(
             local.payload_types.contains(&HEVC_PAYLOAD_TYPE)
@@ -83,18 +189,14 @@ impl VideoSession {
             Ok(player) => {
                 decoder.spawn(play_video(player, frames, FramePublisher(options.frames)));
             }
-            Err(error) => options.status.send_modify(|status| {
+            Err(error) => options.capture.status.send_modify(|status| {
                 status.playback_error = Some(error.to_string());
             }),
         }
         Ok(Self {
-            camera_path: options.camera,
-            camera_enabled: options.camera_enabled,
-            camera: None,
-            preview: options.preview,
-            status: options.status,
-            paused_at: None,
+            capture: options.capture,
             packetizer,
+            needs_keyframe: true,
             outgoing: Vec::new().into_iter(),
             receiver,
             decode,
@@ -103,85 +205,45 @@ impl VideoSession {
     }
 
     pub(in crate::engine::calls) fn camera_switch(&self) -> watch::Receiver<bool> {
-        self.camera_enabled.clone()
-    }
-
-    fn stop_capture(&mut self) {
-        if self.camera.take().is_some() {
-            self.paused_at = Some(Instant::now());
-        }
-        self.outgoing = Vec::new().into_iter();
-    }
-
-    fn open_camera(&self) -> Result<HevcCamera> {
-        let device = self.camera_path.clone().map_or_else(default_camera, Ok)?;
-        HevcCamera::start(&device, self.preview.clone())
-    }
-
-    fn camera_failed(&mut self, error: anyhow::Error) {
-        self.stop_capture();
-        self.status
-            .send_modify(|status| status.camera_error = Some(error.to_string()));
+        self.capture.enabled.clone()
     }
 
     pub(in crate::engine::calls) async fn next_packet(&mut self) -> Zeroizing<Vec<u8>> {
         loop {
-            let can_change = self.camera_enabled.has_changed().is_ok();
-            let (enabled, changed) = {
-                let state = self.camera_enabled.borrow_and_update();
-                (can_change && *state, state.has_changed())
-            };
-            if !enabled || changed {
-                self.stop_capture();
+            // Drop packets from a prior capture before reopening the device.
+            if !matches!(self.capture.enabled.has_changed(), Ok(false))
+                || !*self.capture.enabled.borrow()
+            {
+                self.outgoing = Vec::new().into_iter();
+                self.needs_keyframe = true;
             }
-            if changed {
-                self.status
-                    .send_if_modified(|status| status.camera_error.take().is_some());
+            if let Some(packet) = self.outgoing.next() {
+                return packet;
             }
-            if enabled && self.camera.is_none() && self.status.borrow().camera_error.is_none() {
-                match self.open_camera() {
-                    Ok(encoder) => {
-                        self.camera = Some(Capture {
-                            encoder,
-                            deadline: TokioInstant::now() + CAMERA_FRAME_TIMEOUT,
-                        });
-                        if let Some(paused) = self.paused_at.take() {
-                            self.packetizer.advance_clock(paused.elapsed());
-                        }
-                    }
-                    Err(error) => self.camera_failed(error),
-                }
-            }
-            let packet = async {
-                let Some(camera) = &mut self.camera else {
-                    return pending().await;
-                };
-                if let Some(packet) = self.outgoing.next() {
-                    return Ok(packet);
-                }
-                let frame = timeout_at(camera.deadline, camera.encoder.next_frame())
-                    .await
-                    .context("The FaceTime camera stopped sending video")??
-                    .context("The FaceTime camera stopped")?;
-                camera.deadline = TokioInstant::now() + CAMERA_FRAME_TIMEOUT;
-                self.outgoing = self.packetizer.packetize(&frame)?.into_iter();
-                self.outgoing
-                    .next()
-                    .context("The FaceTime camera produced an empty frame")
-            };
             tokio::select! {
                 biased;
-                _ = wait_for_camera_change(&self.camera_enabled, can_change) => (),
                 Some(completed) = self.decoder.join_next() => {
                     let error = match completed {
                         Ok(Err(error)) => error.to_string(),
                         _ => "The FaceTime video decoder stopped".to_owned(),
                     };
-                    self.status.send_modify(|status| status.playback_error = Some(error));
+                    self.capture.status.send_modify(|status| status.playback_error = Some(error));
                 }
-                result = packet => match result {
-                    Ok(packet) => return packet,
-                    Err(error) => self.camera_failed(error),
+                frame = self.capture.next_frame() => {
+                    if let Some(paused) = self.capture.paused_at.take() {
+                        self.packetizer.advance_clock(paused.elapsed());
+                        self.needs_keyframe = true;
+                    }
+                    if self.needs_keyframe && !annex_b_nals(&frame).any(is_keyframe) {
+                        continue;
+                    }
+                    match self.packetizer.packetize(&frame) {
+                        Ok(packets) => {
+                            self.outgoing = packets.into_iter();
+                            self.needs_keyframe = false;
+                        }
+                        Err(error) => self.capture.failed(error),
+                    }
                 },
             }
         }
@@ -256,12 +318,15 @@ mod tests {
         let mut decoder = JoinSet::new();
         decoder.spawn(pending::<Result<()>>());
         let mut session = VideoSession {
-            camera_path: Some(temporary.path().join("removed-camera")),
-            camera_enabled: enabled,
-            camera: None,
-            preview: watch::channel(None).0,
-            status,
-            paused_at: None,
+            capture: CameraCapture {
+                path: Some(temporary.path().join("removed-camera")),
+                enabled,
+                preview: watch::channel(None).0,
+                status,
+                camera: None,
+                paused_at: None,
+            },
+            needs_keyframe: true,
             packetizer: HevcPacketizer::new(
                 1,
                 CAMERA_WIDTH,
@@ -278,7 +343,7 @@ mod tests {
         assert!(futures_util::poll!(&mut next).is_pending());
         drop(next);
         assert!(session.outgoing.as_slice().is_empty());
-        assert!(session.camera.is_none());
+        assert!(session.capture.camera.is_none());
         assert!(report.borrow().camera_error.is_none());
 
         // A failed capture leaves the media loop alive and retries on a new request.

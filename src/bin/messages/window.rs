@@ -678,7 +678,7 @@ impl MessagesApp {
                         bar.min + vec2(16., 14.),
                         vec2(56., 20.),
                     )));
-                    if chrome::traffic_lights(&mut lights) {
+                    if chrome::traffic_lights(&mut lights, true) {
                         self.quit(ctx);
                     }
                 }
@@ -1641,13 +1641,7 @@ impl MessagesApp {
     fn call_panel(&mut self, ctx: &egui::Context) {
         if let Some(call) = &mut self.active_call {
             let name = self.contacts.name(&call.peer);
-            let mode = call.controls.mode();
-            let is_video = mode == CallMode::Video;
-            let (title, symbol, width) = if is_video {
-                ("FaceTime Video", Icon::Video, 440.)
-            } else {
-                ("FaceTime Audio", Icon::Phone, 245.)
-            };
+            let title = "FaceTime Audio";
             let (detail, end_label) = if call.controls.ending() {
                 ("Ending…".to_owned(), "End")
             } else if let Some(start) = call.connected_at {
@@ -1675,72 +1669,48 @@ impl MessagesApp {
                     "Cancel",
                 )
             };
-            let video_status = call.controls.video_status().unwrap_or_default();
-            if let Some(frame) = call.controls.next_video_frame() {
-                update_video_texture(
-                    ctx,
-                    &mut call.video_texture,
-                    "FaceTime remote video",
-                    frame.as_deref(),
-                );
-            }
-            let preview = call.controls.next_camera_preview();
-            if call.controls.ending() || call.controls.camera_enabled() != Some(true) {
-                call.camera_preview = None;
-            } else if let Some(frame) = preview {
-                update_video_texture(
-                    ctx,
-                    &mut call.camera_preview,
-                    "FaceTime camera preview",
-                    frame.as_deref(),
-                );
-            }
-            call_card(ctx, name, &detail, symbol, width, |ui| {
-                if is_video && call.connected_at.is_some() {
-                    let size = vec2(ui.available_width(), ui.available_width() * 9. / 16.);
-                    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-                    if let Some(texture) = &call.video_texture {
-                        egui::Image::new((texture.id(), size))
-                            .corner_radius(9)
-                            .paint_at(ui, rect);
-                    } else {
-                        ui.painter().rect_filled(rect, 9, Color32::from_gray(26));
-                        ui.painter().text(
-                            rect.center(),
-                            Align2::CENTER_CENTER,
-                            if video_status.playback_error.is_some() {
-                                "Video unavailable"
-                            } else {
-                                "Waiting for video…"
-                            },
-                            FontId::proportional(13.),
-                            Color32::WHITE,
-                        );
-                    }
-                    camera_preview(
-                        ui,
-                        call.id,
-                        call.camera_preview.as_ref(),
-                        &mut call.preview_position,
-                        rect,
+            if call.controls.mode() == CallMode::Video {
+                let video_status = call.controls.video_status().unwrap_or_default();
+                if let Some(frame) = call.controls.next_video_frame() {
+                    update_video_texture(
+                        ctx,
+                        &mut call.video_texture,
+                        "FaceTime remote video",
+                        frame.as_deref(),
                     );
-                    video_call_controls(
-                        ui,
-                        call.id,
-                        &mut call.controls,
-                        rect,
-                        video_status.camera_error.is_some(),
-                        call.connected_at
-                            .is_some_and(|start| start.elapsed() < Duration::from_secs(2)),
-                    );
-                    if let Some(error) = &video_status.camera_error {
-                        ui.colored_label(DANGER, error);
-                    }
-                    if let Some(error) = &video_status.playback_error {
-                        ui.colored_label(DANGER, error);
-                    }
-                    return;
                 }
+                let preview = call.controls.next_camera_preview();
+                if call.controls.ending() || call.controls.camera_enabled() != Some(true) {
+                    call.camera_preview = None;
+                } else if let Some(frame) = preview {
+                    update_video_texture(
+                        ctx,
+                        &mut call.camera_preview,
+                        "FaceTime camera preview",
+                        frame.as_deref(),
+                    );
+                }
+                let status = call
+                    .connected_at
+                    .filter(|_| !call.controls.ending())
+                    .map_or(Some(detail.as_str()), |_| {
+                        video_status
+                            .playback_error
+                            .as_ref()
+                            .map(|_| "Video unavailable")
+                    });
+                let name = name.to_owned();
+                video_call_window(
+                    ctx,
+                    call,
+                    &name,
+                    status,
+                    video_status.camera_error.as_deref(),
+                );
+                return;
+            }
+
+            call_card(ctx, name, &detail, Icon::Phone, 245., |ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let enabled = !call.controls.ending();
                     if ui
@@ -2325,21 +2295,198 @@ fn update_video_texture(
     }
 }
 
+fn video_call_window(
+    ctx: &egui::Context,
+    call: &mut DesktopCall,
+    name: &str,
+    status: Option<&str>,
+    camera_error: Option<&str>,
+) {
+    let id = egui::ViewportId::from_hash_of("facetime-video");
+    let builder = egui::ViewportBuilder::default()
+        .with_title(format!("{name} – FaceTime Video"))
+        .with_inner_size([800., 520.])
+        .with_min_inner_size([360., 255.])
+        .with_decorations(false)
+        .with_transparent(true);
+    ctx.show_viewport_immediate(id, builder, |ctx, class| {
+        if class == egui::ViewportClass::Embedded {
+            egui::Area::new(egui::Id::new("facetime-video-embedded"))
+                .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    let size = (ctx.content_rect().size() - vec2(32., 32.)).min(vec2(800., 520.));
+                    let (stage, _) = ui.allocate_exact_size(size, Sense::hover());
+                    video_call_stage(ui, call, name, status, camera_error, stage);
+                });
+            return;
+        }
+        if ctx.input(|input| input.viewport().close_requested())
+            || ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::W))
+        {
+            call.controls.hang_up();
+        }
+        egui::CentralPanel::default()
+            .frame(Frame::NONE)
+            .show(ctx, |ui| {
+                let (stage, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
+                video_call_stage(ui, call, name, status, camera_error, stage);
+            });
+        window_edge(ctx);
+    });
+}
+
+fn video_call_stage(
+    ui: &mut Ui,
+    call: &mut DesktopCall,
+    name: &str,
+    status: Option<&str>,
+    camera_error: Option<&str>,
+    stage: Rect,
+) {
+    let radius = chrome::window_radius(ui.ctx());
+    let connecting = call.connected_at.is_none();
+    let connected =
+        ui.ctx()
+            .animate_bool_with_time(ui.id().with((call.id, "connected")), !connecting, 0.20);
+    let main_video = if connecting {
+        call.camera_preview.as_ref()
+    } else {
+        call.video_texture.as_ref()
+    };
+    if let Some(texture) = main_video {
+        paint_call_video(ui, texture, stage, radius, connecting, 1.);
+    } else {
+        ui.painter()
+            .rect_filled(stage, radius, Color32::from_gray(30));
+    }
+
+    if let Some(status) = status.or_else(|| main_video.is_none().then_some("Waiting for video…"))
+    {
+        let center = stage.center();
+        if main_video.is_none() {
+            chrome::avatar(ui, center - vec2(0., 36.), 76., name, &call.peer);
+        } else {
+            ui.painter().rect_filled(
+                Rect::from_center_size(center + vec2(0., 12.), vec2(224., 64.)),
+                18,
+                Color32::from_black_alpha(150),
+            );
+        }
+        ui.painter().text(
+            center,
+            Align2::CENTER_TOP,
+            name,
+            FontId::proportional(19.),
+            Color32::WHITE,
+        );
+        ui.painter().text(
+            center + vec2(0., 28.),
+            Align2::CENTER_TOP,
+            status,
+            FontId::proportional(13.),
+            Color32::from_gray(222),
+        );
+    }
+
+    if !connecting {
+        camera_preview(
+            ui,
+            call.id,
+            call.camera_preview.as_ref(),
+            &mut call.preview_position,
+            stage,
+            connected,
+        );
+    }
+    video_call_controls(
+        ui,
+        call.id,
+        &mut call.controls,
+        stage,
+        camera_error.is_some(),
+        connecting
+            || call
+                .connected_at
+                .is_some_and(|start| start.elapsed() < Duration::from_secs(2)),
+    );
+    if let Some(error) = camera_error {
+        let anchor = stage.center_top() + vec2(0., 50.);
+        let galley = ui.painter().layout(
+            error.to_owned(),
+            FontId::proportional(12.),
+            Color32::WHITE,
+            stage.width() - 40.,
+        );
+        let rect = Align2::CENTER_TOP.anchor_size(anchor, galley.size());
+        ui.painter().rect_filled(
+            rect.expand2(vec2(9., 5.)),
+            9,
+            Color32::from_black_alpha(200),
+        );
+        ui.painter().galley(rect.min, galley, Color32::WHITE);
+    }
+    if ui.ctx().viewport_id() != egui::ViewportId::ROOT {
+        chrome::drag_region(
+            ui,
+            Rect::from_min_size(
+                stage.left_top() + vec2(75., 0.),
+                vec2(stage.width() - 75., 32.),
+            ),
+        );
+        ui.scope_builder(
+            UiBuilder::new().max_rect(Rect::from_min_size(
+                stage.left_top() + vec2(15., 10.),
+                vec2(56., 20.),
+            )),
+            |ui| {
+                chrome::traffic_lights(ui, false);
+            },
+        );
+    }
+}
+
+fn paint_call_video(
+    ui: &Ui,
+    texture: &egui::TextureHandle,
+    rect: Rect,
+    radius: u8,
+    mirror: bool,
+    opacity: f32,
+) {
+    let image_ratio = texture.aspect_ratio();
+    let window_ratio = rect.aspect_ratio();
+    let visible = vec2(
+        (window_ratio / image_ratio).min(1.),
+        (image_ratio / window_ratio).min(1.),
+    );
+    let mut uv = Rect::from_center_size(pos2(0.5, 0.5), visible);
+    if mirror {
+        std::mem::swap(&mut uv.min.x, &mut uv.max.x);
+    }
+    egui::Image::new((texture.id(), rect.size()))
+        .uv(uv)
+        .corner_radius(radius)
+        .tint(Color32::WHITE.gamma_multiply(opacity))
+        .paint_at(ui, rect);
+}
+
 fn camera_preview(
     ui: &Ui,
     call: Uuid,
     texture: Option<&egui::TextureHandle>,
     position: &mut egui::Vec2,
     stage: Rect,
+    connected: f32,
 ) {
     let id = ui.id().with(("camera preview", call));
     let alpha = ui.ctx().animate_bool_with_time(id, texture.is_some(), 0.16);
     let Some(texture) = texture else {
         return;
     };
-    let bounds = stage.shrink(10.);
-    let width = (stage.width() * 0.28).min(136.);
-    let size = vec2(width, width * 9. / 16.);
+    let bounds = stage.shrink(16.);
+    let width = (stage.width() * 0.22).clamp(96., 180.);
+    let size = vec2(width, width / texture.aspect_ratio());
     let travel = (bounds.size() - size).max(egui::Vec2::ZERO);
     let anchor =
         |position: egui::Vec2| bounds.min + vec2(position.x * travel.x, position.y * travel.y);
@@ -2353,25 +2500,25 @@ fn camera_preview(
     response
         .on_hover_and_drag_cursor(egui::CursorIcon::Grab)
         .on_hover_text("Your camera");
-    let rect = Rect::from_min_size(anchor(*position), size);
+    let destination = Rect::from_min_size(anchor(*position), size);
+    let rect = Rect::from_min_max(
+        stage.min.lerp(destination.min, connected),
+        stage.max.lerp(destination.max, connected),
+    );
     let painter = ui.painter().with_clip_rect(stage);
     painter.rect_filled(
         rect.expand(2.).translate(vec2(0., 2.)),
         9,
-        Color32::from_black_alpha((110. * alpha) as u8),
+        Color32::from_black_alpha((110. * alpha * connected) as u8),
     );
-    egui::Image::new((texture.id(), size))
-        .uv(Rect {
-            min: pos2(1., 0.),
-            max: pos2(0., 1.),
-        })
-        .corner_radius(7)
-        .tint(Color32::WHITE.gamma_multiply(alpha))
-        .paint_at(ui, rect);
+    paint_call_video(ui, texture, rect, 8, true, alpha);
     painter.rect_stroke(
         rect,
         7,
-        Stroke::new(1.0_f32, Color32::from_white_alpha((122. * alpha) as u8)),
+        Stroke::new(
+            1.0_f32,
+            Color32::from_white_alpha((122. * alpha * connected) as u8),
+        ),
         StrokeKind::Inside,
     );
 }
@@ -2385,22 +2532,16 @@ fn video_call_controls(
     just_connected: bool,
 ) {
     let id = ui.id().with(("video controls", call));
-    let buttons = [id.with("mute"), id.with("camera"), id.with("end")];
+    let buttons = [id.with("camera"), id.with("mute"), id.with("end")];
     let hovered = ui.rect_contains_pointer(stage);
     let focused = ui.memory(|memory| buttons.iter().any(|id| memory.has_focus(*id)));
     let alpha = ui
         .ctx()
         .animate_bool_with_time(id, just_connected || hovered || focused, 0.18);
-    let center = stage.center_bottom() - vec2(0., 31.);
-    let capsule = Rect::from_center_size(center, vec2(137., 45.));
+    let first = stage.left_bottom() + vec2(38., -55.);
     let muted = controls.muted();
     let camera_on = controls.camera_enabled() == Some(true) && !retry_camera;
     let actions = [
-        (
-            Icon::Microphone,
-            if muted { "Unmute" } else { "Mute" },
-            muted,
-        ),
         (
             Icon::Video,
             if retry_camera {
@@ -2410,22 +2551,28 @@ fn video_call_controls(
             } else {
                 "Camera On"
             },
+            "Camera",
             !camera_on,
         ),
-        (Icon::EndCall, "End", false),
+        (
+            Icon::Microphone,
+            if muted { "Unmute" } else { "Mute" },
+            if muted { "Unmute" } else { "Mute" },
+            muted,
+        ),
+        (Icon::EndCall, "End Call", "End", false),
     ];
-    let mut toolbar = ui.new_child(UiBuilder::new().max_rect(capsule));
+    let mut toolbar = ui.new_child(UiBuilder::new().max_rect(stage));
     toolbar.set_clip_rect(stage.intersect(ui.clip_rect()));
     let enabled = !controls.ending();
     if !enabled {
         toolbar.disable();
     }
-    toolbar
-        .painter()
-        .rect_filled(capsule, 23, Color32::from_black_alpha((212. * alpha) as u8));
-    for (index, ((icon, label, off), button)) in actions.into_iter().zip(buttons).enumerate() {
-        let center = center + vec2((index as f32 - 1.) * 40., 0.);
-        let rect = Rect::from_center_size(center, vec2(34., 34.));
+    for (index, ((icon, label, caption, off), button)) in
+        actions.into_iter().zip(buttons).enumerate()
+    {
+        let center = first + vec2(index as f32 * 55., 0.);
+        let rect = Rect::from_center_size(center, vec2(36., 36.));
         let response = toolbar.interact(rect, button, Sense::click());
         response
             .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
@@ -2439,19 +2586,33 @@ fn video_call_controls(
             0.12,
         );
         let fill = if index == 2 {
-            DANGER
-                .lerp_to_gamma(Color32::from_rgb(225, 49, 58), highlight)
+            Color32::from_rgb(255, 59, 48)
+                .lerp_to_gamma(Color32::from_rgb(226, 45, 35), highlight)
                 .gamma_multiply(alpha)
+        } else if index == 0 && camera_on {
+            Color32::WHITE.gamma_multiply(alpha)
         } else {
-            Color32::from_white_alpha(((35. + 46. * highlight) * alpha) as u8)
+            Color32::from_black_alpha(((153. + 38. * highlight) * alpha) as u8)
         };
-        toolbar.painter().circle_filled(center, 17., fill);
+        toolbar.painter().circle_filled(center, 18., fill);
+        toolbar.painter().text(
+            center + vec2(0., 24.),
+            Align2::CENTER_TOP,
+            caption,
+            FontId::proportional(11.),
+            Color32::WHITE.gamma_multiply(alpha),
+        );
         if response.has_focus() {
             toolbar
                 .painter()
                 .circle_stroke(center, 16., Stroke::new(1.5_f32, Color32::WHITE));
         }
-        let ink = Color32::WHITE.gamma_multiply(if enabled { alpha } else { alpha * 0.5 });
+        let ink = if index == 0 && camera_on {
+            Color32::BLACK
+        } else {
+            Color32::WHITE
+        }
+        .gamma_multiply(if enabled { alpha } else { alpha * 0.5 });
         chrome::icon(toolbar.painter(), center, icon, ink);
         if off {
             toolbar.painter().line_segment(
@@ -2462,9 +2623,9 @@ fn video_call_controls(
         response.on_hover_text(label);
         if activating {
             match index {
-                0 => controls.toggle_mute(),
-                1 if retry_camera => controls.retry_camera(),
-                1 => controls.toggle_camera(),
+                0 if retry_camera => controls.retry_camera(),
+                0 => controls.toggle_camera(),
+                1 => controls.toggle_mute(),
                 _ => controls.hang_up(),
             }
         }
@@ -3350,22 +3511,9 @@ mod tests {
         assert_eq!(accepted, id);
         assert_eq!(video.is_some(), answer == CallMode::Video);
         assert!(!*muted.borrow());
-        assert!(
-            report
-                .send(Event::CallConnected { id, mode: answer })
-                .is_ok()
-        );
-        assert!(report.send(Event::IncomingCalls(Vec::new())).is_ok());
         let mut video_control_center = None;
         if let Some(video) = video {
             assert!(*video.camera_enabled.borrow());
-            video.frames.send_replace(Some(std::sync::Arc::new(
-                linux_imessage::engine::video::VideoFrame {
-                    width: 2,
-                    height: 2,
-                    rgba: Zeroizing::new([20, 120, 220, 255].repeat(4)),
-                },
-            )));
             video
                 .preview
                 .send_replace(Some(std::sync::Arc::new(VideoFrame {
@@ -3374,16 +3522,6 @@ mod tests {
                     rgba: Zeroizing::new([220, 120, 20, 255].repeat(8)),
                 })));
             let output = frame(Vec::new());
-            let remote = output
-                .textures_delta
-                .set
-                .iter()
-                .find_map(|(id, texture)| {
-                    let egui::ImageData::Color(image) = &texture.image;
-                    (image.size == [2, 2] && image.pixels[0] == Color32::from_rgb(20, 120, 220))
-                        .then_some(*id)
-                })
-                .expect("Missing remote video");
             let preview = output
                 .textures_delta
                 .set
@@ -3410,11 +3548,36 @@ mod tests {
                     })
                     .expect("Missing camera tile")
             };
-            for _ in 0..12 {
+            assert!(tile_rect(frame(Vec::new()), preview, true).width() > 700.);
+            assert!(
+                report
+                    .send(Event::CallConnected { id, mode: answer })
+                    .is_ok()
+            );
+            assert!(report.send(Event::IncomingCalls(Vec::new())).is_ok());
+            video.frames.send_replace(Some(std::sync::Arc::new(
+                linux_imessage::engine::video::VideoFrame {
+                    width: 2,
+                    height: 2,
+                    rgba: Zeroizing::new([20, 120, 220, 255].repeat(4)),
+                },
+            )));
+            let output = frame(Vec::new());
+            let remote = output
+                .textures_delta
+                .set
+                .iter()
+                .find_map(|(id, texture)| {
+                    let egui::ImageData::Color(image) = &texture.image;
+                    (image.size == [2, 2] && image.pixels[0] == Color32::from_rgb(20, 120, 220))
+                        .then_some(*id)
+                })
+                .expect("Missing remote video");
+            for _ in 0..18 {
                 frame(Vec::new());
             }
             let stage = tile_rect(frame(Vec::new()), remote, false);
-            let center = stage.center_bottom() - vec2(0., 31.);
+            let center = stage.left_bottom() + vec2(38., -55.);
             video_control_center = Some(center);
             let original = tile_rect(frame(Vec::new()), preview, true).center();
             frame(vec![egui::Event::PointerMoved(original)]);
@@ -3454,7 +3617,7 @@ mod tests {
             assert!(*camera.borrow());
         }
         if let Some(center) = video_control_center {
-            click_at(&mut frame, center - vec2(40., 0.));
+            click_at(&mut frame, center + vec2(55., 0.));
             assert!(*muted.borrow());
             frame(vec![
                 egui::Event::PointerGone,
@@ -3467,8 +3630,15 @@ mod tests {
                 },
             ]);
             assert!(!*muted.borrow());
-            click_at(&mut frame, center + vec2(40., 0.));
+            click_at(&mut frame, center + vec2(110., 0.));
         } else {
+            assert!(
+                report
+                    .send(Event::CallConnected { id, mode: answer })
+                    .is_ok()
+            );
+            assert!(report.send(Event::IncomingCalls(Vec::new())).is_ok());
+
             click(&mut frame, "Mute");
             assert!(*muted.borrow());
             click(&mut frame, "End");

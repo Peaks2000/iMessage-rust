@@ -224,25 +224,8 @@ pub(super) fn icon(painter: &egui::Painter, at: Pos2, which: Icon, color: Color3
             line(p(-2.7, 7.), p(2.7, 7.));
         }
         Icon::EndCall => {
-            painter.add(Shape::closed_line(
-                vec![
-                    p(-8.2, 1.8),
-                    p(-7.7, -0.7),
-                    p(-5.8, -2.2),
-                    p(-2.8, -3.3),
-                    p(2.8, -3.3),
-                    p(5.8, -2.2),
-                    p(7.7, -0.7),
-                    p(8.2, 1.8),
-                    p(6.9, 2.9),
-                    p(3.5, 2.9),
-                    p(3.1, 0.9),
-                    p(-3.1, 0.9),
-                    p(-3.5, 2.9),
-                    p(-6.9, 2.9),
-                ],
-                edge,
-            ));
+            line(p(-5., -5.), p(5., 5.));
+            line(p(-5., 5.), p(5., -5.));
         }
         Icon::Info => {
             painter.circle_stroke(at, 6.5, edge);
@@ -342,7 +325,7 @@ pub(super) fn icon_button(
     response.on_hover_text(label)
 }
 
-pub(super) fn traffic_lights(ui: &mut Ui) -> bool {
+pub(super) fn traffic_lights(ui: &mut Ui, show_quit: bool) -> bool {
     let size = vec2(56., 20.);
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     let controls = [
@@ -424,7 +407,7 @@ pub(super) fn traffic_lights(ui: &mut Ui) -> bool {
             };
             ui.ctx().send_viewport_cmd(command);
         }
-        if index == 0 {
+        if show_quit && index == 0 {
             button.context_menu(|ui| {
                 quit = ui
                     .add(egui::Button::new("Quit iMessage").shortcut_text("Ctrl+Q"))

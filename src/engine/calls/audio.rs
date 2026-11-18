@@ -23,7 +23,7 @@ use crate::{
 use super::{
     AnsweredCall,
     aac::{self, Decoder, Encoder, FRAME_SAMPLES, SAMPLE_RATE},
-    video::{VideoCallOptions, VideoSession},
+    video::{PreparedVideoCall, VideoCallOptions, VideoSession},
 };
 
 const PCM_BYTES: usize = FRAME_SAMPLES * size_of::<i16>();
@@ -50,13 +50,24 @@ impl AnsweredCall {
         video: VideoCallOptions,
         media_ready: impl FnOnce(),
     ) -> Result<()> {
+        self.run_prepared_video(muted, video.prepare(), media_ready)
+            .await
+    }
+
+    /// Continue an existing self-view when the authenticated video connection is ready.
+    pub async fn run_prepared_video(
+        self,
+        muted: watch::Receiver<bool>,
+        video: PreparedVideoCall,
+        media_ready: impl FnOnce(),
+    ) -> Result<()> {
         self.run_media(muted, Some(video), media_ready).await
     }
 
     async fn run_media(
         mut self,
         muted: watch::Receiver<bool>,
-        video: Option<VideoCallOptions>,
+        video: Option<PreparedVideoCall>,
         media_ready: impl FnOnce(),
     ) -> Result<()> {
         let mode = if video.is_some() {

@@ -5,7 +5,7 @@ mod session;
 
 pub use linux::{DecodedFrames, HevcCamera, HevcDecoder, VIDEO_HEIGHT, VIDEO_WIDTH, VideoFrame};
 pub(super) use session::VideoSession;
-pub use session::{VideoCallOptions, VideoStatus};
+pub use session::{PreparedVideoCall, VideoCallOptions, VideoStatus};
 
 use std::collections::BTreeMap;
 
