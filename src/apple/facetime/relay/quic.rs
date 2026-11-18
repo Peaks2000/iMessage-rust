@@ -216,6 +216,11 @@ pub struct CallRelayStream {
     write_pending: bool,
 }
 
+pub(super) enum RelayWireDatagram {
+    Pod(RelayDatagramChannel, Vec<u8>),
+    Turn(Vec<u8>),
+}
+
 impl CallRelayAllocation {
     /// Connect to the allocated relay using the per-call external PSK and HTTP/3 ALPN.
     pub async fn connect(&self) -> Result<CallRelayConnection> {
@@ -323,6 +328,14 @@ impl CallRelayConnection {
         Ok(())
     }
 
+    pub(super) fn route_turn(&mut self, channel: u16) -> Result<()> {
+        self.bridge
+            .as_mut()
+            .context("Missing FaceTime datagram bridge")?
+            .route_turn(channel);
+        Ok(())
+    }
+
     pub(super) async fn send_datagram(&mut self, packet: &[u8]) -> Result<()> {
         self.flush()?;
         ensure!(
@@ -340,7 +353,10 @@ impl CallRelayConnection {
         Ok(())
     }
 
-    pub(super) async fn receive_datagram(&mut self) -> Result<(RelayDatagramChannel, Vec<u8>)> {
+    pub(super) async fn receive_datagram(
+        &mut self,
+        include_turn: bool,
+    ) -> Result<RelayWireDatagram> {
         loop {
             self.flush()?;
             ensure!(
@@ -351,7 +367,7 @@ impl CallRelayConnection {
                 .bridge
                 .as_mut()
                 .context("Missing FaceTime datagram bridge")?
-                .pop()
+                .pop(include_turn)
             {
                 return Ok(packet);
             }

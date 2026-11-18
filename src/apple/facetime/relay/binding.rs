@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result, ensure};
 use openssl::rand::rand_bytes;
 use prost::Message;
@@ -11,7 +13,9 @@ use crate::apple::facetime::{
 use super::{
     CallRelayConnection,
     http3::RelayHttp3,
+    one_to_one::OneToOnePath,
     pod::{Pod, RelayDatagramChannel},
+    quic::RelayWireDatagram,
 };
 
 const SERVICE_ID: u32 = 4096;
@@ -38,6 +42,7 @@ pub struct CallRelayBinding {
     control: RelayHttp3,
     media: Pod,
     signaling: Pod,
+    one_to_one: Option<OneToOnePath>,
     peer_descriptions: Vec<MaterialInfo>,
     pub channel_id: u16,
     pub link_id: u32,
@@ -102,9 +107,98 @@ impl CallRelayBinding {
     /// Receive a datagram authenticated by the relay. The call layer authenticates the peer.
     pub async fn receive_datagram(&mut self) -> Result<(RelayDatagramChannel, Zeroizing<Vec<u8>>)> {
         loop {
-            let (channel, packet) = self.control.transport.receive_datagram().await?;
+            let RelayWireDatagram::Pod(channel, packet) =
+                self.control.transport.receive_datagram(false).await?
+            else {
+                continue;
+            };
             if let Some(data) = self.pod(channel).open(packet)? {
                 return Ok((channel, data));
+            }
+        }
+    }
+
+    pub(crate) async fn negotiate_media_path(&mut self) -> Result<()> {
+        if self.one_to_one.as_ref().is_some_and(OneToOnePath::ready) {
+            return Ok(());
+        }
+        let transport = &mut self.control.transport;
+        let ipv6 = transport.peer_addr()?.is_ipv6();
+        let path = OneToOnePath::new(
+            transport.call,
+            transport.relay_keys(),
+            self.channel_id,
+            self.link_id,
+        )?;
+        transport.route_turn(path.channel())?;
+        let announcement = path.announce(ipv6)?;
+        self.one_to_one = Some(path);
+
+        let mut retries = tokio::time::interval(Duration::from_millis(500));
+        retries.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tokio::time::timeout(Duration::from_secs(12), async {
+            while self.one_to_one.as_ref().is_some_and(|path| !path.ready()) {
+                tokio::select! {
+                    _ = retries.tick() => self.send_datagram(RelayDatagramChannel::Signaling, &announcement).await?,
+                    received = self.receive_datagram() => {
+                        let (channel, payload) = received?;
+                        if channel == RelayDatagramChannel::Signaling {
+                            self.accept_route_message(&payload).await?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }).await.context("The FaceTime caller did not confirm a media route")?
+    }
+
+    async fn accept_route_message(&mut self, payload: &[u8]) -> Result<()> {
+        let path = self
+            .one_to_one
+            .as_mut()
+            .context("Missing FaceTime media route")?;
+        if let Some(reply) = path.accept_control(payload)? {
+            self.send_datagram(RelayDatagramChannel::Signaling, &reply)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn send_routed_rtp(&mut self, protected_rtp: &[u8]) -> Result<()> {
+        let path = self
+            .one_to_one
+            .as_ref()
+            .context("Missing FaceTime media route")?;
+        let packet = path.wrap_media(protected_rtp)?;
+        self.control.transport.send_datagram(&packet).await
+    }
+
+    pub(crate) async fn receive_routed_rtp(&mut self) -> Result<Zeroizing<Vec<u8>>> {
+        ensure!(
+            self.one_to_one.as_ref().is_some_and(OneToOnePath::ready),
+            "Missing FaceTime media route"
+        );
+        loop {
+            let received = self.control.transport.receive_datagram(true).await?;
+            let packet = match received {
+                RelayWireDatagram::Turn(packet) => Zeroizing::new(packet),
+                RelayWireDatagram::Pod(channel, packet) => {
+                    let Some(payload) = self.pod(channel).open(packet)? else {
+                        continue;
+                    };
+                    if channel == RelayDatagramChannel::Signaling {
+                        self.accept_route_message(&payload).await?;
+                        continue;
+                    }
+                    payload
+                }
+            };
+            if let Some(media) = self
+                .one_to_one
+                .as_ref()
+                .and_then(|path| path.open_media(&packet))
+            {
+                return Ok(Zeroizing::new(media.to_vec()));
             }
         }
     }
@@ -218,6 +312,7 @@ impl CallRelayConnection {
             control,
             media,
             signaling,
+            one_to_one: None,
             peer_descriptions,
             channel_id,
             link_id,

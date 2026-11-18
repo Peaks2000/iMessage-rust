@@ -11,8 +11,11 @@ use openssl::{error::ErrorStack, ssl::SslRef};
 use openssl_sys as ffi;
 use tokio::io::{Interest, unix::AsyncFd};
 
-use super::{BioAddress, QuicApi};
-use crate::apple::facetime::relay::pod::{RelayDatagramChannel, destination_id};
+use super::{BioAddress, QuicApi, RelayWireDatagram};
+use crate::apple::facetime::relay::{
+    one_to_one::turn_payload,
+    pod::{RelayDatagramChannel, destination_id},
+};
 
 const BIO_CTRL_PENDING: i32 = 10;
 const BIO_CTRL_DGRAM_SET_CAPS: i32 = 87;
@@ -30,6 +33,8 @@ pub(super) struct DatagramBridge {
     buffer: Box<[u8]>,
     sending: Vec<u8>,
     routes: Option<[[u8; 4]; 2]>,
+    turn_channel: Option<u16>,
+    turn: VecDeque<Vec<u8>>,
     media: VecDeque<Vec<u8>>,
     signaling: VecDeque<Vec<u8>>,
 }
@@ -60,6 +65,8 @@ impl DatagramBridge {
             buffer: vec![0; MAX_UDP].into_boxed_slice(),
             sending: Vec::new(),
             routes: None,
+            turn_channel: None,
+            turn: VecDeque::new(),
             media: VecDeque::new(),
             signaling: VecDeque::new(),
         };
@@ -123,13 +130,23 @@ impl DatagramBridge {
         self.routes = Some([media, signaling]);
     }
 
-    pub(super) fn pop(&mut self) -> Option<(RelayDatagramChannel, Vec<u8>)> {
+    pub(super) fn route_turn(&mut self, channel: u16) {
+        self.turn_channel = Some(channel);
+    }
+
+    pub(super) fn pop(&mut self, include_turn: bool) -> Option<RelayWireDatagram> {
         if let Some(bytes) = self.signaling.pop_front() {
-            return Some((RelayDatagramChannel::Signaling, bytes));
+            return Some(RelayWireDatagram::Pod(
+                RelayDatagramChannel::Signaling,
+                bytes,
+            ));
+        }
+        if include_turn && let Some(bytes) = self.turn.pop_front() {
+            return Some(RelayWireDatagram::Turn(bytes));
         }
         self.media
             .pop_front()
-            .map(|bytes| (RelayDatagramChannel::Media, bytes))
+            .map(|bytes| RelayWireDatagram::Pod(RelayDatagramChannel::Media, bytes))
     }
 
     pub(super) fn receive(&mut self, socket: &AsyncFd<UdpSocket>, ssl: &SslRef) -> Result<()> {
@@ -153,6 +170,15 @@ impl DatagramBridge {
                     }
                     continue;
                 }
+            }
+            if let Some(frame) = self
+                .turn_channel
+                .and_then(|channel| turn_payload(packet, channel))
+            {
+                if self.turn.len() < POD_QUEUE {
+                    self.turn.push_back(frame.to_vec());
+                }
+                continue;
             }
             // SAFETY: OpenSSL makes its own copy before returning. The source is
             // the connected UDP peer, whose address this bridge owns.

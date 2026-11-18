@@ -76,6 +76,30 @@ impl AnsweredCall {
         self.rtp.open(key, packet)
     }
 
+    /// Protect and send an RTP packet through the negotiated one-to-one relay.
+    pub async fn send_rtp(&mut self, packet: &[u8]) -> Result<()> {
+        let protected = self.protect_rtp(packet)?;
+        tokio::select! {
+            biased;
+            _ = self.lifetime.ended.changed() => anyhow::bail!("This FaceTime call has ended"),
+            result = self.relay.send_routed_rtp(&protected) => result,
+        }
+    }
+
+    /// Receive the caller's authenticated RTP, skipping invalid and replayed packets.
+    pub async fn receive_rtp(&mut self) -> Result<Zeroizing<Vec<u8>>> {
+        loop {
+            let protected = tokio::select! {
+                biased;
+                _ = self.lifetime.ended.changed() => anyhow::bail!("This FaceTime call has ended"),
+                result = self.relay.receive_routed_rtp() => result?,
+            };
+            if let Some(clear) = self.open_rtp(&protected)? {
+                return Ok(clear);
+            }
+        }
+    }
+
     /// End the local call and release the relay channels.
     pub async fn hang_up(self) -> Result<()> {
         let Self {
@@ -177,10 +201,15 @@ impl Engine {
         let mut lifetime = joined
             .await
             .context("The Apple engine stopped before joining FaceTime")??;
+        // Announce our route while the IDS engine receives the peer's keys.
+        let media_setup = async {
+            relay.negotiate_media_path().await?;
+            wait_for_media(&handshake, &mut relay, &mut peer_keys).await
+        };
         let remote_description = tokio::select! {
             biased;
             _ = lifetime.ended.changed() => anyhow::bail!("This FaceTime call has ended"),
-            result = timeout(MEDIA_SETUP_TIMEOUT, wait_for_media(&handshake, &mut relay, &mut peer_keys)) =>
+            result = timeout(MEDIA_SETUP_TIMEOUT, media_setup) =>
                 result.context("The caller did not finish FaceTime media setup")??,
         };
         let rtp = CallRtpProtection::new(

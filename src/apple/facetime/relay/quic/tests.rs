@@ -1,6 +1,10 @@
 use super::super::{CallRelayProfile, pod::Pod};
 use super::*;
 use crate::apple::facetime::description::tests as description;
+use crate::apple::facetime::relay::one_to_one::{
+    tests::{forwarded_control, forwarded_media},
+    turn_payload,
+};
 use compcol::qpack::QpackDecoder;
 use openssl::{
     memcmp,
@@ -311,7 +315,9 @@ async fn exchanges_media_and_signaling_on_the_bound_http3_socket() -> Result<()>
     let local_description = description::local_offer()?;
 
     let (local_address, received_address) = tokio::sync::oneshot::channel();
-    let (packets_received, ready_to_unbind) = tokio::sync::oneshot::channel();
+    let (packets_received, pods_verified) = tokio::sync::oneshot::channel();
+    let (routed_received, ready_to_unbind) = tokio::sync::oneshot::channel();
+    let srtp = hex::decode("80681388010203001234567854e21a48c03a70957c92d1001036471633")?;
     let server = async {
         let _listener = accept_relay(&mut relay, accept_connection).await?;
         let mut control = relay
@@ -441,6 +447,64 @@ async fn exchanges_media_and_signaling_on_the_bound_http3_socket() -> Result<()>
         }
         packets_received
             .send(())
+            .map_err(|_| anyhow::anyhow!("Missing relay media task"))?;
+        loop {
+            let (size, source) = relay
+                .socket
+                .async_io(Interest::READABLE, |socket| socket.recv_from(&mut buffer))
+                .await?;
+            assert_eq!(source, peer);
+            if super::super::pod::destination_id(&buffer[..size]) == Some(SERVER_IDS) {
+                let packet = ids_pod
+                    .open(buffer[..size].to_vec())?
+                    .context("Invalid media path control")?;
+                assert_eq!(packet[4..6], [0, 6], "expected link interface announcement");
+                break;
+            }
+        }
+        let peer_interface = forwarded_control(test_call(), &relay.keys, false)?;
+        let announcement_ack = forwarded_control(test_call(), &relay.keys, true)?;
+        for frame in [peer_interface, announcement_ack] {
+            let packet = ids_pod.seal(&frame)?;
+            relay
+                .socket
+                .async_io(Interest::WRITABLE, |socket| socket.send_to(&packet, peer))
+                .await?;
+        }
+        let caller_media = forwarded_media(test_call(), &relay.keys, &srtp)?;
+        let mut wrong_sender = caller_media.clone();
+        wrong_sender[6] ^= 1;
+        // Use another ciphertext for a wrong participant so passing it as media would fail the test.
+        *wrong_sender.last_mut().unwrap() ^= 1;
+        for frame in [wrong_sender, caller_media] {
+            relay
+                .socket
+                .async_io(Interest::WRITABLE, |socket| socket.send_to(&frame, peer))
+                .await?;
+        }
+        let mut got_route_ack = false;
+        let mut got_routed_media = false;
+        while !got_route_ack || !got_routed_media {
+            let (size, source) = relay
+                .socket
+                .async_io(Interest::READABLE, |socket| socket.recv_from(&mut buffer))
+                .await?;
+            assert_eq!(source, peer);
+            let packet = &buffer[..size];
+            if let Some(frame) = turn_payload(packet, 0x4008) {
+                assert_eq!(frame[..4], [0x20, 0x40, 0x12, 0x34]);
+                assert_eq!(frame[4..], srtp);
+                got_routed_media = true;
+            } else if super::super::pod::destination_id(packet) == Some(SERVER_IDS) {
+                let control = ids_pod
+                    .open(packet.to_vec())?
+                    .context("Invalid interface acknowledgment")?;
+                assert_eq!(control[4..6], [0x80, 6]);
+                got_route_ack = true;
+            }
+        }
+        routed_received
+            .send(())
             .map_err(|_| anyhow::anyhow!("Missing relay release task"))?;
         let mut unbind = relay.accept_stream().await?;
         let headers = read_fixture_frame(&mut relay, &mut unbind, 1).await?;
@@ -505,6 +569,13 @@ async fn exchanges_media_and_signaling_on_the_bound_http3_socket() -> Result<()>
         binding
             .send_datagram(RelayDatagramChannel::Signaling, b"client signaling")
             .await?;
+        pods_verified.await?;
+        require_send(binding.negotiate_media_path()).await?;
+        assert_eq!(
+            require_send(binding.receive_routed_rtp()).await?.as_slice(),
+            srtp
+        );
+        require_send(binding.send_routed_rtp(&srtp)).await?;
         ready_to_unbind.await?;
         require_send(binding.unbind()).await?;
         Ok::<_, anyhow::Error>(())
