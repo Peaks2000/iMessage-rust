@@ -181,12 +181,14 @@ pub struct Connection {
 pub struct VideoAnswer {
     pub camera_enabled: watch::Receiver<bool>,
     pub frames: watch::Sender<Option<Arc<VideoFrame>>>,
+    pub preview: watch::Sender<Option<Arc<VideoFrame>>>,
     pub status: watch::Sender<VideoStatus>,
 }
 
 struct VideoControls {
     camera_enabled: watch::Sender<bool>,
     frames: watch::Receiver<Option<Arc<VideoFrame>>>,
+    preview: watch::Receiver<Option<Arc<VideoFrame>>>,
     status: watch::Receiver<VideoStatus>,
 }
 
@@ -253,6 +255,12 @@ impl CallControls {
     pub fn next_video_frame(&mut self) -> Option<Option<Arc<VideoFrame>>> {
         let video = self.video.as_mut()?;
         let frame = video.frames.borrow_and_update();
+        frame.has_changed().then(|| frame.clone())
+    }
+
+    pub fn next_camera_preview(&mut self) -> Option<Option<Arc<VideoFrame>>> {
+        let video = self.video.as_mut()?;
+        let frame = video.preview.borrow_and_update();
         frame.has_changed().then(|| frame.clone())
     }
 
@@ -345,16 +353,19 @@ impl Connection {
         let (video, controls) = if mode == CallMode::Video {
             let (camera, camera_enabled) = watch::channel(true);
             let (publish, frames) = watch::channel(None);
+            let (publish_preview, preview) = watch::channel(None);
             let (status, video_status) = watch::channel(VideoStatus::default());
             (
                 Some(VideoAnswer {
                     camera_enabled,
                     frames: publish,
+                    preview: publish_preview,
                     status,
                 }),
                 Some(VideoControls {
                     camera_enabled: camera,
                     frames,
+                    preview,
                     status: video_status,
                 }),
             )
@@ -626,11 +637,13 @@ async fn work(
                         let ready = || emit(&events, &context, Event::CallConnected { id, mode });
                         if let (CallMode::Video, Some(video)) = (mode, video) {
                             let mut frames = video.frames.subscribe();
+                            let mut preview = video.preview.subscribe();
                             let mut status = video.status.subscribe();
                             let update = async {
                                 loop {
                                     tokio::select! {
                                         Ok(()) = frames.changed() => (),
+                                        Ok(()) = preview.changed() => (),
                                         Ok(()) = status.changed() => (),
                                         else => return std::future::pending::<Result<()>>().await,
                                     }
@@ -641,6 +654,7 @@ async fn work(
                                 camera: None,
                                 camera_enabled: video.camera_enabled,
                                 frames: video.frames,
+                                preview: video.preview,
                                 status: video.status,
                             };
                             tokio::select! {

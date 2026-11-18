@@ -1,17 +1,23 @@
 use std::{
     fs::OpenOptions,
     os::{
-        fd::AsRawFd,
-        unix::fs::{FileTypeExt, OpenOptionsExt},
+        fd::{AsRawFd, OwnedFd},
+        unix::{
+            fs::{FileTypeExt, OpenOptionsExt},
+            net::UnixStream as StdUnixStream,
+        },
     },
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, ensure};
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
+    net::UnixStream,
     process::{Child, ChildStdin, ChildStdout, Command},
+    sync::watch,
 };
 use zeroize::Zeroizing;
 
@@ -20,7 +26,8 @@ use crate::apple::{CAMERA_HEIGHT, CAMERA_WIDTH};
 
 pub const VIDEO_WIDTH: u16 = 640;
 pub const VIDEO_HEIGHT: u16 = 360;
-const RGBA_BYTES: usize = VIDEO_WIDTH as usize * VIDEO_HEIGHT as usize * 4;
+const PREVIEW_WIDTH: u16 = 320;
+const PREVIEW_HEIGHT: u16 = 180;
 
 pub(super) fn default_camera() -> Result<PathBuf> {
     let mut devices = std::fs::read_dir("/dev")
@@ -91,10 +98,22 @@ fn is_capture_device(path: &Path) -> bool {
 pub struct HevcCamera {
     process: Child,
     stream: AccessUnits<ChildStdout>,
+    preview: Option<CameraPreview>,
+}
+
+struct CameraPreview {
+    stream: DecodedFrames<UnixStream>,
+    frames: watch::Sender<Option<Arc<VideoFrame>>>,
+}
+
+impl Drop for CameraPreview {
+    fn drop(&mut self) {
+        self.frames.send_replace(None);
+    }
 }
 
 impl HevcCamera {
-    pub fn start(device: &Path) -> Result<Self> {
+    pub fn start(device: &Path, preview: watch::Sender<Option<Arc<VideoFrame>>>) -> Result<Self> {
         ensure!(
             device
                 .metadata()
@@ -105,22 +124,33 @@ impl HevcCamera {
         );
         let mut source = ffmpeg();
         source.args(["-f", "v4l2", "-i"]).arg(device);
-        Self::from_source(source)
+        Self::from_source(source, preview)
     }
 
-    fn from_source(mut source: Command) -> Result<Self> {
+    fn from_source(
+        mut source: Command,
+        frames: watch::Sender<Option<Arc<VideoFrame>>>,
+    ) -> Result<Self> {
+        // FFmpeg uses fd 0 as a second, private output socket. -nostdin keeps its
+        // command reader disabled, leaving stdout for HEVC and stderr for diagnostics.
+        let (preview, output) =
+            StdUnixStream::pair().context("Opening the FaceTime camera preview socket")?;
+        preview.set_nonblocking(true)?;
+        let preview = UnixStream::from_std(preview)?;
         source
-            .args(["-map", "0:v:0", "-an", "-sn", "-dn", "-filter_threads", "1", "-vf"])
-            .arg(format!("fps={FRAME_RATE},{}", scale(CAMERA_WIDTH, CAMERA_HEIGHT)))
+            .args(["-filter_complex_threads", "1", "-filter_complex"])
+            .arg(format!("[0:v:0]fps={FRAME_RATE},split=2[video][preview];[video]{}[encoded];[preview]{}[local]", scale(CAMERA_WIDTH, CAMERA_HEIGHT), scale(PREVIEW_WIDTH, PREVIEW_HEIGHT)))
             .args([
+                "-map", "[encoded]",
                 "-pix_fmt", "yuv420p", "-c:v", "libx265", "-preset", "ultrafast",
                 "-tune", "zerolatency", "-maxrate", "700k", "-bufsize", "350k",
                 "-x265-params",
                 "aud=1:repeat-headers=1:scenecut=0:pools=none:frame-threads=1:keyint=15:min-keyint=15:log-level=error",
                 "-flush_packets", "1", "-f", "hevc", "pipe:1",
+                "-map", "[local]", "-threads", "1", "-pix_fmt", "rgba", "-flush_packets", "1", "-f", "rawvideo", "pipe:0",
             ]);
         let mut child = source
-            .stdin(Stdio::null())
+            .stdin(Stdio::from(OwnedFd::from(output)))
             .spawn()
             .context("Starting the Linux FaceTime HEVC camera encoder (FFmpeg and libx265)")?;
         let stdout = child
@@ -130,12 +160,27 @@ impl HevcCamera {
         Ok(Self {
             process: child,
             stream: AccessUnits::new(stdout),
+            preview: Some(CameraPreview {
+                stream: DecodedFrames::new(preview, PREVIEW_WIDTH, PREVIEW_HEIGHT),
+                frames,
+            }),
         })
     }
 
     /// Read one complete camera frame. The parser retains partial data when canceled.
     pub async fn next_frame(&mut self) -> Result<Option<Zeroizing<Vec<u8>>>> {
-        let frame = self.stream.next().await?;
+        let frame = loop {
+            let Some(preview) = self.preview.as_mut() else {
+                break self.stream.next().await?;
+            };
+            tokio::select! {
+                encoded = self.stream.next() => break encoded?,
+                image = preview.stream.next_frame() => match image? {
+                    Some(image) => { preview.frames.send_replace(Some(Arc::new(image))); }
+                    None => self.preview = None,
+                },
+            }
+        };
         if frame.is_none() {
             let status = self
                 .process
@@ -224,11 +269,7 @@ impl HevcDecoder {
         Ok(Self {
             _child: child,
             input,
-            output: DecodedFrames {
-                output,
-                frame: Zeroizing::new(vec![0; RGBA_BYTES]),
-                filled: 0,
-            },
+            output: DecodedFrames::new(output, VIDEO_WIDTH, VIDEO_HEIGHT),
         })
     }
 
@@ -238,15 +279,29 @@ impl HevcDecoder {
     }
 }
 
-pub struct DecodedFrames {
-    output: ChildStdout,
+pub struct DecodedFrames<R = ChildStdout> {
+    output: R,
     frame: Zeroizing<Vec<u8>>,
     filled: usize,
+    width: u16,
+    height: u16,
 }
 
-impl DecodedFrames {
+impl<R: AsyncRead + Unpin> DecodedFrames<R> {
+    fn new(output: R, width: u16, height: u16) -> Self {
+        let size = usize::from(width) * usize::from(height) * 4;
+        Self {
+            output,
+            frame: Zeroizing::new(vec![0; size]),
+            filled: 0,
+            width,
+            height,
+        }
+    }
+
     pub async fn next_frame(&mut self) -> Result<Option<VideoFrame>> {
-        while self.filled < RGBA_BYTES {
+        let size = self.frame.len();
+        while self.filled < size {
             let read = self
                 .output
                 .read(&mut self.frame[self.filled..])
@@ -263,9 +318,9 @@ impl DecodedFrames {
         }
         self.filled = 0;
         Ok(Some(VideoFrame {
-            width: VIDEO_WIDTH,
-            height: VIDEO_HEIGHT,
-            rgba: std::mem::replace(&mut self.frame, Zeroizing::new(vec![0; RGBA_BYTES])),
+            width: self.width,
+            height: self.height,
+            rgba: std::mem::replace(&mut self.frame, Zeroizing::new(vec![0; size])),
         }))
     }
 }
@@ -380,14 +435,14 @@ mod tests {
         let mut source = ffmpeg();
         source.stderr(Stdio::inherit());
         source.args([
+            "-re",
             "-f",
             "lavfi",
             "-i",
-            "testsrc2=size=640x360:rate=15",
-            "-frames:v",
-            "18",
+            "testsrc2=size=640x360:rate=15:duration=1.2",
         ]);
-        let mut camera = HevcCamera::from_source(source)?;
+        let (preview, observed) = watch::channel(None);
+        let mut camera = HevcCamera::from_source(source, preview)?;
         let features = HevcFeatures::negotiate(HevcFeatures::SUPPORTED);
         let mut packetizer = HevcPacketizer::new(1204, CAMERA_WIDTH, CAMERA_HEIGHT, features)?;
         let mut receiver = HevcReceiver::new(1204, features);
@@ -445,11 +500,32 @@ mod tests {
         })
         .await??;
         assert_eq!((rgba.width, rgba.height), (VIDEO_WIDTH, VIDEO_HEIGHT));
-        assert_eq!(rgba.rgba.len(), RGBA_BYTES);
+        assert_eq!(
+            rgba.rgba.len(),
+            usize::from(VIDEO_WIDTH) * usize::from(VIDEO_HEIGHT) * 4
+        );
         assert!(rgba.rgba.as_chunks::<4>().0.iter().any(|pixel| {
             pixel[3] == 255
                 && pixel[..3].iter().max().unwrap() - pixel[..3].iter().min().unwrap() > 80
         }));
+        let preview = observed
+            .borrow()
+            .clone()
+            .context("Camera produced no local preview")?;
+        assert_eq!(
+            (preview.width, preview.height),
+            (PREVIEW_WIDTH, PREVIEW_HEIGHT)
+        );
+        assert!(
+            preview
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[0] > 100 && pixel[3] == 255)
+        );
+        drop(camera);
+        assert!(observed.borrow().is_none());
         Ok(())
     }
 }

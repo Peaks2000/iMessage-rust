@@ -14,7 +14,7 @@ use eframe::egui::{
 use linux_imessage::{
     CallMode, Conversation, Delivery, FILE_LIMIT, IncomingCall, MAX_ATTACHMENTS, Message,
     PAGE_SIZE, SendText, SetTapback, Status, TEXT_LIMIT, TapbackKind, address, display_address,
-    now_ms, storage,
+    engine::video::VideoFrame, now_ms, storage,
 };
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
@@ -93,6 +93,8 @@ struct DesktopCall {
     connected_at: Option<Instant>,
     controls: CallControls,
     video_texture: Option<egui::TextureHandle>,
+    camera_preview: Option<egui::TextureHandle>,
+    preview_position: egui::Vec2,
 }
 
 #[derive(Default)]
@@ -1674,32 +1676,34 @@ impl MessagesApp {
                 )
             };
             let video_status = call.controls.video_status().unwrap_or_default();
-            if let Some(update) = call.controls.next_video_frame() {
-                if let Some(frame) = update {
-                    let image = egui::ColorImage::from_rgba_unmultiplied(
-                        [usize::from(frame.width), usize::from(frame.height)],
-                        &frame.rgba,
-                    );
-                    if let Some(texture) = &mut call.video_texture {
-                        texture.set(image, egui::TextureOptions::LINEAR);
-                    } else {
-                        call.video_texture = Some(ctx.load_texture(
-                            "FaceTime remote video",
-                            image,
-                            egui::TextureOptions::LINEAR,
-                        ));
-                    }
-                } else {
-                    call.video_texture = None;
-                }
+            if let Some(frame) = call.controls.next_video_frame() {
+                update_video_texture(
+                    ctx,
+                    &mut call.video_texture,
+                    "FaceTime remote video",
+                    frame.as_deref(),
+                );
+            }
+            let preview = call.controls.next_camera_preview();
+            if call.controls.ending() || call.controls.camera_enabled() != Some(true) {
+                call.camera_preview = None;
+            } else if let Some(frame) = preview {
+                update_video_texture(
+                    ctx,
+                    &mut call.camera_preview,
+                    "FaceTime camera preview",
+                    frame.as_deref(),
+                );
             }
             call_card(ctx, name, &detail, symbol, width, |ui| {
                 if is_video && call.connected_at.is_some() {
                     let size = vec2(ui.available_width(), ui.available_width() * 9. / 16.);
+                    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
                     if let Some(texture) = &call.video_texture {
-                        ui.add(egui::Image::new((texture.id(), size)).corner_radius(9));
+                        egui::Image::new((texture.id(), size))
+                            .corner_radius(9)
+                            .paint_at(ui, rect);
                     } else {
-                        let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
                         ui.painter().rect_filled(rect, 9, Color32::from_gray(26));
                         ui.painter().text(
                             rect.center(),
@@ -1713,6 +1717,13 @@ impl MessagesApp {
                             Color32::WHITE,
                         );
                     }
+                    camera_preview(
+                        ui,
+                        call.id,
+                        call.camera_preview.as_ref(),
+                        &mut call.preview_position,
+                        rect,
+                    );
                     if let Some(error) = &video_status.camera_error {
                         ui.colored_label(DANGER, error);
                     }
@@ -1865,6 +1876,8 @@ impl MessagesApp {
                             connected_at: None,
                             controls,
                             video_texture: None,
+                            camera_preview: None,
+                            preview_position: vec2(1., 1.),
                         });
                         self.call_error = None;
                     }
@@ -1897,6 +1910,8 @@ impl MessagesApp {
                     connected_at: None,
                     controls,
                     video_texture: None,
+                    camera_preview: None,
+                    preview_position: vec2(1., 1.),
                 });
             }
             Err(error) => self.error = Some(error.to_string()),
@@ -2299,6 +2314,78 @@ impl eframe::App for MessagesApp {
         self.media.show(ctx);
         window_edge(ctx);
     }
+}
+
+fn update_video_texture(
+    ctx: &egui::Context,
+    texture: &mut Option<egui::TextureHandle>,
+    label: &str,
+    frame: Option<&VideoFrame>,
+) {
+    let Some(frame) = frame else {
+        *texture = None;
+        return;
+    };
+    let image = egui::ColorImage::from_rgba_unmultiplied(
+        [usize::from(frame.width), usize::from(frame.height)],
+        &frame.rgba,
+    );
+    if let Some(texture) = texture {
+        texture.set(image, egui::TextureOptions::LINEAR);
+    } else {
+        *texture = Some(ctx.load_texture(label, image, egui::TextureOptions::LINEAR));
+    }
+}
+
+fn camera_preview(
+    ui: &Ui,
+    call: Uuid,
+    texture: Option<&egui::TextureHandle>,
+    position: &mut egui::Vec2,
+    stage: Rect,
+) {
+    let id = ui.id().with(("camera preview", call));
+    let alpha = ui.ctx().animate_bool_with_time(id, texture.is_some(), 0.16);
+    let Some(texture) = texture else {
+        return;
+    };
+    let bounds = stage.shrink(10.);
+    let width = (stage.width() * 0.28).min(136.);
+    let size = vec2(width, width * 9. / 16.);
+    let travel = (bounds.size() - size).max(egui::Vec2::ZERO);
+    let anchor =
+        |position: egui::Vec2| bounds.min + vec2(position.x * travel.x, position.y * travel.y);
+    let previous = Rect::from_min_size(anchor(*position), size);
+    let response = ui.interact(previous, id, Sense::drag());
+    let delta = response.drag_delta();
+    if response.dragged() {
+        *position += vec2(delta.x / travel.x.max(1.), delta.y / travel.y.max(1.));
+        *position = position.clamp(egui::Vec2::ZERO, vec2(1., 1.));
+    }
+    response
+        .on_hover_and_drag_cursor(egui::CursorIcon::Grab)
+        .on_hover_text("Your camera");
+    let rect = Rect::from_min_size(anchor(*position), size);
+    let painter = ui.painter().with_clip_rect(stage);
+    painter.rect_filled(
+        rect.expand(2.).translate(vec2(0., 2.)),
+        9,
+        Color32::from_black_alpha((110. * alpha) as u8),
+    );
+    egui::Image::new((texture.id(), size))
+        .uv(Rect {
+            min: pos2(1., 0.),
+            max: pos2(0., 1.),
+        })
+        .corner_radius(7)
+        .tint(Color32::WHITE.gamma_multiply(alpha))
+        .paint_at(ui, rect);
+    painter.rect_stroke(
+        rect,
+        7,
+        Stroke::new(1.0_f32, Color32::from_white_alpha((122. * alpha) as u8)),
+        StrokeKind::Inside,
+    );
 }
 
 fn call_card(
@@ -3195,13 +3282,68 @@ mod tests {
                     rgba: Zeroizing::new([20, 120, 220, 255].repeat(4)),
                 },
             )));
+            video
+                .preview
+                .send_replace(Some(std::sync::Arc::new(VideoFrame {
+                    width: 4,
+                    height: 2,
+                    rgba: Zeroizing::new([220, 120, 20, 255].repeat(8)),
+                })));
             let output = frame(Vec::new());
             assert!(output.textures_delta.set.iter().any(|(_, texture)| {
                 let egui::ImageData::Color(image) = &texture.image;
                 image.size == [2, 2] && image.pixels[0] == Color32::from_rgb(20, 120, 220)
             }));
+            let preview = output
+                .textures_delta
+                .set
+                .iter()
+                .find_map(|(id, update)| {
+                    let egui::ImageData::Color(image) = &update.image;
+                    (image.size == [4, 2] && image.pixels[0] == Color32::from_rgb(220, 120, 20))
+                        .then_some(*id)
+                })
+                .expect("Missing local camera preview");
+            let preview_rect = |output: egui::FullOutput| {
+                output
+                    .shapes
+                    .into_iter()
+                    .find_map(|shape| {
+                        if let egui::Shape::Rect(rect) = shape.shape
+                            && let Some(brush) = &rect.brush
+                            && brush.fill_texture_id == preview
+                        {
+                            assert!(brush.uv.min.x > brush.uv.max.x);
+                            return Some(rect.rect);
+                        }
+                        None
+                    })
+                    .expect("Missing mirrored camera tile")
+            };
+            for _ in 0..12 {
+                frame(Vec::new());
+            }
+            let original = preview_rect(frame(Vec::new())).center();
+            frame(vec![egui::Event::PointerMoved(original)]);
+            frame(vec![egui::Event::PointerButton {
+                pos: original,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+            let moved = original - vec2(75., 30.);
+            let moved_rect = preview_rect(frame(vec![egui::Event::PointerMoved(moved)]));
+            assert!(moved_rect.center().distance(moved) < 2.);
+            frame(vec![egui::Event::PointerButton {
+                pos: moved,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }]);
             click(&mut frame, "Camera Off");
             assert!(!*video.camera_enabled.borrow());
+            frame(Vec::new());
+            assert!(ctx.tex_manager().read().meta(preview).is_none());
             click(&mut frame, "Camera On");
             assert!(*video.camera_enabled.borrow());
 

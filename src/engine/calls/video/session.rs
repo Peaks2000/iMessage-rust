@@ -30,6 +30,7 @@ pub struct VideoCallOptions {
     pub camera: Option<PathBuf>,
     pub camera_enabled: watch::Receiver<bool>,
     pub frames: watch::Sender<Option<Arc<VideoFrame>>>,
+    pub preview: watch::Sender<Option<Arc<VideoFrame>>>,
     pub status: watch::Sender<VideoStatus>,
 }
 
@@ -48,6 +49,7 @@ pub(in crate::engine::calls) struct VideoSession {
     camera_path: Option<PathBuf>,
     camera_enabled: watch::Receiver<bool>,
     camera: Option<Capture>,
+    preview: watch::Sender<Option<Arc<VideoFrame>>>,
     status: watch::Sender<VideoStatus>,
     paused_at: Option<Instant>,
     packetizer: HevcPacketizer,
@@ -89,6 +91,7 @@ impl VideoSession {
             camera_path: options.camera,
             camera_enabled: options.camera_enabled,
             camera: None,
+            preview: options.preview,
             status: options.status,
             paused_at: None,
             packetizer,
@@ -111,11 +114,8 @@ impl VideoSession {
     }
 
     fn open_camera(&self) -> Result<HevcCamera> {
-        if let Some(device) = &self.camera_path {
-            HevcCamera::start(device)
-        } else {
-            HevcCamera::start(&default_camera()?)
-        }
+        let device = self.camera_path.clone().map_or_else(default_camera, Ok)?;
+        HevcCamera::start(&device, self.preview.clone())
     }
 
     fn camera_failed(&mut self, error: anyhow::Error) {
@@ -259,6 +259,7 @@ mod tests {
             camera_path: Some(temporary.path().join("removed-camera")),
             camera_enabled: enabled,
             camera: None,
+            preview: watch::channel(None).0,
             status,
             paused_at: None,
             packetizer: HevcPacketizer::new(
