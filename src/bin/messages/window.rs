@@ -2763,6 +2763,13 @@ mod tests {
 
     #[test]
     fn tapback_menu_replaces_a_legacy_reaction_with_a_pasted_emoji() -> anyhow::Result<()> {
+        for from_badge in [false, true] {
+            replace_legacy_tapback_with_emoji(from_badge)?;
+        }
+        Ok(())
+    }
+
+    fn replace_legacy_tapback_with_emoji(from_badge: bool) -> anyhow::Result<()> {
         let ctx = egui::Context::default();
         let root = tempfile::tempdir()?;
         let mut app = MessagesApp::new(&ctx, root.path().to_owned(), true, Clipboard::empty());
@@ -2806,8 +2813,12 @@ mod tests {
                 },
             )
         };
-        let bubble = find_label(&mut frame, "Choose a reaction");
-        pointer_click(&mut frame, bubble, egui::PointerButton::Secondary);
+        if from_badge {
+            click(&mut frame, "👍");
+        } else {
+            let bubble = find_label(&mut frame, "Choose a reaction");
+            pointer_click(&mut frame, bubble, egui::PointerButton::Secondary);
+        }
         let submenu = find_label(&mut frame, "Emoji…");
         frame(vec![egui::Event::PointerMoved(submenu)]);
         click(&mut frame, "Paste emoji or type :name:");

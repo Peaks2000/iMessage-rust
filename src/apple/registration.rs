@@ -374,7 +374,7 @@ fn registration_document(
                 .collect(),
         )
     };
-    let client_data = map(&[
+    let client_data = Dictionary::from_iter([
         (
             "public-message-identity-key",
             Value::Data(public_identity.to_vec()),
@@ -382,11 +382,13 @@ fn registration_document(
         ("public-message-identity-version", 2.into()),
         ("ec-version", 1.into()),
     ]);
-    let mut account = Dictionary::from_iter([
-        ("user-id", user_id.into()),
-        ("uris", Value::Array(vec![map(&[("uri", handle.into())])])),
-        ("client-data", client_data),
-    ]);
+    let account = |client_data| {
+        Dictionary::from_iter([
+            ("user-id", user_id.into()),
+            ("uris", Value::Array(vec![map(&[("uri", handle.into())])])),
+            ("client-data", Value::Dictionary(client_data)),
+        ])
+    };
     let service = |name: &str, subservices: &[&str], capability: &str, flags: i32, user: Value| {
         let capabilities = map(&[
             ("flags", flags.into()),
@@ -405,15 +407,18 @@ fn registration_document(
     };
     let mut requested = Vec::new();
     if !matches!(services, Services::FaceTime) {
+        let mut messaging_data = client_data.clone();
+        messaging_data.insert("supports-emoji-tapbacks".into(), Value::Boolean(true));
         requested.push(service(
             TOPIC,
             &[],
             "Messenger",
             17,
-            Value::Dictionary(account.clone()),
+            Value::Dictionary(account(messaging_data)),
         ));
     }
     if !matches!(services, Services::Messages) {
+        let mut account = account(client_data);
         if let Some(directory) = relay_directory {
             // Advertise only the device identity used for relay signatures. IDS signaling
             // continues to use the legacy encryption identity above.
@@ -752,6 +757,15 @@ mod tests {
         user.get("kt-loggable-data")?.as_data()
     }
 
+    fn advertised_emoji_tapbacks(document: &Dictionary, service: usize) -> Option<bool> {
+        let service = document["services"].as_array()?[service].as_dictionary()?;
+        let user = service["users"].as_array()?.first()?.as_dictionary()?;
+        user["client-data"]
+            .as_dictionary()?
+            .get("supports-emoji-tapbacks")?
+            .as_boolean()
+    }
+
     #[tokio::test]
     async fn enabling_face_time_reuses_the_original_keys_and_never_reregisters_messages()
     -> Result<()> {
@@ -969,6 +983,9 @@ mod tests {
             assert_eq!(identity.can_sign_relay_prekey(), face_time_granted);
             assert!(advertised_relay_key(&initial, 0).is_none());
             assert!(advertised_relay_key(&initial, 1).is_some());
+            assert_eq!(advertised_emoji_tapbacks(&initial, 0), Some(true));
+            assert_eq!(advertised_emoji_tapbacks(&initial, 1), None);
+            assert_eq!(advertised_emoji_tapbacks(&initial, 2), None);
             assert_eq!(
                 service_names(&initial),
                 [TOPIC, facetime::SIGNALING, facetime::VIDEO_SERVICE]
@@ -983,6 +1000,7 @@ mod tests {
                     request_identity(&retry_headers, &body, &push_key, &auth_key)?;
                 assert_eq!(service_names(&retry), [TOPIC]);
                 assert!(advertised_relay_key(&retry, 0).is_none());
+                assert_eq!(advertised_emoji_tapbacks(&retry, 0), Some(true));
                 assert_eq!(retry_key, initial_key);
                 assert_eq!(
                     retry["validation-data"].as_data(),
