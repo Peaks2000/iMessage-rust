@@ -139,7 +139,7 @@ pub async fn register_device(input: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
             &registration.auth_private_key,
         )?,
     };
-    register(&apple_client()?, &mut registration.device, auth, None).await
+    register(&apple_client()?, &mut registration.device, auth, None, None).await
 }
 
 pub(super) async fn register(
@@ -147,6 +147,7 @@ pub(super) async fn register(
     registration: &mut DeviceRegistration,
     auth: AccountAuth,
     fresh_proof_provider: Option<&DeviceProvider>,
+    existing: Option<&Identity>,
 ) -> Result<Zeroizing<Vec<u8>>> {
     register_at(
         client,
@@ -154,6 +155,7 @@ pub(super) async fn register(
         registration,
         auth,
         fresh_proof_provider,
+        existing,
     )
     .await
 }
@@ -164,6 +166,7 @@ async fn register_at(
     registration: &mut DeviceRegistration,
     auth: AccountAuth,
     fresh_proof_provider: Option<&DeviceProvider>,
+    existing: Option<&Identity>,
 ) -> Result<Zeroizing<Vec<u8>>> {
     let handle = address(&registration.handle)?;
     let token = registration.token()?;
@@ -171,24 +174,37 @@ async fn register_at(
         &registration.push_certificate,
         &registration.push_private_key,
     )?;
-    let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
-    let signing = PKey::from_ec_key(
-        EcKey::generate(&group).context("Could not generate a P-256 message key")?,
-    )?;
-    let encryption = PKey::from_rsa(Rsa::generate(1280)?)?;
-    let signing_bytes = Zeroizing::new(signing.private_key_to_der()?);
-    let encryption_bytes = Zeroizing::new(encryption.private_key_to_der()?);
+    let (signing_bytes, encryption_bytes) = if let Some(identity) = existing {
+        ensure!(
+            identity.handle == handle
+                && identity.token == token
+                && identity.push_cert == registration.push_certificate.as_ref()
+                && identity.push_key.public_eq(&push)
+                && identity.ids_key.public_eq(&auth.key),
+            "The FaceTime registration does not match the saved iMessage identity"
+        );
+        identity.message_keys.registration_keys()?
+    } else {
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
+        let signing = PKey::from_ec_key(
+            EcKey::generate(&group).context("Could not generate a P-256 message key")?,
+        )?;
+        let encryption = PKey::from_rsa(Rsa::generate(1280)?)?;
+        (
+            Zeroizing::new(signing.private_key_to_der()?),
+            Zeroizing::new(encryption.private_key_to_der()?),
+        )
+    };
     let pair = KeyPair::private(&signing_bytes, &encryption_bytes)?;
-
     let public_identity = pair.public_der()?;
 
-    let submit = async |registration: &DeviceRegistration, include_facetime| {
+    let submit = async |registration: &DeviceRegistration, services| {
         let document = registration_document(
             registration,
             &auth.user_id,
             &handle,
             &public_identity,
-            include_facetime,
+            services,
         );
         let body = plist_xml_gzip(&document)?;
         let mut headers = HeaderMap::new();
@@ -247,12 +263,24 @@ async fn register_at(
             .context("Could not reach Apple's registration endpoint")?
             .error_for_status()?;
         let bytes = read_response(response).await?;
-        let response: RegisterReply =
-            plist::from_bytes(&bytes).context("Could not decode Apple's registration response")?;
-        select_certificates(&response, &auth, &handle, include_facetime)
+        plist::from_bytes::<RegisterReply>(&bytes)
+            .context("Could not decode Apple's registration response")
     };
-    let (cert, facetime_certificates) =
-        match submit(registration, registration.include_facetime).await {
+    let (cert, facetime_certificates) = if let Some(identity) = existing {
+        let response = submit(registration, Services::FaceTime).await?;
+        let calls = required_facetime_certificates(&response, &auth, &handle)?;
+        (Data::new(identity.ids_cert.clone()), calls)
+    } else {
+        let register_new = async |registration: &DeviceRegistration, include_facetime| {
+            let services = if include_facetime {
+                Services::Both
+            } else {
+                Services::Messages
+            };
+            let response = submit(registration, services).await?;
+            select_certificates(&response, &auth, &handle, include_facetime)
+        };
+        match register_new(registration, registration.include_facetime).await {
             Err(error) if registration.include_facetime && error.is::<RegistrationRejected>() => {
                 let Some(provider) = fresh_proof_provider else {
                     return Err(error);
@@ -265,12 +293,13 @@ async fn register_at(
             })?;
                 clear_data(&mut registration.validation_data);
                 registration.validation_data = proof;
-                submit(registration, false)
+                register_new(registration, false)
                     .await
                     .with_context(|| format!("{error}. The iMessage registration retry failed"))?
             }
             result => result?,
-        };
+        }
+    };
     let session = Session {
         version: 1,
         handle,
@@ -282,8 +311,12 @@ async fn register_at(
         facetime_certificates,
         signing_private_key: Data::new(signing_bytes.to_vec()),
         encryption_private_key: Data::new(encryption_bytes.to_vec()),
-        protocol_version: registration.protocol_version,
-        user_agent: registration.user_agent.clone(),
+        protocol_version: existing.map_or(registration.protocol_version, |identity| {
+            identity.protocol_version
+        }),
+        user_agent: existing
+            .map_or(&registration.user_agent, |identity| &identity.user_agent)
+            .clone(),
     };
     let mut serialized = Zeroizing::new(Vec::new());
     plist::to_writer_binary(&mut *serialized, &session)?;
@@ -292,12 +325,19 @@ async fn register_at(
     Ok(serialized)
 }
 
+#[derive(Clone, Copy)]
+enum Services {
+    Both,
+    Messages,
+    FaceTime,
+}
+
 fn registration_document(
     input: &DeviceRegistration,
     user_id: &str,
     handle: &str,
     public_identity: &[u8],
-    include_facetime: bool,
+    services: Services,
 ) -> Value {
     let map = |fields: &[(&str, Value)]| {
         Value::Dictionary(
@@ -336,9 +376,12 @@ fn registration_document(
             ("users", Value::Array(vec![user])),
         ])
     };
-    let mut services = vec![service(TOPIC, &[], "Messenger", 17, account.clone())];
-    if include_facetime {
-        services.extend([
+    let mut requested = Vec::new();
+    if !matches!(services, Services::FaceTime) {
+        requested.push(service(TOPIC, &[], "Messenger", 17, account.clone()));
+    }
+    if !matches!(services, Services::Messages) {
+        requested.extend([
             service(facetime::SIGNALING, &[], "Invitation", 1, account.clone()),
             service(
                 facetime::VIDEO_SERVICE,
@@ -359,7 +402,7 @@ fn registration_document(
             "private-device-data",
             Value::Dictionary(input.private_device_data.clone()),
         ),
-        ("services", Value::Array(services)),
+        ("services", Value::Array(requested)),
         (
             "validation-data",
             Value::Data(input.validation_data.as_ref().to_vec()),
@@ -437,16 +480,42 @@ fn select_certificates(
     let mut calls = BTreeMap::new();
     if include_facetime {
         for service in [facetime::SIGNALING, facetime::VIDEO_SERVICE] {
-            if let Ok(certificate) = registered_certificate(reply, service, &auth.user_id, handle)
-                && X509::from_der(certificate.as_ref())
-                    .and_then(|certificate| certificate.public_key())
-                    .is_ok_and(|public| auth.key.public_eq(&public))
-            {
+            if let Ok(certificate) = checked_facetime_certificate(reply, auth, handle, service) {
                 calls.insert(service.to_owned(), certificate);
             }
         }
     }
     Ok((messages, calls))
+}
+
+fn required_facetime_certificates(
+    reply: &RegisterReply,
+    auth: &AccountAuth,
+    handle: &str,
+) -> Result<BTreeMap<String, Data>> {
+    check_status(reply.status, "FaceTime registration")?;
+    let signal = checked_facetime_certificate(reply, auth, handle, facetime::SIGNALING)
+        .context("Apple did not grant FaceTime to this iMessage address")?;
+    let mut calls = BTreeMap::from([(facetime::SIGNALING.to_owned(), signal)]);
+    if let Ok(video) = checked_facetime_certificate(reply, auth, handle, facetime::VIDEO_SERVICE) {
+        calls.insert(facetime::VIDEO_SERVICE.to_owned(), video);
+    }
+    Ok(calls)
+}
+
+fn checked_facetime_certificate(
+    reply: &RegisterReply,
+    auth: &AccountAuth,
+    handle: &str,
+    service: &str,
+) -> Result<Data> {
+    let certificate = registered_certificate(reply, service, &auth.user_id, handle)?;
+    let public = X509::from_der(certificate.as_ref())?.public_key()?;
+    ensure!(
+        auth.key.public_eq(&public),
+        "Apple returned a FaceTime certificate for a different key"
+    );
+    Ok(certificate)
 }
 
 fn registered_certificate(
@@ -515,17 +584,22 @@ mod tests {
 
     fn identity_certificate() -> Result<(PKey<Private>, Data)> {
         let rsa = PKey::from_rsa(Rsa::generate(2048)?)?;
+        let cert = certificate_for(&rsa, "Registration fixture")?;
+        Ok((rsa, cert))
+    }
+
+    fn certificate_for(rsa: &PKey<Private>, common_name: &str) -> Result<Data> {
         let mut name = X509NameBuilder::new()?;
-        name.append_entry_by_text("CN", "Registration fixture")?;
+        name.append_entry_by_text("CN", common_name)?;
         let name = name.build();
         let mut builder = X509::builder()?;
         builder.set_subject_name(&name)?;
         builder.set_issuer_name(&name)?;
-        builder.set_pubkey(&rsa)?;
+        builder.set_pubkey(rsa)?;
         builder.set_not_before(Asn1Time::days_from_now(0)?.as_ref())?;
         builder.set_not_after(Asn1Time::days_from_now(1)?.as_ref())?;
-        builder.sign(&rsa, MessageDigest::sha256())?;
-        Ok((rsa, Data::new(builder.build().to_der()?)))
+        builder.sign(rsa, MessageDigest::sha256())?;
+        Ok(Data::new(builder.build().to_der()?))
     }
 
     fn device(key: &PKey<Private>, cert: &Data) -> Result<DeviceRegistration> {
@@ -633,6 +707,110 @@ mod tests {
             .collect()
     }
 
+    #[tokio::test]
+    async fn enabling_face_time_reuses_the_original_keys_and_never_reregisters_messages()
+    -> Result<()> {
+        let (push_key, push_cert) = identity_certificate()?;
+        let (ids_key, messages_cert) = identity_certificate()?;
+        let authorization = certificate_for(&ids_key, "Fresh account authorization")?;
+        let face_time = certificate_for(&ids_key, "FaceTime registration")?;
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
+        let signing = PKey::from_ec_key(EcKey::generate(&group)?)?;
+        let encryption = PKey::from_rsa(Rsa::generate(1280)?)?;
+        let old = Session {
+            version: 1,
+            handle: HANDLE.to_owned(),
+            push_token: Data::new(TOKEN.to_vec()),
+            push_certificate: push_cert.clone(),
+            push_private_key: Data::new(push_key.private_key_to_der()?),
+            ids_certificate: messages_cert.clone(),
+            ids_private_key: Data::new(ids_key.private_key_to_der()?),
+            facetime_certificates: BTreeMap::new(),
+            signing_private_key: Data::new(signing.private_key_to_der()?),
+            encryption_private_key: Data::new(encryption.private_key_to_der()?),
+            protocol_version: 1650,
+            user_agent: "[Mac OS X,10.11.6,15G31,MacBookPro11,3]".to_owned(),
+        };
+        let mut encoded = Zeroizing::new(Vec::new());
+        plist::to_writer_binary(&mut *encoded, &old)?;
+        let previous = Identity::parse(&encoded)?;
+
+        let responses = [
+            reply(
+                0,
+                vec![
+                    accepted(facetime::SIGNALING, &face_time),
+                    accepted(facetime::VIDEO_SERVICE, &face_time),
+                ],
+            )?,
+            reply(71, Vec::new())?,
+            reply(0, vec![accepted(facetime::SIGNALING, &push_cert)])?,
+        ];
+        for (index, response) in responses.into_iter().enumerate() {
+            let (requests, mut captured) = tokio::sync::mpsc::unbounded_channel();
+            let router = Router::new().route(
+                "/register",
+                post(move |headers: HeaderMap, body: Bytes| {
+                    requests.send((headers, body)).unwrap();
+                    let response = response.clone();
+                    async move { response }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let url = format!("http://{}/register", listener.local_addr()?);
+            let server = tokio::spawn(async move { axum::serve(listener, router).await });
+            let auth = AccountAuth {
+                user_id: ACCOUNT.into(),
+                certificate: authorization.clone(),
+                key: ids_key.clone(),
+            };
+            let result = register_at(
+                &Client::builder().no_proxy().build()?,
+                &url,
+                &mut device(&push_key, &push_cert)?,
+                auth,
+                None,
+                Some(&previous),
+            )
+            .await;
+            if index == 0 {
+                let upgraded = Identity::parse(&result?)?;
+                assert!(upgraded.same_messaging_registration(&previous)?);
+                assert_eq!(upgraded.profile_id(), previous.profile_id());
+                assert_eq!(
+                    upgraded.ids_certificate(TOPIC),
+                    Some(messages_cert.as_ref())
+                );
+                assert_eq!(
+                    upgraded.ids_certificate(facetime::SIGNALING),
+                    Some(face_time.as_ref())
+                );
+                assert_eq!(
+                    upgraded.ids_certificate(facetime::VIDEO),
+                    Some(face_time.as_ref())
+                );
+            } else {
+                assert!(result.is_err());
+            }
+            let (headers, payload) = captured.try_recv()?;
+            let (document, advertised_key) =
+                request_identity(&headers, &payload, &push_key, &ids_key)?;
+            assert_eq!(
+                service_names(&document),
+                [facetime::SIGNALING, facetime::VIDEO_SERVICE]
+            );
+            assert_eq!(advertised_key, previous.message_keys.public_der()?);
+            assert_eq!(
+                STANDARD.decode(headers["x-auth-cert-0"].as_bytes())?,
+                authorization.as_ref()
+            );
+            assert!(captured.try_recv().is_err());
+            server.abort();
+        }
+        assert!(!previous.facetime_registered());
+        Ok(())
+    }
+
     #[test]
     fn optional_face_time_certificates_must_match_the_requested_account_key() -> Result<()> {
         let (key, cert) = identity_certificate()?;
@@ -724,6 +902,7 @@ mod tests {
                 &mut device(&push_key, &push_cert)?,
                 auth,
                 Some(&provider),
+                None,
             )
             .await?;
             let identity = Identity::parse(&saved)?;

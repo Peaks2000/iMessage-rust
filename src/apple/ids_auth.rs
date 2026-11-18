@@ -4,7 +4,7 @@ use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use openssl::{
     hash::MessageDigest,
-    pkey::PKey,
+    pkey::{PKey, Private},
     rsa::Rsa,
     sha::sha1,
     x509::{X509, X509NameBuilder, X509ReqBuilder},
@@ -32,6 +32,7 @@ pub(super) async fn authenticate(
     username: &str,
     session: &LoginSession,
     headers: DeviceHeaders,
+    existing_key: Option<&PKey<Private>>,
 ) -> Result<AccountAuth> {
     let setup = client_builder().build()?;
     let request = plist_xml(&Dictionary::from_iter([
@@ -91,7 +92,10 @@ pub(super) async fn authenticate(
         "Apple returned an incomplete iMessage account grant"
     );
 
-    let key = PKey::from_rsa(Rsa::generate(2048)?)?;
+    let key = match existing_key {
+        Some(key) => key.clone(),
+        None => PKey::from_rsa(Rsa::generate(2048)?)?,
+    };
     let mut common_name = String::new();
     for byte in sha1(grant.profile_id.as_bytes()) {
         write!(common_name, "{byte:02X}")?;

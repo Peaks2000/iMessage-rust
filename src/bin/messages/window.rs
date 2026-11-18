@@ -1998,6 +1998,7 @@ impl MessagesApp {
         let mut apply = false;
         let mut import = false;
         let mut setup_mac = false;
+        let mut enable_facetime = false;
         let mut contacts = false;
         let mut cancel = false;
         let connecting = self.candidate.is_some();
@@ -2034,12 +2035,12 @@ impl MessagesApp {
                                     .as_ref()
                                     .is_some_and(|status| !status.facetime_registered)
                             {
-                                ui.label(
-                                    RichText::new(
-                                        "This Apple session needs FaceTime registration.",
+                                enable_facetime = ui
+                                    .add_enabled(
+                                        !self.sending && self.active_call.is_none(),
+                                        egui::Button::new("Enable FaceTime…"),
                                     )
-                                    .color(MUTED),
-                                );
+                                    .clicked();
                             }
                             ui.add_space(3.);
                             ui.horizontal_wrapped(|ui| {
@@ -2120,6 +2121,9 @@ impl MessagesApp {
             });
         if contacts {
             self.contacts.open();
+        } else if enable_facetime {
+            form.error = None;
+            self.mac_setup = Some(MacSetup::for_facetime(&self.root));
         } else if setup_mac {
             form.error = None;
             self.mac_setup = Some(MacSetup::new());
@@ -2718,6 +2722,44 @@ fn window_edge(ctx: &egui::Context) {
 #[cfg(test)]
 mod call_panel_tests {
     use super::*;
+
+    #[test]
+    fn existing_apple_session_can_open_face_time_upgrade_from_settings() -> anyhow::Result<()> {
+        let ctx = egui::Context::default();
+        let root = tempfile::tempdir()?;
+        let mut app = MessagesApp::new(&ctx, root.path().to_owned(), true, Clipboard::empty());
+        app.mac_setup = None;
+        app.status = Some(Status {
+            connected: true,
+            detail: "Connected to Apple courier".into(),
+            tapback_revision: None,
+            facetime_registered: false,
+            incoming_calls: Vec::new(),
+        });
+        app.open_settings();
+        let mut frame = |events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(932., 700.))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.settings_dialog(ctx);
+                    app.mac_setup_dialog(ctx);
+                },
+            )
+        };
+        click(&mut frame, "Enable FaceTime…");
+        frame(Vec::new());
+        assert!(
+            frame(Vec::new())
+                .shapes
+                .iter()
+                .any(|shape| { label_position(&shape.shape, "Enable FaceTime").is_some() })
+        );
+        Ok(())
+    }
 
     #[test]
     fn conversation_toolbar_places_a_video_call_and_displays_an_audio_answer() -> anyhow::Result<()>

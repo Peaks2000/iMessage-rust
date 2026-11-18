@@ -18,6 +18,8 @@ If Apple sends a sign-in alert to your iPhone or another trusted device, tap **A
 
 Setup requests iMessage and FaceTime registration in the same sign-in. Apple can grant iMessage access independently. If Apple rejects the combined request, setup retries iMessage with a new validation proof when the device helper can generate one.
 
+If an existing desktop session has iMessage access, **Settings → This Computer → Enable FaceTime** requests the FaceTime certificates for the saved device and iMessage address. It reuses a remembered Apple Account password when available and uses the configured local device helper or a Mac for fresh Apple device validation.
+
 With **Remember Apple Account password** selected, Linux Secret Service keeps the Apple Account credentials for later sign-in. The desktop also requests iCloud Contacts access from the same sign-in. Once authorized, Contacts syncs directly from iCloud whenever the app opens.
 
 For a source build, install the local Anisette library with `bash tools/build-local-adi.sh "$HOME/.local/lib/linux-imessage"`. The script uses Git, CMake, a C++20 compiler and the mbed TLS development libraries.

@@ -1,7 +1,7 @@
 use std::{
-    fs::{self, DirBuilder, File},
+    fs::{self, DirBuilder, File, OpenOptions},
     io::{Read, Write},
-    os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -175,6 +175,50 @@ pub fn import_session(root: &Path, source: &Path, key_file: Option<&Path>) -> Re
 
 pub fn save_session(root: &Path, bytes: &[u8], key_file: Option<&Path>) -> Result<()> {
     crate::apple::Identity::parse(bytes).context("Invalid Apple session")?;
+    let _lock = lock_session_storage(root)?;
+    write_session(root, bytes, key_file)
+}
+
+/// Add FaceTime to the current desktop session after verifying the existing registration.
+pub fn save_facetime_upgrade(
+    root: &Path,
+    prior: &crate::apple::Identity,
+    bytes: &[u8],
+) -> Result<()> {
+    let upgraded = crate::apple::Identity::parse(bytes).context("Invalid FaceTime session")?;
+    ensure!(
+        upgraded.facetime_registered() && upgraded.same_messaging_registration(prior)?,
+        "FaceTime registration does not match the saved iMessage device"
+    );
+    let _lock = lock_session_storage(root)?;
+    let saved = load_local_session(root)?
+        .context("The saved iMessage session was removed during FaceTime setup")?;
+    ensure!(
+        saved.same_messaging_registration(prior)?,
+        "The saved Apple session changed during FaceTime setup"
+    );
+    if saved.same_facetime_registration(&upgraded) {
+        return Ok(());
+    }
+    ensure!(
+        saved.same_facetime_registration(prior),
+        "The saved FaceTime registration changed during setup"
+    );
+    write_session(root, bytes, None)
+}
+
+fn lock_session_storage(root: &Path) -> Result<File> {
+    let lock = OpenOptions::new()
+        .mode(0o600)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join("session-storage.lock"))?;
+    fs2::FileExt::try_lock_exclusive(&lock).context("Apple session storage is busy")?;
+    Ok(lock)
+}
+
+fn write_session(root: &Path, bytes: &[u8], key_file: Option<&Path>) -> Result<()> {
     let vault = root.join("apple-session.enc");
     match key_file {
         Some(path) => {

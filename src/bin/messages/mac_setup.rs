@@ -25,7 +25,8 @@ pub(super) enum Outcome {
 }
 
 pub(super) struct MacSetup {
-    contacts_only: bool,
+    purpose: Purpose,
+    device_helper: Option<PathBuf>,
     account_seeded: bool,
     remembered: Option<String>,
     remember_password: bool,
@@ -40,6 +41,13 @@ pub(super) struct MacSetup {
     worker: Option<Worker>,
     focus_code: bool,
     focus_ssh: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    Messages,
+    FaceTime,
+    Contacts,
 }
 
 enum Step {
@@ -77,6 +85,7 @@ enum Event {
 }
 
 struct Request {
+    purpose: Purpose,
     setup: Option<AutomaticSetup>,
     account: String,
     password: Zeroizing<String>,
@@ -87,7 +96,8 @@ struct Request {
 impl MacSetup {
     pub(super) fn new() -> Self {
         Self {
-            contacts_only: false,
+            purpose: Purpose::Messages,
+            device_helper: None,
             account_seeded: false,
             remembered: None,
             remember_password: true,
@@ -107,8 +117,15 @@ impl MacSetup {
 
     pub(super) fn for_contacts(account: &str, password_saved: bool) -> Self {
         let mut setup = Self::new();
-        setup.contacts_only = true;
+        setup.purpose = Purpose::Contacts;
         setup.seed_account(account, password_saved);
+        setup
+    }
+
+    pub(super) fn for_facetime(root: &Path) -> Self {
+        let mut setup = Self::new();
+        setup.purpose = Purpose::FaceTime;
+        setup.device_helper = apple::default_device_helper(root);
         setup
     }
 
@@ -125,7 +142,7 @@ impl MacSetup {
 
     pub(super) fn show(&mut self, context: &egui::Context, root: &Path) -> Outcome {
         if self.poll() {
-            return if self.contacts_only {
+            return if self.purpose == Purpose::Contacts {
                 Outcome::ContactsAuthorized
             } else {
                 Outcome::Saved
@@ -140,10 +157,10 @@ impl MacSetup {
             .frame(chrome::sheet())
             .show(context, |ui| {
                 ui.set_width(404.);
-                let title = if self.contacts_only {
-                    "Authorize iCloud Contacts"
-                } else {
-                    "Set Up with a Mac"
+                let title = match self.purpose {
+                    Purpose::Messages => "Set Up with a Mac",
+                    Purpose::FaceTime => "Enable FaceTime",
+                    Purpose::Contacts => "Authorize iCloud Contacts",
                 };
                 ui.label(chrome::bold(title, 19.));
                 ui.add_space(7.);
@@ -241,11 +258,11 @@ impl MacSetup {
     }
 
     fn form(&mut self, ui: &mut Ui) -> (&'static str, bool) {
-        if self.contacts_only {
+        if self.purpose == Purpose::Contacts {
             ui.label(
                 RichText::new("Sign in with the Apple Account you use for iCloud.").color(MUTED),
             );
-        } else {
+        } else if self.device_helper.is_none() {
             ui.label(
                 RichText::new(
                     "Enable Remote Login on your Mac. iMessage installs its setup helper over SSH.",
@@ -267,6 +284,10 @@ impl MacSetup {
                 true,
             );
             ui.add_space(5.);
+        } else {
+            ui.label(
+                RichText::new("Register FaceTime using the local device helper.").color(MUTED),
+            );
         }
         edit(
             ui,
@@ -286,14 +307,15 @@ impl MacSetup {
             "Remember Apple Account password",
         );
         let mac_ready = !self.host.trim().is_empty() && self.mac_password.len() <= 1023;
-        let ready = (self.contacts_only || mac_ready)
-            && !self.account.trim().is_empty()
-            && (saved || !self.password.is_empty());
+        let ready =
+            (self.purpose == Purpose::Contacts || self.device_helper.is_some() || mac_ready)
+                && !self.account.trim().is_empty()
+                && (saved || !self.password.is_empty());
         (
-            if self.contacts_only {
-                "Authorize"
-            } else {
-                "Connect"
+            match self.purpose {
+                Purpose::Messages => "Connect",
+                Purpose::FaceTime => "Enable FaceTime",
+                Purpose::Contacts => "Authorize",
             },
             ready,
         )
@@ -304,8 +326,12 @@ impl MacSetup {
         match std::mem::replace(&mut self.step, Step::Working("Contacting Apple…")) {
             Step::Form => {
                 let request = Request {
-                    setup: (!self.contacts_only).then(|| AutomaticSetup {
-                        connection: DeviceConnection::MacOverSsh(self.host.trim().to_owned()),
+                    purpose: self.purpose,
+                    setup: (self.purpose != Purpose::Contacts).then(|| AutomaticSetup {
+                        connection: match &self.device_helper {
+                            Some(path) => DeviceConnection::OnDeviceHelper(path.clone()),
+                            None => DeviceConnection::MacOverSsh(self.host.trim().to_owned()),
+                        },
                         opencore_config: None,
                         address: String::new(),
                     }),
@@ -314,7 +340,7 @@ impl MacSetup {
                     mac_password: std::mem::take(&mut self.mac_password),
                     remember_password: self.remember_password,
                 };
-                if !self.contacts_only {
+                if self.purpose != Purpose::Contacts && self.device_helper.is_none() {
                     self.step = Step::Working("Connecting to the Mac…");
                 }
                 self.worker = Some(Worker::start(context, root.to_owned(), request));
@@ -404,7 +430,7 @@ impl MacSetup {
 }
 
 impl Worker {
-    fn start(context: &egui::Context, root: PathBuf, request: Request) -> Self {
+    fn start(context: &egui::Context, root: PathBuf, mut request: Request) -> Self {
         let (send, events) = mpsc::channel();
         let (cancel, canceled) = oneshot::channel();
         let context = context.clone();
@@ -412,18 +438,10 @@ impl Worker {
             let mut prompts = GuiPrompts {
                 send,
                 context,
-                mac_password: request.mac_password,
+                mac_password: std::mem::take(&mut request.mac_password),
                 contacts_grant: None,
             };
-            let result = run(
-                &root,
-                request.setup,
-                &request.account,
-                request.password,
-                request.remember_password,
-                &mut prompts,
-                canceled,
-            );
+            let result = run(&root, request, &mut prompts, canceled);
             let _ = prompts.emit(Event::Finished(result));
         });
         Self {
@@ -435,15 +453,21 @@ impl Worker {
 
 fn run(
     root: &Path,
-    setup: Option<AutomaticSetup>,
-    account: &str,
-    mut password: Zeroizing<String>,
-    remember_password: bool,
+    request: Request,
     prompts: &mut GuiPrompts,
     mut canceled: oneshot::Receiver<()>,
 ) -> Result<()> {
+    let Request {
+        purpose,
+        setup,
+        account,
+        mut password,
+        remember_password,
+        ..
+    } = request;
+    let account = account.as_str();
     storage::check_desktop_session_storage(root)?;
-    let current = if setup.is_none() || password.is_empty() {
+    let current = if purpose != Purpose::Messages || password.is_empty() {
         storage::load_local_session(root)?
     } else {
         None
@@ -473,17 +497,26 @@ fn run(
             _ = &mut canceled => anyhow::bail!("Apple account setup canceled"),
             result = async {
                 if let Some(setup) = setup {
-                    let session = setup.sign_in(root, account, password, prompts).await?;
+                    let session = if purpose == Purpose::FaceTime {
+                        let identity = current.as_ref().context("Sign in to iMessage to enable FaceTime")?;
+                        setup.enable_facetime(root, identity, account, password, prompts).await?
+                    } else {
+                        setup.sign_in(root, account, password, prompts).await?
+                    };
                     let identity = Identity::parse(&session)?;
-                    Ok((Some(session), identity, prompts.contacts_grant.take()))
+                    Ok((Some(session), Some(identity), prompts.contacts_grant.take()))
                 } else {
-                    let identity = current.context("Sign in to iMessage to authorize Contacts")?;
-                    let contacts = apple::authorize_icloud_contacts(root, &identity, account, password, prompts).await?;
-                    Ok((None, identity, Some(contacts)))
+                    let identity = current.as_ref().context("Sign in to iMessage to authorize Contacts")?;
+                    let contacts = apple::authorize_icloud_contacts(root, identity, account, password, prompts).await?;
+                    Ok((None, None, Some(contacts)))
                 }
             } => result,
         }
     })?;
+    let identity = identity
+        .as_ref()
+        .or(current.as_ref())
+        .context("Missing Apple session")?;
     let mut saved = storage::SavedAppleAccount {
         account: account.to_owned(),
         password: remembered,
@@ -501,14 +534,21 @@ fn run(
         })?;
         let result = (|| {
             if saved.contacts.is_none()
-                && let Some(previous) = storage::load_apple_account(root, &identity)?
+                && let Some(previous) = storage::load_apple_account(root, identity)?
                 && previous.account.eq_ignore_ascii_case(account)
             {
                 saved.contacts = previous.contacts;
             }
-            storage::save_apple_account(root, &identity, &saved)?;
+            storage::save_apple_account(root, identity, &saved)?;
             if let Some(session) = &session {
-                storage::save_session(root, session, None)?;
+                if purpose == Purpose::FaceTime {
+                    let previous = current
+                        .as_ref()
+                        .context("Missing saved iMessage identity")?;
+                    storage::save_facetime_upgrade(root, previous, session)?;
+                } else {
+                    storage::save_session(root, session, None)?;
+                }
             }
             Ok(())
         })();

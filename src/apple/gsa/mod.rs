@@ -77,7 +77,16 @@ pub async fn login_device_sms(
         plist::from_bytes(device_plist).context("Could not decode Apple device plist")?;
     device.validate()?;
     let mut anisette = Anisette::new(anisette_helper)?;
-    login(&mut device, &mut anisette, None, account, password, prompts).await
+    login(
+        &mut device,
+        &mut anisette,
+        None,
+        account,
+        password,
+        prompts,
+        None,
+    )
+    .await
 }
 
 pub(super) fn validate_login(account: &str, password: &str) -> Result<()> {
@@ -99,6 +108,7 @@ pub(super) async fn login(
     account: &str,
     password: Zeroizing<String>,
     prompts: &mut impl SmsPrompts,
+    existing: Option<&super::Identity>,
 ) -> Result<Zeroizing<Vec<u8>>> {
     let account = account.trim();
     validate_login(account, &password)?;
@@ -119,7 +129,15 @@ pub(super) async fn login(
         device.validation_data = proofs.qualification().await?;
         device.validate()?;
     }
-    let auth = super::ids_auth::authenticate(&client, device, account, &session, headers).await?;
+    let auth = super::ids_auth::authenticate(
+        &client,
+        device,
+        account,
+        &session,
+        headers,
+        existing.map(|identity| &identity.ids_key),
+    )
+    .await?;
     let fresh_proof_provider = match &proofs {
         Some(Proofs::Provider(provider)) => Some(*provider),
         _ => None,
@@ -127,8 +145,8 @@ pub(super) async fn login(
     if let Some(proofs) = proofs {
         device.validation_data = proofs.registration().await?;
     }
-    let registration = register(&client, device, auth, fresh_proof_provider).await?;
-    if prompts.request_icloud_contacts() {
+    let registration = register(&client, device, auth, fresh_proof_provider, existing).await?;
+    if existing.is_none() && prompts.request_icloud_contacts() {
         let grant = super::icloud_contacts::authorize(account, &session, anisette).await;
         prompts.received_icloud_contacts(grant);
     }

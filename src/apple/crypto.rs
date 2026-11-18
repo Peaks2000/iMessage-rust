@@ -34,6 +34,8 @@ const CTR_IV: [u8; 16] = 1u128.to_be_bytes();
 const RSA_PREFIX: usize = 100;
 const LEGACY_VERSION: u8 = 2;
 
+type PrivateKeyDer = Zeroizing<Vec<u8>>;
+
 pub(super) struct KeyPair<T> {
     signing: PKey<T>,
     encryption: PKey<T>,
@@ -84,6 +86,13 @@ impl KeyPair<Public> {
 }
 
 impl KeyPair<Private> {
+    pub(super) fn registration_keys(&self) -> Result<(PrivateKeyDer, PrivateKeyDer)> {
+        Ok((
+            Zeroizing::new(self.signing.private_key_to_der()?),
+            Zeroizing::new(self.encryption.private_key_to_der()?),
+        ))
+    }
+
     pub(super) fn public_der(&self) -> Result<Vec<u8>> {
         let fields = public_fields(&self.signing.ec_key()?, &self.encryption.rsa()?)?;
         Ok(encode_identity(fields))

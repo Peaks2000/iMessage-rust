@@ -112,7 +112,7 @@ impl Drop for Session {
 }
 
 impl Identity {
-    pub(crate) fn facetime_registered(&self) -> bool {
+    pub fn facetime_registered(&self) -> bool {
         self.ids_certificate(facetime::SIGNALING).is_some()
     }
 
@@ -125,6 +125,20 @@ impl Identity {
 
     pub fn handle(&self) -> &str {
         &self.handle
+    }
+
+    pub(crate) fn same_messaging_registration(&self, other: &Self) -> Result<bool> {
+        Ok(self.handle == other.handle
+            && self.token == other.token
+            && self.push_cert == other.push_cert
+            && self.ids_cert == other.ids_cert
+            && self.user_agent == other.user_agent
+            && self.protocol_version == other.protocol_version
+            && self.message_keys.public_der()? == other.message_keys.public_der()?)
+    }
+
+    pub(crate) fn same_facetime_registration(&self, other: &Self) -> bool {
+        self.facetime_certificates == other.facetime_certificates
     }
 
     pub fn parse(bytes: &[u8]) -> Result<Self> {

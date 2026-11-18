@@ -20,6 +20,7 @@ use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
 use super::{
+    Identity,
     aps::enroll_push_token,
     certified_rsa,
     gsa::{Anisette, SmsPrompts, login, validate_login},
@@ -61,12 +62,40 @@ impl AutomaticSetup {
         password: Zeroizing<String>,
         prompts: &mut impl SmsPrompts,
     ) -> Result<Zeroizing<Vec<u8>>> {
-        let handle = address(if self.address.trim().is_empty() {
-            account
-        } else {
-            &self.address
-        })
-        .context("Enter a registered iMessage email address or international phone number")?;
+        self.sign_in_for(root, account, password, prompts, None)
+            .await
+    }
+
+    /// Request FaceTime for the saved device and message keys.
+    pub async fn enable_facetime(
+        self,
+        root: &Path,
+        identity: &Identity,
+        account: &str,
+        password: Zeroizing<String>,
+        prompts: &mut impl SmsPrompts,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        self.sign_in_for(root, account, password, prompts, Some(identity))
+            .await
+    }
+
+    async fn sign_in_for(
+        self,
+        root: &Path,
+        account: &str,
+        password: Zeroizing<String>,
+        prompts: &mut impl SmsPrompts,
+        existing: Option<&Identity>,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        let handle = match existing {
+            Some(identity) => identity.handle.clone(),
+            None => address(if self.address.trim().is_empty() {
+                account
+            } else {
+                &self.address
+            })
+            .context("Enter a registered iMessage email address or international phone number")?,
+        };
         validate_login(account, &password)?;
         let use_local_adi = matches!(
             self.connection,
@@ -82,7 +111,7 @@ impl AutomaticSetup {
         };
         if let DeviceProvider::OnDevice(local) = &provider {
             return local
-                .sign_in(root, handle, account, password, prompts)
+                .sign_in(root, handle, account, password, prompts, existing)
                 .await;
         }
         let computer = provider.describe().await?;
@@ -121,7 +150,8 @@ impl AutomaticSetup {
         } else {
             Anisette::from_provider(provider.clone())
         };
-        let (push, token) = provision_push(root, &profile, &computer, &provider, None).await?;
+        let (push, token) =
+            device_push(root, &profile, &computer, &provider, None, existing).await?;
         let mut device = computer.registration(handle, token, &push);
         login(
             &mut device,
@@ -130,6 +160,7 @@ impl AutomaticSetup {
             account,
             password,
             prompts,
+            existing,
         )
         .await
     }
@@ -399,6 +430,7 @@ impl LocalDevice {
         account: &str,
         password: Zeroizing<String>,
         prompts: &mut impl SmsPrompts,
+        existing: Option<&Identity>,
     ) -> Result<Zeroizing<Vec<u8>>> {
         let profile = self.computer.profile();
         let _activation_lock = lock_profile(root, &profile)?;
@@ -406,8 +438,15 @@ impl LocalDevice {
         // Check account-independent provisioning before making an Apple activation request.
         let _ = adi.headers().await?;
         let provider = DeviceProvider::OnDevice(self.clone());
-        let (push, token) =
-            provision_push(root, &profile, &self.computer, &provider, self.push.clone()).await?;
+        let (push, token) = device_push(
+            root,
+            &profile,
+            &self.computer,
+            &provider,
+            self.push.clone(),
+            existing,
+        )
+        .await?;
         let mut device = self.computer.registration(handle, token, &push);
         let mut anisette = Anisette::from_local(adi);
         login(
@@ -420,6 +459,7 @@ impl LocalDevice {
             account,
             password,
             prompts,
+            existing,
         )
         .await
     }
@@ -600,6 +640,26 @@ pub(super) fn lock_profile(root: &Path, profile: &str) -> Result<std::fs::File> 
     fs2::FileExt::try_lock_exclusive(&lock)
         .context("Device setup is already running for this Apple identity")?;
     Ok(lock)
+}
+
+async fn device_push(
+    root: &Path,
+    profile: &str,
+    computer: &Computer,
+    provider: &DeviceProvider,
+    imported: Option<PushActivation>,
+    existing: Option<&Identity>,
+) -> Result<(PushActivation, [u8; 32])> {
+    if let Some(identity) = existing {
+        let push = PushActivation {
+            certificate: Data::new(identity.push_cert.clone()),
+            key: Data::new(identity.push_key.private_key_to_der()?),
+            token: Some(Data::new(identity.token.to_vec())),
+        };
+        Ok((push, identity.token))
+    } else {
+        provision_push(root, profile, computer, provider, imported).await
+    }
 }
 
 async fn provision_push(
