@@ -1,6 +1,7 @@
 use std::{collections::HashMap, future::Future, process::Stdio, time::Duration};
 
 use anyhow::Result;
+use futures_util::StreamExt;
 use linux_imessage::{CallMode, IncomingCall, display_address, now_ms};
 use tokio::{
     process::Command,
@@ -13,6 +14,41 @@ use zbus::zvariant::Value;
 
 const RING_INTERVAL: Duration = Duration::from_secs(3);
 const DESKTOP_TIMEOUT: Duration = Duration::from_secs(2);
+const NOTIFICATIONS: &str = "org.freedesktop.Notifications";
+const NOTIFICATION_PATH: &str = "/org/freedesktop/Notifications";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RingAction {
+    Open,
+    Answer(CallMode),
+    Decline,
+}
+
+fn notification_actions(mode: Option<CallMode>, can_answer: bool) -> &'static [&'static str] {
+    if !can_answer {
+        &["default", "Open iMessage", "decline", "Decline"]
+    } else if mode == Some(CallMode::Video) {
+        &[
+            "default",
+            "Open iMessage",
+            "answer-video",
+            "Answer Video",
+            "answer-audio",
+            "Answer as Audio",
+            "decline",
+            "Decline",
+        ]
+    } else {
+        &[
+            "default",
+            "Open iMessage",
+            "answer-audio",
+            "Answer",
+            "decline",
+            "Decline",
+        ]
+    }
+}
 
 /// An answer, decline, or outgoing call currently owns the desktop's call controls.
 pub(super) struct RingPause {
@@ -50,14 +86,18 @@ impl Drop for RingPause {
 }
 
 pub(super) struct RingAlert {
-    pub(super) id: Uuid,
+    pub(super) call: (Uuid, Option<CallMode>),
     stop: watch::Sender<()>,
     task: JoinHandle<()>,
 }
 
 impl RingAlert {
-    pub(super) fn start(call: IncomingCall) -> Self {
-        let id = call.id;
+    pub(super) fn start(
+        call: IncomingCall,
+        can_answer: bool,
+        invoked: impl Fn(RingAction, Option<String>) + Send + 'static,
+    ) -> Self {
+        let announced = (call.id, call.mode);
         let (stop, cancel) = watch::channel(());
         let task = tokio::spawn(async move {
             let remaining = call.expires_ms.saturating_sub(now_ms());
@@ -77,11 +117,15 @@ impl RingAlert {
                 }
             };
             let notification = async {
-                let _ = notify(call, cancel.clone(), use_system_sound).await;
+                let _ = notify(call, cancel.clone(), use_system_sound, can_answer, invoked).await;
             };
             tokio::join!(player, notification);
         });
-        Self { id, stop, task }
+        Self {
+            call: announced,
+            stop,
+            task,
+        }
     }
 
     pub(super) async fn stop(self) {
@@ -132,35 +176,23 @@ async fn repeat_sound(
     }
 }
 
-#[zbus::proxy(
-    interface = "org.freedesktop.Notifications",
-    default_service = "org.freedesktop.Notifications",
-    default_path = "/org/freedesktop/Notifications"
-)]
-trait Notifications {
-    #[allow(clippy::too_many_arguments)] // Fields of the freedesktop Notify method.
-    fn notify(
-        &self,
-        app_name: &str,
-        replaces_id: u32,
-        app_icon: &str,
-        summary: &str,
-        body: &str,
-        actions: &[&str],
-        hints: HashMap<&str, Value<'_>>,
-        expire_timeout: i32,
-    ) -> zbus::Result<u32>;
-
-    fn close_notification(&self, id: u32) -> zbus::Result<()>;
-}
-
 async fn notify(
     call: IncomingCall,
     cancel: watch::Receiver<()>,
     use_system_sound: bool,
+    can_answer: bool,
+    invoked: impl Fn(RingAction, Option<String>),
 ) -> Result<()> {
     let connection = timeout(DESKTOP_TIMEOUT, zbus::Connection::session()).await??;
-    notify_on(&connection, call, cancel, use_system_sound).await
+    notify_on(
+        &connection,
+        call,
+        cancel,
+        use_system_sound,
+        can_answer,
+        invoked,
+    )
+    .await
 }
 
 async fn notify_on(
@@ -168,8 +200,16 @@ async fn notify_on(
     call: IncomingCall,
     mut cancel: watch::Receiver<()>,
     use_system_sound: bool,
+    can_answer: bool,
+    invoked: impl Fn(RingAction, Option<String>),
 ) -> Result<()> {
-    let proxy = timeout(DESKTOP_TIMEOUT, NotificationsProxy::new(connection)).await??;
+    let proxy = timeout(
+        DESKTOP_TIMEOUT,
+        zbus::Proxy::new(connection, NOTIFICATIONS, NOTIFICATION_PATH, NOTIFICATIONS),
+    )
+    .await??;
+    // Subscribe before posting and preserve the order of activation tokens and actions.
+    let mut signals = timeout(DESKTOP_TIMEOUT, proxy.receive_all_signals()).await??;
     let remaining = call.expires_ms.saturating_sub(now_ms());
     if remaining <= 0 || cancel.has_changed().is_err() {
         return Ok(());
@@ -194,26 +234,89 @@ async fn notify_on(
         hints.insert("suppress-sound", Value::from(true));
     }
     let caller = display_address(&call.caller);
-    let id = timeout(
+    let actions = notification_actions(call.mode, can_answer);
+    let response = timeout(
         DESKTOP_TIMEOUT,
-        proxy.notify(
-            "iMessage",
-            0,
-            "camera-video",
-            &format!("{title} · {caller}"),
-            "",
-            &[],
-            hints,
-            i32::try_from(remaining)?,
+        proxy.call_method(
+            "Notify",
+            &(
+                "iMessage",
+                0u32,
+                "camera-video",
+                format!("{title} · {caller}"),
+                "",
+                actions,
+                hints,
+                i32::try_from(remaining)?,
+            ),
         ),
     )
     .await??;
-    tokio::select! {
-        biased;
-        _ = cancel.changed() => (),
-        () = tokio::time::sleep_until(expiry) => (),
+    let id: u32 = response.body().deserialize()?;
+    let reply_header = response.header();
+    let owner = reply_header
+        .sender()
+        .ok_or_else(|| anyhow::anyhow!("Missing desktop notification sender"))?;
+    let mut token = None;
+    loop {
+        let message = tokio::select! {
+            biased;
+            _ = cancel.changed() => break,
+            () = tokio::time::sleep_until(expiry) => break,
+            Some(message) = signals.next() => message,
+        };
+        let header = message.header();
+        if header.sender() != Some(owner) {
+            continue;
+        }
+        let body = message.body();
+        match header.member().map(|member| member.as_str()) {
+            Some("ActivationToken") => {
+                if let Ok((target, value)) = body.deserialize::<(u32, &str)>()
+                    && target == id
+                    && !value.is_empty()
+                    && value.len() <= 4096
+                {
+                    token = Some(value.to_owned());
+                }
+            }
+            Some("ActionInvoked") => {
+                let Ok((target, key)) = body.deserialize::<(u32, &str)>() else {
+                    continue;
+                };
+                if target != id || !actions.as_chunks::<2>().0.iter().any(|pair| pair[0] == key) {
+                    continue;
+                }
+                let action = match key {
+                    "default" => RingAction::Open,
+                    "answer-audio" => RingAction::Answer(CallMode::Audio),
+                    "answer-video" => RingAction::Answer(CallMode::Video),
+                    "decline" => RingAction::Decline,
+                    _ => continue,
+                };
+                invoked(action, token.take());
+            }
+            Some("NotificationClosed")
+                if body
+                    .deserialize::<(u32, u32)>()
+                    .is_ok_and(|(target, _)| target == id) =>
+            {
+                return Ok(());
+            }
+            _ => (),
+        }
     }
-    let _ = timeout(DESKTOP_TIMEOUT, proxy.close_notification(id)).await;
+    let _ = timeout(
+        DESKTOP_TIMEOUT,
+        connection.call_method(
+            Some(owner.as_str()),
+            NOTIFICATION_PATH,
+            Some(NOTIFICATIONS),
+            "CloseNotification",
+            &(id,),
+        ),
+    )
+    .await;
     Ok(())
 }
 
@@ -244,7 +347,11 @@ mod tests {
     }
 
     enum DesktopEvent {
-        Incoming { title: String, timeout_ms: i32 },
+        Incoming {
+            title: String,
+            timeout_ms: i32,
+            actions: Vec<String>,
+        },
         Closed(u32),
     }
 
@@ -264,7 +371,6 @@ mod tests {
             hints: HashMap<String, zbus::zvariant::OwnedValue>,
             expire_timeout: i32,
         ) -> u32 {
-            assert!(actions.is_empty());
             assert_eq!(
                 hints
                     .get("suppress-sound")
@@ -274,6 +380,7 @@ mod tests {
             let _ = self.0.send(DesktopEvent::Incoming {
                 title: summary.to_owned(),
                 timeout_ms: expire_timeout,
+                actions,
             });
             71
         }
@@ -281,11 +388,25 @@ mod tests {
         async fn close_notification(&self, id: u32) {
             let _ = self.0.send(DesktopEvent::Closed(id));
         }
+
+        #[zbus(signal)]
+        async fn activation_token(
+            context: &zbus::SignalContext<'_>,
+            id: u32,
+            token: &str,
+        ) -> zbus::Result<()>;
+
+        #[zbus(signal)]
+        async fn action_invoked(
+            context: &zbus::SignalContext<'_>,
+            id: u32,
+            key: &str,
+        ) -> zbus::Result<()>;
     }
 
     #[tokio::test]
     #[ignore = "Uses dbus-daemon to verify desktop notifications on a private session bus"]
-    async fn ringing_posts_and_withdraws_the_announcement_on_the_desktop_bus() -> Result<()> {
+    async fn desktop_bus_routes_ring_actions_and_withdraws_the_announcement() -> Result<()> {
         let mut bus = Command::new("dbus-daemon")
             .args(["--session", "--nofork", "--print-address=1"])
             .stdin(Stdio::null())
@@ -307,6 +428,12 @@ mod tests {
             .build()
             .await?;
         let client = zbus::connection::Builder::address(address)?.build().await?;
+        let outsider = zbus::connection::Builder::address(address)?.build().await?;
+        let path = "/org/freedesktop/Notifications";
+        let interface = service
+            .object_server()
+            .interface::<_, NotificationDaemon>(path)
+            .await?;
         let received_ms = now_ms();
         let call = IncomingCall {
             id: Uuid::new_v4(),
@@ -316,12 +443,57 @@ mod tests {
             expires_ms: received_ms + 45_000,
         };
         let (stop, cancel) = watch::channel(());
+        let (invoked, mut actions_received) = mpsc::unbounded_channel();
         let desktop = async move {
-            let Some(DesktopEvent::Incoming { title, timeout_ms }) = events.recv().await else {
+            let Some(DesktopEvent::Incoming {
+                title,
+                timeout_ms,
+                actions,
+            }) = events.recv().await
+            else {
                 anyhow::bail!("Expected an incoming call notification");
             };
             assert_eq!(title, "FaceTime Video · caller@example.org");
             assert!((1..=45_000).contains(&timeout_ms));
+            assert_eq!(
+                actions,
+                [
+                    "default",
+                    "Open iMessage",
+                    "answer-video",
+                    "Answer Video",
+                    "answer-audio",
+                    "Answer as Audio",
+                    "decline",
+                    "Decline"
+                ]
+            );
+            let signals = interface.signal_context();
+            NotificationDaemon::action_invoked(
+                &zbus::SignalContext::new(&outsider, path)?,
+                71,
+                "answer-video",
+            )
+            .await?;
+            NotificationDaemon::action_invoked(signals, 70, "decline").await?;
+            NotificationDaemon::action_invoked(signals, 71, "invalid-action").await?;
+            NotificationDaemon::activation_token(signals, 71, "open-token").await?;
+            NotificationDaemon::activation_token(signals, 70, "unrelated-token").await?;
+            NotificationDaemon::action_invoked(signals, 71, "default").await?;
+            assert_eq!(
+                actions_received.recv().await,
+                Some((RingAction::Open, Some("open-token".into())))
+            );
+            NotificationDaemon::action_invoked(signals, 71, "answer-audio").await?;
+            assert_eq!(
+                actions_received.recv().await,
+                Some((RingAction::Answer(CallMode::Audio), None))
+            );
+            NotificationDaemon::action_invoked(signals, 71, "decline").await?;
+            assert_eq!(
+                actions_received.recv().await,
+                Some((RingAction::Decline, None))
+            );
             drop(stop);
             assert!(matches!(
                 events.recv().await,
@@ -330,7 +502,12 @@ mod tests {
             Ok(())
         };
         timeout(Duration::from_secs(5), async {
-            tokio::try_join!(notify_on(&client, call, cancel, false), desktop)
+            tokio::try_join!(
+                notify_on(&client, call, cancel, false, true, |action, token| {
+                    let _ = invoked.send((action, token));
+                }),
+                desktop
+            )
         })
         .await??;
         drop(service);

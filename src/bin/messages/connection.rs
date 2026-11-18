@@ -28,7 +28,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use super::attachments::{AttachmentId, Contents, Purpose};
-use super::ringing::{RingAlert, RingPause};
+use super::ringing::{RingAction, RingAlert, RingPause};
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -153,6 +153,11 @@ pub enum Event {
         result: Result<()>,
     },
     IncomingCalls(Vec<IncomingCall>),
+    IncomingCallAction {
+        id: Uuid,
+        action: RingAction,
+        token: Option<String>,
+    },
     ConversationDeleted {
         chat: String,
         result: Result<()>,
@@ -433,6 +438,7 @@ async fn watch_calls(
     mut activity: watch::Receiver<Option<Uuid>>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
+    let can_answer = matches!(backend.as_ref(), Backend::Local(_));
     let mut status_changes = match backend.as_ref() {
         Backend::Local(engine) => Some(engine.watch_status()),
         Backend::Remote(_) => None,
@@ -466,14 +472,27 @@ async fn watch_calls(
         } else {
             None
         };
-        if alert.as_ref().map(|handle| handle.id) != ring.map(|call| call.id) {
+        if alert.as_ref().map(|handle| handle.call) != ring.map(|call| (call.id, call.mode)) {
             if let Some(active) = alert.take() {
                 active.stop().await;
             }
             if let Some(call) =
                 ring.filter(|call| call.expires_ms > now_ms() && activity.borrow().is_none())
             {
-                alert = Some(RingAlert::start(call.clone()));
+                let id = call.id;
+                let events = events.clone();
+                let context = context.clone();
+                alert = Some(RingAlert::start(
+                    call.clone(),
+                    can_answer,
+                    move |action, token| {
+                        emit(
+                            &events,
+                            &context,
+                            Event::IncomingCallAction { id, action, token },
+                        );
+                    },
+                ));
             }
         }
         let expiry = previous.iter().map(|call| call.expires_ms).min();

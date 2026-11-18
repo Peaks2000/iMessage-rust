@@ -1,7 +1,7 @@
 use std::{os::fd::OwnedFd, time::Duration};
 
 use anyhow::{Context, Result, ensure};
-use raw_window_handle::WaylandDisplayHandle;
+use raw_window_handle::{RawWindowHandle, WaylandDisplayHandle, WindowHandle};
 use smithay_client_toolkit::{
     data_device_manager::{
         DataDeviceManagerState,
@@ -10,15 +10,16 @@ use smithay_client_toolkit::{
     },
     delegate_registry, delegate_seat,
     globals::GlobalData,
+    reexports::protocols::xdg::activation::v1::client::xdg_activation_v1::XdgActivationV1,
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{Capability, SeatHandler, SeatState},
 };
 use tokio::io::AsyncReadExt;
 use wayland_client::{
-    Connection, EventQueue, QueueHandle,
-    backend::Backend,
-    delegate_dispatch,
+    Connection, EventQueue, Proxy, QueueHandle,
+    backend::{Backend, ObjectId},
+    delegate_dispatch, delegate_noop,
     globals::registry_queue_init,
     protocol::{
         wl_data_device::WlDataDevice,
@@ -36,6 +37,7 @@ pub(super) struct Clipboard {
     connection: Connection,
     queue: EventQueue<Selection>,
     selection: Selection,
+    activation: Option<XdgActivationV1>,
 }
 
 struct Selection {
@@ -54,6 +56,7 @@ impl Clipboard {
         let connection = Connection::from_backend(backend);
         let (globals, mut queue) = registry_queue_init(&connection)?;
         let handle = queue.handle();
+        let activation = globals.bind(&handle, 1..=1, ()).ok();
         let mut selection = Selection {
             registry: RegistryState::new(&globals),
             seats: SeatState::new(&globals, &handle),
@@ -67,7 +70,24 @@ impl Clipboard {
             connection,
             queue,
             selection,
+            activation,
         })
+    }
+
+    pub(super) fn activate_window(&self, window: WindowHandle<'_>, token: String) -> Result<()> {
+        if let (Some(activation), RawWindowHandle::Wayland(window)) =
+            (&self.activation, window.as_raw())
+        {
+            // Eframe borrows the current window. Its surface belongs to the same display
+            // as our event queue and is used only for the synchronous activation request.
+            let id = unsafe {
+                ObjectId::from_ptr(WlSurface::interface(), window.surface.as_ptr().cast())
+            }?;
+            let surface = WlSurface::from_id(&self.connection, id)?;
+            activation.activate(token, &surface);
+            self.connection.flush()?;
+        }
+        Ok(())
     }
 
     pub(super) fn receive(&mut self, accepted: &[&str]) -> Result<Option<OwnedFd>> {
@@ -213,6 +233,7 @@ impl DataOfferHandler for Selection {
 
 delegate_registry!(Selection);
 delegate_seat!(Selection);
+delegate_noop!(Selection: XdgActivationV1);
 delegate_dispatch!(Selection: [WlDataDeviceManager: GlobalData] => DataDeviceManagerState);
 delegate_dispatch!(Selection: [WlDataDevice: DataDeviceData] => DataDeviceManagerState);
 delegate_dispatch!(Selection: [WlDataOffer: DataOfferData] => DataDeviceManagerState);

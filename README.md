@@ -27,7 +27,7 @@ The desktop opens a registered iMessage session from Linux Secret Service and co
 
 The engine supports one-to-one text and attachments with devices that accept the legacy iMessage format. A message can contain up to eight attachments and 32 MiB of attachment data. **Sent** indicates that Apple’s courier accepted the send.
 
-With a local Apple session registered for FaceTime, open the camera menu beside a conversation to place a **FaceTime Audio** or **FaceTime Video** call. Incoming calls appear in a call card and trigger a desktop notification. If `canberra-gtk-play` is available, iMessage repeats the desktop sound theme's incoming-call tone until you respond or the call ends. For a video ring, choose **Answer Video** or **Answer as Audio**. During a video call, **Camera Off** stops local capture. FaceTime audio uses the PulseAudio-compatible `parec` and `pacat` tools. Video uses a V4L2 camera and FFmpeg with `libx265`.
+With a local Apple session registered for FaceTime, open the camera menu beside a conversation to place a **FaceTime Audio** or **FaceTime Video** call. You can answer or decline an incoming call from the app or from a desktop notification that supports actions. For a video ring, choose **Answer Video** or **Answer as Audio**. If `canberra-gtk-play` is available, iMessage repeats the desktop sound theme's incoming-call tone until you respond or the call ends. During a video call, **Camera Off** stops local capture. FaceTime audio uses the PulseAudio-compatible `parec` and `pacat` tools. Video uses a V4L2 camera and FFmpeg with `libx265`.
 
 ## Sync iCloud Contacts
 

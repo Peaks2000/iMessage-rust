@@ -26,6 +26,7 @@ use super::{
     contacts::Contacts,
     links::MessageText,
     mac_setup::{MacSetup, Outcome as MacOutcome},
+    ringing::RingAction,
     session_import::{Outcome as ImportOutcome, SessionImport},
 };
 
@@ -81,6 +82,7 @@ pub struct MessagesApp {
     active_call: Option<DesktopCall>,
     declining_call: Option<Uuid>,
     call_error: Option<(Uuid, String)>,
+    call_activation: Option<String>,
 }
 
 struct DesktopCall {
@@ -183,6 +185,7 @@ impl MessagesApp {
             active_call: None,
             declining_call: None,
             call_error: None,
+            call_activation: None,
         }
     }
 
@@ -370,6 +373,13 @@ impl MessagesApp {
                     self.refresh_at = Instant::now();
                 }
                 Event::IncomingCalls(calls) => self.incoming_calls = calls,
+                Event::IncomingCallAction { id, action, token } => {
+                    if self.respond_to_ring(id, action) && action != RingAction::Decline {
+                        self.call_activation = token;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
+                }
                 Event::CallConnected { id, mode } => {
                     if let Some(call) = &mut self.active_call
                         && call.id == id
@@ -1752,11 +1762,7 @@ impl MessagesApp {
             None => ("FaceTime", Icon::Video),
         };
         ctx.request_repaint_after(Duration::from_millis((call.expires_ms - now) as u64));
-        let can_answer = self.config.mode == Mode::Local
-            && self
-                .status
-                .as_ref()
-                .is_some_and(|status| status.connected && status.facetime_registered);
+        let can_answer = self.config.mode == Mode::Local;
         let show_video = can_answer && call.mode == Some(CallMode::Video);
         let width = if show_video { 340. } else { 245. };
         let available = self.declining_call.is_none() && self.connection.is_some();
@@ -1796,33 +1802,59 @@ impl MessagesApp {
                     .clicked();
             });
         });
-        let Some(connection) = &self.connection else {
-            return;
-        };
         if let Some(mode) = accept {
-            match connection.answer_call(call.id, mode) {
-                Ok(controls) => {
-                    self.active_call = Some(DesktopCall {
-                        id: call.id,
-                        peer: call.caller,
-                        outgoing: false,
-                        connected_at: None,
-                        controls,
-                        video_texture: None,
-                    });
-                    self.call_error = None;
-                }
-                Err(error) => self.call_error = Some((call.id, error.to_string())),
-            }
+            self.respond_to_ring(call.id, RingAction::Answer(mode));
         } else if decline {
-            match connection.decline_call(call.id) {
+            self.respond_to_ring(call.id, RingAction::Decline);
+        }
+    }
+
+    fn respond_to_ring(&mut self, id: Uuid, action: RingAction) -> bool {
+        if self.active_call.is_some() || self.declining_call.is_some() {
+            return false;
+        }
+        let Some(connection) = &self.connection else {
+            return false;
+        };
+        let Some(call) = self
+            .incoming_calls
+            .iter()
+            .find(|call| call.id == id && call.expires_ms > now_ms())
+        else {
+            return false;
+        };
+        match action {
+            RingAction::Open => (),
+            RingAction::Answer(mode) => {
+                if self.config.mode != Mode::Local
+                    || (mode == CallMode::Video && call.mode != Some(CallMode::Video))
+                {
+                    return false;
+                }
+                match connection.answer_call(id, mode) {
+                    Ok(controls) => {
+                        self.active_call = Some(DesktopCall {
+                            id,
+                            peer: call.caller.clone(),
+                            outgoing: false,
+                            connected_at: None,
+                            controls,
+                            video_texture: None,
+                        });
+                        self.call_error = None;
+                    }
+                    Err(error) => self.call_error = Some((id, error.to_string())),
+                }
+            }
+            RingAction::Decline => match connection.decline_call(id) {
                 Ok(()) => {
-                    self.declining_call = Some(call.id);
+                    self.declining_call = Some(id);
                     self.call_error = None;
                 }
-                Err(error) => self.call_error = Some((call.id, error.to_string())),
-            }
+                Err(error) => self.call_error = Some((id, error.to_string())),
+            },
         }
+        true
     }
 
     fn start_outgoing_call(&mut self, peer: &str, mode: CallMode) {
@@ -2164,8 +2196,11 @@ impl eframe::App for MessagesApp {
         [0., 0., 0., 0.]
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.process(ctx);
+        if let Some(token) = self.call_activation.take() {
+            self.clipboard.activate_window(frame, token);
+        }
         let paste = self.clipboard.take_paste_request(ctx);
         if self.settings.is_none()
             && self.delete_conversation.is_none()
@@ -2943,12 +2978,17 @@ mod tests {
             (CallMode::Video, CallMode::Video, "Answer Video"),
             (CallMode::Video, CallMode::Audio, "Answer as Audio"),
         ] {
-            exercise_call(offered, answer, label)?;
+            exercise_call(offered, answer, Some(label))?;
+            exercise_call(offered, answer, None)?;
         }
         Ok(())
     }
 
-    fn exercise_call(offered: CallMode, answer: CallMode, label: &str) -> anyhow::Result<()> {
+    fn exercise_call(
+        offered: CallMode,
+        answer: CallMode,
+        label: Option<&str>,
+    ) -> anyhow::Result<()> {
         let ctx = egui::Context::default();
         let root = tempfile::tempdir()?;
         // Bypass starting a real session. All incoming status and action events use test channels.
@@ -2987,7 +3027,36 @@ mod tests {
                 },
             )
         };
-        click(&mut frame, label);
+        if let Some(label) = label {
+            click(&mut frame, label);
+        } else {
+            report.send(Event::IncomingCallAction {
+                id: Uuid::new_v4(),
+                action: RingAction::Answer(CallMode::Audio),
+                token: None,
+            })?;
+            frame(Vec::new());
+            assert!(actions.try_recv().is_err());
+            report.send(Event::IncomingCallAction {
+                id,
+                action: RingAction::Open,
+                token: Some("open-token".into()),
+            })?;
+            let output = frame(Vec::new());
+            assert!(
+                output.viewport_output[&egui::ViewportId::ROOT]
+                    .commands
+                    .iter()
+                    .any(|cmd| matches!(cmd, egui::ViewportCommand::Focus))
+            );
+            assert!(actions.try_recv().is_err());
+            report.send(Event::IncomingCallAction {
+                id,
+                action: RingAction::Answer(answer),
+                token: Some("answer-token".into()),
+            })?;
+            frame(Vec::new());
+        }
         let Action::StartCall {
             id: accepted,
             start: super::super::connection::CallStart::Answer,

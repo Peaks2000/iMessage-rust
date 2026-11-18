@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use eframe::{CreationContext, EframeWinitApplication, NativeOptions, UserEvent, egui};
-use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle};
 use winit::{
     application::ApplicationHandler,
     event::{DeviceEvent, DeviceId, ElementState, KeyEvent, StartCause, WindowEvent},
@@ -33,6 +33,14 @@ impl Clipboard {
             requested: Cell::new(false),
             wayland: RefCell::new(None),
         })
+    }
+
+    pub(super) fn activate_window(&self, frame: &eframe::Frame, token: String) {
+        if let Some(wayland) = &*self.wayland.borrow()
+            && let Ok(window) = frame.window_handle()
+        {
+            let _ = wayland.activate_window(window, token);
+        }
     }
 
     pub(super) fn restore_wayland_text_paste(&self, input: &mut egui::RawInput) {
