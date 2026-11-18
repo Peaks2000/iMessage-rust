@@ -65,13 +65,18 @@ pub(super) fn encode(event: &TapbackEvent, original: &Message, sender: &str) -> 
         TapbackKind::Question => (5, "Questioned", "a question mark"),
         TapbackKind::Emoji(emoji) => (6, emoji.as_str(), emoji.as_str()),
     };
-    let quoted = if (0..original.attachments.len())
-        .any(|index| original.attachment_part(index) == event.tapback.part)
-    {
-        "\u{fffc}"
+    // The locally displayed bubble can stand in for a part from an older message format.
+    let part = if original.has_part(event.tapback.part) {
+        event.tapback.part
     } else {
-        original.body.as_str()
+        original.first_part()
     };
+    let quoted =
+        if (0..original.attachments.len()).any(|index| original.attachment_part(index) == part) {
+            "\u{fffc}"
+        } else {
+            original.body.as_str()
+        };
     let mut summary = Vec::new();
     plist::to_writer_binary(
         &mut summary,

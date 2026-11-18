@@ -1900,13 +1900,16 @@ fn tapback_options(
     let current = message
         .tapbacks
         .iter()
-        .find(|reaction| reaction.outgoing && reaction.part == part);
-    let select = |reaction| {
+        .filter(|reaction| reaction.outgoing && tapback_on_part(message, part, reaction.part))
+        .min_by_key(|reaction| reaction.part != part);
+    let select = |kind: Option<TapbackKind>| {
         (
             id,
             SetTapback {
-                reaction,
-                part: Some(part),
+                reaction: kind.filter(|kind| {
+                    !current.is_some_and(|reaction| reaction.kind.matches_reaction(kind))
+                }),
+                part: Some(current.map_or(part, |reaction| reaction.part)),
             },
         )
     };
@@ -1931,31 +1934,66 @@ fn tapback_options(
                 .on_hover_text(label)
                 .clicked()
             {
-                *selection = Some(select((!selected).then_some(kind)));
+                *selection = Some(select(Some(kind)));
                 ui.close();
             }
         }
     });
-    ui.menu_button("Emoji…", |ui| {
-        ui.horizontal(|ui| {
-            for emoji in ["😂", "❤️", "🎉", "🔥", "😮", "🙌"] {
-                let kind = TapbackKind::Emoji(emoji.to_owned());
-                let selected =
-                    current.is_some_and(|reaction| reaction.kind.matches_reaction(&kind));
-                if ui
-                    .selectable_label(selected, RichText::new(emoji).size(17.))
-                    .clicked()
-                {
-                    *selection = Some(select((!selected).then_some(kind)));
-                    ui.close_kind(egui::UiKind::Menu);
+    let config = egui::containers::menu::MenuConfig::new()
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+    egui::containers::menu::SubMenuButton::new("Emoji…")
+        .config(config)
+        .ui(ui, |ui| {
+            ui.horizontal(|ui| {
+                for emoji in ["😂", "❤️", "🎉", "🔥", "😮", "🙌"] {
+                    let kind = TapbackKind::Emoji(emoji.to_owned());
+                    let selected =
+                        current.is_some_and(|reaction| reaction.kind.matches_reaction(&kind));
+                    if ui
+                        .selectable_label(selected, RichText::new(emoji).size(17.))
+                        .clicked()
+                    {
+                        *selection = Some(select(Some(kind)));
+                        ui.close_kind(egui::UiKind::Menu);
+                    }
                 }
+            });
+            if let Some(kind) = tapback_emoji_input(ui) {
+                *selection = Some(select(Some(kind)));
+                ui.close_kind(egui::UiKind::Menu);
             }
         });
-    });
     if current.is_some() && ui.button("Remove Tapback").clicked() {
         *selection = Some(select(None));
         ui.close();
     }
+}
+
+fn tapback_emoji_input(ui: &mut Ui) -> Option<TapbackKind> {
+    let id = ui.id().with("custom-emoji");
+    let mut value = ui.data_mut(|data| data.get_temp::<String>(id).unwrap_or_default());
+    let input = ui.add(
+        egui::TextEdit::singleline(&mut value)
+            .id(id)
+            .hint_text("Paste emoji or type :name:")
+            .desired_width(154.)
+            .char_limit(64),
+    );
+    let value_trimmed = value.trim();
+    let emoji = emojis::get(value_trimmed).or_else(|| {
+        let name = value_trimmed.strip_prefix(':')?;
+        emojis::get_by_shortcode(name.trim_end_matches(':'))
+    });
+    let confirm = ui.add_enabled(emoji.is_some(), egui::Button::new("Select Emoji"));
+    let enter = input.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+    if let Some(emoji) = emoji.filter(|_| confirm.clicked() || enter) {
+        ui.data_mut(|data| data.remove::<String>(id));
+        return Some(TapbackKind::Emoji(emoji.as_str().to_owned()));
+    }
+    if input.changed() {
+        ui.data_mut(|data| data.insert_temp(id, value));
+    }
+    None
 }
 
 fn has_tapbacks(message: &Message, part: u32) -> bool {

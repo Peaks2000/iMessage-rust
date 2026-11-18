@@ -291,6 +291,24 @@ async fn send_tapback(
         .history()?
         .get(&target.to_string())?
         .context("This message is unavailable")?;
+    let Some(event) = tapback_change(&message, target, request)? else {
+        return Ok(message.tapbacks);
+    };
+    let result = madrid.send_tapback(identity, &message, &event).await?;
+    ensure!(
+        result == Delivery::Accepted,
+        "Apple did not confirm the reaction"
+    );
+    let history = state.history()?;
+    record_tapback(&history, status, &event)?;
+    history.tapbacks(&message.id, &message.address)
+}
+
+fn tapback_change(
+    message: &Message,
+    target: uuid::Uuid,
+    request: SetTapback,
+) -> Result<Option<TapbackEvent>> {
     ensure!(
         matches!(message.status, Delivery::Received | Delivery::Accepted),
         "This message is awaiting delivery"
@@ -309,7 +327,7 @@ async fn send_tapback(
         .iter()
         .find(|tapback| tapback.outgoing && tapback.part == part);
     ensure!(
-        message.has_part(part) || (request.reaction.is_none() && previous.is_some()),
+        message.has_part(part) || previous.is_some(),
         "This part of the message is unavailable"
     );
     let unchanged = match (previous, &request.reaction) {
@@ -318,14 +336,14 @@ async fn send_tapback(
         _ => false,
     };
     if unchanged {
-        return Ok(message.tapbacks);
+        return Ok(None);
     }
     let removed = request.reaction.is_none();
     let kind = request
         .reaction
         .or_else(|| previous.map(|tapback| tapback.kind.clone()))
         .context("No tapback to remove")?;
-    let event = TapbackEvent {
+    Ok(Some(TapbackEvent {
         id: uuid::Uuid::new_v4(),
         target,
         chat: message.address.clone(),
@@ -336,15 +354,7 @@ async fn send_tapback(
             outgoing: true,
             part,
         },
-    };
-    let result = madrid.send_tapback(identity, &message, &event).await?;
-    ensure!(
-        result == Delivery::Accepted,
-        "Apple did not confirm the reaction"
-    );
-    let history = state.history()?;
-    record_tapback(&history, status, &event)?;
-    history.tapbacks(&message.id, &message.address)
+    }))
 }
 
 fn record_tapback(
@@ -460,6 +470,41 @@ async fn download(
 mod tests {
     use super::*;
     use crate::{Attachment, Upload};
+
+    #[test]
+    fn changes_existing_reactions_on_legacy_parts_without_creating_new_ones_there() -> Result<()> {
+        let id = uuid::Uuid::new_v4();
+        let mut message = Message {
+            id: id.to_string(),
+            address: "mailto:peer@example.org".into(),
+            body: "Hi".into(),
+            text_part: Some(1),
+            outgoing: false,
+            timestamp_ms: 0,
+            status: Delivery::Received,
+            attachments: Vec::new(),
+            tapbacks: vec![Tapback {
+                kind: TapbackKind::Like,
+                outgoing: true,
+                part: 0,
+            }],
+        };
+        let request = |reaction| SetTapback {
+            reaction,
+            part: Some(0),
+        };
+        let replacement = tapback_change(&message, id, request(Some(TapbackKind::Heart)))?
+            .context("Missing replacement")?;
+        assert_eq!(replacement.tapback.part, 0);
+        assert_eq!(replacement.tapback.kind, TapbackKind::Heart);
+        assert!(!replacement.removed);
+        let removal = tapback_change(&message, id, request(None))?.context("Missing removal")?;
+        assert_eq!(removal.tapback, message.tapbacks[0]);
+        assert!(removal.removed);
+        message.tapbacks[0].outgoing = false;
+        assert!(tapback_change(&message, id, request(Some(TapbackKind::Heart))).is_err());
+        Ok(())
+    }
 
     #[test]
     fn an_attachment_retry_preserves_the_message_and_its_original_bytes() -> Result<()> {
