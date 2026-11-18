@@ -42,6 +42,7 @@ pub(super) const JOIN_COMMAND: u64 = 207;
 pub(super) const LEAVE_COMMAND: u64 = 208;
 pub(super) const PREKEY_COMMAND: u64 = 210;
 pub(super) const KEY_MATERIAL_COMMAND: u64 = 211;
+pub(super) const RESPONDED_ELSEWHERE: u64 = 6;
 pub(super) const DECLINE: u64 = 9;
 pub(crate) const RING_TIMEOUT_MS: i64 = 45_000;
 
@@ -106,7 +107,12 @@ pub(crate) enum CallSignal {
         id: Uuid,
         sender: String,
         received_ms: i64,
-        endpoint: Option<CallEndpoint>,
+        endpoint: CallEndpoint,
+    },
+    RespondedElsewhere {
+        id: Uuid,
+        sender: String,
+        received_ms: i64,
     },
 }
 
@@ -114,7 +120,10 @@ impl CallSignal {
     pub(crate) fn id(&self) -> Uuid {
         match self {
             Self::Ring { call, .. } | Self::Accepted { call, .. } => call.id,
-            Self::Prekey { id, .. } | Self::MediaKeys { id, .. } | Self::End { id, .. } => *id,
+            Self::Prekey { id, .. }
+            | Self::MediaKeys { id, .. }
+            | Self::End { id, .. }
+            | Self::RespondedElsewhere { id, .. } => *id,
         }
     }
 }
@@ -129,6 +138,8 @@ struct ConversationSignal {
     participants: Vec<Participant>,
     #[prost(string, tag = "5")]
     group_id: String,
+    #[prost(uint32, tag = "7")]
+    disconnected_reason: u32,
     #[prost(message, repeated, tag = "19")]
     invitation_preferences: Vec<InvitationPreference>,
     #[prost(int32, optional, tag = "28")]
@@ -375,6 +386,16 @@ pub(super) fn decline(id: Uuid) -> Vec<u8> {
     .encode_to_vec()
 }
 
+pub(super) fn responded_elsewhere(id: Uuid) -> Vec<u8> {
+    ConversationSignal {
+        kind: RESPONDED_ELSEWHERE as i32,
+        group_id: id.to_string().to_ascii_uppercase(),
+        disconnected_reason: 4,
+        ..Default::default()
+    }
+    .encode_to_vec()
+}
+
 /// Interpret call signaling after IDS has authenticated and decrypted its sender.
 pub(crate) fn decode(
     command: u64,
@@ -406,7 +427,7 @@ pub(crate) fn decode(
     if command == INVITATION_COMMAND {
         let offer = ConversationSignal::decode(payload).ok()?;
         let id = Uuid::parse_str(&offer.group_id).ok()?;
-        return match offer.kind {
+        return match offer.kind as u64 {
             1 if sender != own && !offer.suppress_ui => Some(ring(
                 id,
                 sender,
@@ -414,17 +435,18 @@ pub(crate) fn decode(
                 CallEndpoint::new(push_token, None),
                 None,
             )),
-            6 if sender == own => Some(CallSignal::End {
+            RESPONDED_ELSEWHERE | DECLINE if sender == own => {
+                Some(CallSignal::RespondedElsewhere {
+                    id,
+                    sender,
+                    received_ms,
+                })
+            }
+            DECLINE => Some(CallSignal::End {
                 id,
                 sender,
                 received_ms,
-                endpoint: None,
-            }),
-            9 => Some(CallSignal::End {
-                id,
-                sender,
-                received_ms,
-                endpoint: Some(CallEndpoint::new(push_token, None)),
+                endpoint: CallEndpoint::new(push_token, None),
             }),
             _ => None,
         };
@@ -526,7 +548,7 @@ pub(crate) fn decode(
             id,
             sender,
             received_ms,
-            endpoint: Some(endpoint),
+            endpoint,
         }),
         _ => None,
     }
@@ -604,6 +626,45 @@ mod tests {
         assert!(parse(&offer, own, now).is_none());
         offer.suppress_ui = true;
         assert!(parse(&offer, peer, now).is_none());
+    }
+
+    #[test]
+    fn a_sibling_response_can_only_be_decoded_for_the_own_account() {
+        let time = now_ms();
+        let own = "mailto:own@example.org";
+        let id = Uuid::new_v4();
+        let payload = responded_elsewhere(id);
+        let wire = ConversationSignal::decode(payload.as_slice()).unwrap();
+        assert_eq!(wire.kind, RESPONDED_ELSEWHERE as i32);
+        assert_eq!(wire.disconnected_reason, 4);
+        for payload in [&payload, &decline(id)] {
+            assert!(matches!(
+                decode(INVITATION_COMMAND, payload, own.into(), own, [7; 32], time),
+                Some(CallSignal::RespondedElsewhere { id: received, .. }) if received == id
+            ));
+        }
+        assert!(
+            decode(
+                INVITATION_COMMAND,
+                &payload,
+                "mailto:peer@example.org".into(),
+                own,
+                [7; 32],
+                time
+            )
+            .is_none()
+        );
+        assert!(
+            decode(
+                INVITATION_COMMAND,
+                &payload,
+                own.into(),
+                own,
+                [7; 32],
+                time - RING_TIMEOUT_MS
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -704,7 +765,7 @@ mod tests {
         );
         assert!(
             matches!(parse(LEAVE_COMMAND, &context, wire.clone(), peer, own)?,
-            Some(CallSignal::End { id: call_id, endpoint: Some(endpoint), .. }) if call_id == id
+            Some(CallSignal::End { id: call_id, endpoint, .. }) if call_id == id
             && endpoint == CallEndpoint::new([7; 32], Some(-11_i64 as u64)))
         );
         wire.insert(

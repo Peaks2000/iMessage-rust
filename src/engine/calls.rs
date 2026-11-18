@@ -384,7 +384,7 @@ impl Engine {
         let lifetime = joined
             .await
             .context("The Apple engine stopped before joining FaceTime")??;
-        complete_media(
+        let call = complete_media(
             self,
             handshake,
             relay,
@@ -393,7 +393,9 @@ impl Engine {
             caller_participant,
             lifetime,
         )
-        .await
+        .await?;
+        let _ = self.requests.try_send(Request::NotifyAnswerElsewhere(id));
+        Ok(call)
     }
 
     async fn wait_for_caller_offer(&self, id: Uuid) -> Result<AnswerAttempt> {
@@ -873,16 +875,25 @@ mod tests {
             incoming.expire(status, call.expires_ms + 1);
         });
         incoming.update(&status, own, ring());
-        incoming.update(&status, own, end(None));
+        incoming.update(&status, own, end(CallEndpoint::new([2; 32], None)));
         incoming.update(
             &status,
             own,
-            end(Some(CallEndpoint::new([3; 32], endpoint.participant()))),
+            CallSignal::RespondedElsewhere {
+                id,
+                sender: own.into(),
+                received_ms: now + 1,
+            },
+        );
+        incoming.update(
+            &status,
+            own,
+            end(CallEndpoint::new([3; 32], endpoint.participant())),
         );
         assert!(incoming.connected.is_some());
         assert!(reader.borrow().incoming_calls.is_empty());
         assert!(lifetime.ended.has_changed().is_ok());
-        incoming.update(&status, own, end(Some(endpoint)));
+        incoming.update(&status, own, end(endpoint));
         assert!(lifetime.ended.changed().await.is_err());
         assert!(incoming.connected.is_none());
         assert!(incoming.finish_answer(&status, &receipt).is_err());

@@ -29,7 +29,7 @@ The engine supports one-to-one text and attachments with devices that accept the
 
 With a local Apple session registered for FaceTime, open the camera menu beside a conversation to place a **FaceTime Audio** or **FaceTime Video** call. You can answer or decline an incoming call from the app or from a desktop notification that supports actions. For a video ring, choose **Answer Video** or **Answer as Audio**. If `canberra-gtk-play` is available, iMessage repeats the desktop sound theme's incoming-call tone until you respond or the call ends. **Mute** releases the microphone, and **Camera Off** stops camera capture. FaceTime audio uses the PulseAudio-compatible `parec` and `pacat` tools. Video uses a V4L2 camera and FFmpeg with `libx265`.
 
-With FaceTime enabled, closing the window minimizes iMessage so it can continue receiving calls. Press **Ctrl+Q** or right-click **Close Window** and choose **Quit iMessage** to exit.
+With FaceTime enabled, closing the window minimizes iMessage so it can continue receiving calls. Answering or declining on another device signed in to the same FaceTime address dismisses the pending Linux ring. Press **Ctrl+Q** or right-click **Close Window** and choose **Quit iMessage** to exit.
 
 ## Sync iCloud Contacts
 

@@ -506,6 +506,42 @@ impl Madrid {
         Ok(())
     }
 
+    pub(crate) async fn notify_answer_elsewhere(
+        &mut self,
+        identity: &Identity,
+        id: Uuid,
+    ) -> Result<()> {
+        let own = identity.handle.as_str();
+        let targets = self
+            .query(identity, facetime::SIGNALING, &[own], true)
+            .await?;
+        if !targets
+            .get(own)
+            .is_some_and(|devices| devices.iter().any(|device| device.push != identity.token))
+        {
+            return Ok(());
+        }
+        let bytes = compress(&facetime::responded_elsewhere(id))?;
+        let result = self
+            .deliver_message(
+                identity,
+                DeliveryPayload {
+                    recipient: own,
+                    guid: Uuid::new_v4(),
+                    bytes: &bytes,
+                    request_receipt: false,
+                    kind: DeliveryKind::CallInvitation(facetime::RESPONDED_ELSEWHERE),
+                },
+                &targets,
+            )
+            .await?;
+        ensure!(
+            result == Delivery::Accepted,
+            "Apple did not confirm the FaceTime answer notification"
+        );
+        Ok(())
+    }
+
     /// Send a prekey followed by wrapped session and media keys to the ringing device.
     pub(crate) async fn publish_call_keys(
         &mut self,
@@ -1102,15 +1138,20 @@ impl Madrid {
                 else {
                     return Ok(None);
                 };
-                return Ok(facetime::decode(
+                let call = facetime::decode(
                     command,
                     &decompress(&plaintext)?,
                     sender,
                     &identity.handle,
                     push_token,
                     received_ms,
-                )
-                .map(Incoming::Call));
+                );
+                if push_token == identity.token
+                    && matches!(call, Some(facetime::CallSignal::RespondedElsewhere { .. }))
+                {
+                    return Ok(None);
+                }
+                return Ok(call.map(Incoming::Call));
             }
             let body: Dictionary = plist::from_bytes(&decompress(&plaintext)?)?;
             let Some(participants) = body
@@ -1375,6 +1416,8 @@ mod tests {
     async fn answer_directory_lookup(
         mock: &mut tokio::io::DuplexStream,
         recipient_key: &[u8],
+        handle: &str,
+        tokens: &[u8],
     ) -> Result<()> {
         let query_frame = Frame::read(mock).await?;
         assert_eq!(
@@ -1384,6 +1427,8 @@ mod tests {
         let query: Dictionary =
             plist::from_bytes(query_frame.field(3).context("Missing IDS query")?)?;
         assert_eq!(query["c"].as_unsigned_integer(), Some(96));
+        let lookup: Dictionary = plist::from_bytes(&decompress(query["b"].as_data().unwrap())?)?;
+        assert_eq!(lookup["uris"], Value::Array(vec![value(handle)]));
         let headers = query["h"].as_dictionary().context("Missing IDS headers")?;
         assert_eq!(field_str(headers, "x-protocol-version"), Some("1660"));
         assert_eq!(
@@ -1408,10 +1453,10 @@ mod tests {
             (
                 "results",
                 Value::Dictionary(dictionary([(
-                    CALLER,
+                    handle,
                     Value::Dictionary(dictionary([(
                         "identities",
-                        Value::Array(vec![credential(3), credential(2)]),
+                        Value::Array(tokens.iter().copied().map(credential).collect()),
                     )])),
                 )])),
             ),
@@ -1489,7 +1534,7 @@ mod tests {
         };
         let selected_device = facetime::CallEndpoint::new([2; 32], Some(CALLER_ID));
         let simulate = async {
-            answer_directory_lookup(&mut mock, &recipient_key).await?;
+            answer_directory_lookup(&mut mock, &recipient_key, CALLER, &[3, 2]).await?;
 
             let allocation_frame = Frame::read(&mut mock).await?;
             let relay_digest = sha1(relay_topic.as_bytes());
@@ -1584,7 +1629,7 @@ mod tests {
         )?;
         let key_offer = local.handshake.build_key_offer(relay.local_participant)?;
         let simulate_keys = async {
-            answer_directory_lookup(&mut mock, &recipient_key).await?;
+            answer_directory_lookup(&mut mock, &recipient_key, CALLER, &[3, 2]).await?;
             for command in [facetime::PREKEY_COMMAND, facetime::KEY_MATERIAL_COMMAND] {
                 let frame = Frame::read(&mut mock).await?;
                 assert_eq!(
@@ -1672,7 +1717,7 @@ mod tests {
         for joined in [true, false] {
             let description = b"local media description";
             let simulate_update = async {
-                answer_directory_lookup(&mut mock, &recipient_key).await?;
+                answer_directory_lookup(&mut mock, &recipient_key, CALLER, &[3, 2]).await?;
                 let frame = Frame::read(&mut mock).await?;
                 let wire: Dictionary =
                     plist::from_bytes(frame.field(3).context("Missing call update")?)?;
@@ -1759,7 +1804,7 @@ mod tests {
             ..call
         };
         let simulate_outgoing = async {
-            answer_directory_lookup(&mut mock, &recipient_key).await?;
+            answer_directory_lookup(&mut mock, &recipient_key, CALLER, &[3, 2]).await?;
             let frame = Frame::read(&mut mock).await?;
             let request: Dictionary =
                 plist::from_bytes(frame.field(3).context("Missing relay request")?)?;
@@ -1869,6 +1914,51 @@ mod tests {
                 .await
         };
         tokio::try_join!(outgoing, simulate_outgoing)?;
+
+        let simulate_sibling_devices = async {
+            answer_directory_lookup(&mut mock, &recipient_key, LOCAL, &[1, 4]).await?;
+            let frame = Frame::read(&mut mock).await?;
+            let wire: Dictionary =
+                plist::from_bytes(frame.field(3).context("Missing sibling notification")?)?;
+            assert_eq!(
+                wire["c"].as_unsigned_integer(),
+                Some(facetime::INVITATION_COMMAND)
+            );
+            assert_eq!(
+                wire["cc"].as_unsigned_integer(),
+                Some(facetime::RESPONDED_ELSEWHERE)
+            );
+            let [target] = wire["dtl"]
+                .as_array()
+                .context("Missing sibling recipient")?
+                .as_slice()
+            else {
+                anyhow::bail!("Expected one sibling recipient");
+            };
+            let target = target
+                .as_dictionary()
+                .context("Invalid sibling recipient")?;
+            assert_eq!(field_str(target, "tP"), Some(LOCAL));
+            assert_eq!(field_data(target, "t"), Some([4; 32].as_slice()));
+            let sealed =
+                field_data(target, "P").context("Missing encrypted sibling notification")?;
+            let payload = decompress(&recipient.open(&sender_key, sealed)?)?;
+            assert!(matches!(
+                facetime::decode(facetime::INVITATION_COMMAND, &payload, LOCAL.into(), LOCAL, [1; 32], now_ms()),
+                Some(facetime::CallSignal::RespondedElsewhere { id, .. }) if id == call.id
+            ));
+            write_frame(
+                &mut mock,
+                0x0b,
+                &[(4, frame.field(4).context("Missing push ID")?), (8, &[0])],
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(())
+        };
+        tokio::try_join!(
+            madrid.notify_answer_elsewhere(&identity, call.id),
+            simulate_sibling_devices
+        )?;
         Ok(())
     }
 }

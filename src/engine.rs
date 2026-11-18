@@ -33,7 +33,7 @@ use crate::{
     apple::{
         CallEndpoint, CallKeyOffer, CallMediaExchange, CallMediaHandshake, CallRelayAllocation,
         CallSignal, Identity, Incoming, LocalCallPrekey, Madrid, Notification, PeerMediaOffer,
-        PeerPrekey,
+        PeerPrekey, RING_TIMEOUT_MS,
     },
     history::History,
 };
@@ -89,6 +89,7 @@ enum Request {
         answer: JoinAnswer,
         reply: oneshot::Sender<Result<AnswerLifetime>>,
     },
+    NotifyAnswerElsewhere(uuid::Uuid),
     DialCall {
         dial: DialRequest,
         reply: oneshot::Sender<Result<OutgoingAttempt>>,
@@ -399,6 +400,7 @@ async fn run_apple(
                         Request::JoinCall { reply, .. } => {
                             let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
                         }
+                        Request::NotifyAnswerElsewhere(_) => (),
                         Request::DialCall { reply, .. } => {
                             let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
                         }
@@ -563,6 +565,11 @@ async fn online(
                         };
                         let _ = reply.send(result);
                     }
+                    Request::NotifyAnswerElsewhere(id) => {
+                        if calls.connected.as_ref().is_some_and(|active| active.call.id == id && !active.initiator) {
+                            let _ = madrid.notify_answer_elsewhere(identity, id).await;
+                        }
+                    }
                     Request::DialCall { dial, reply } => {
                         calls.begin_outgoing(identity, madrid, status, dial, reply).await;
                     }
@@ -643,6 +650,7 @@ fn active_call(status: &Status, id: uuid::Uuid) -> Result<&crate::IncomingCall> 
 struct IncomingCalls {
     details: HashMap<uuid::Uuid, IncomingCallDetails>,
     ended: HashMap<uuid::Uuid, i64>,
+    responded_elsewhere: HashMap<uuid::Uuid, i64>,
     answering: Option<Weak<AnswerLease>>,
     connected: Option<ConnectedCall>,
     outgoing: Option<PendingOutgoing>,
@@ -769,6 +777,8 @@ impl IncomingCalls {
         self.details
             .retain(|id, _| status.incoming_calls.iter().any(|call| call.id == *id));
         self.ended.retain(|_, expires_ms| *expires_ms > now);
+        self.responded_elsewhere
+            .retain(|_, received_ms| received_ms.saturating_add(RING_TIMEOUT_MS) > now);
         status.incoming_calls.len() != previous
     }
 
@@ -838,6 +848,10 @@ impl IncomingCalls {
                     media,
                 } if offer.expires_ms > now
                     && !self.ended.contains_key(&offer.id)
+                    && self
+                        .responded_elsewhere
+                        .get(&offer.id)
+                        .is_none_or(|response| *response < offer.received_ms)
                     && self
                         .connected
                         .as_ref()
@@ -929,12 +943,10 @@ impl IncomingCalls {
                 } => {
                     if self.connected.as_ref().is_some_and(|connected| {
                         connected.call.id == id
-                            && (endpoint.and_then(CallEndpoint::participant).is_some()
-                                || sender == own)
+                            && endpoint.participant().is_some()
                             && can_end_call(
                                 &connected.call,
                                 Some(connected.endpoint),
-                                own,
                                 &sender,
                                 received_ms,
                                 endpoint,
@@ -948,7 +960,6 @@ impl IncomingCalls {
                             && can_end_call(
                                 call,
                                 self.details.get(&id).map(|details| details.endpoint),
-                                own,
                                 &sender,
                                 received_ms,
                                 endpoint,
@@ -960,6 +971,38 @@ impl IncomingCalls {
                     }
                     expired
                 }
+                CallSignal::RespondedElsewhere {
+                    id,
+                    sender,
+                    received_ms,
+                } if sender == own
+                    && self
+                        .connected
+                        .as_ref()
+                        .is_none_or(|active| active.call.id != id) =>
+                {
+                    if self.responded_elsewhere.len() >= 256
+                        && !self.responded_elsewhere.contains_key(&id)
+                        && let Some((&oldest, _)) = self
+                            .responded_elsewhere
+                            .iter()
+                            .min_by_key(|(_, time)| *time)
+                    {
+                        self.responded_elsewhere.remove(&oldest);
+                    }
+                    let latest = self.responded_elsewhere.entry(id).or_insert(received_ms);
+                    *latest = (*latest).max(received_ms);
+                    if let Some(index) = calls
+                        .iter()
+                        .position(|call| call.id == id && call.received_ms <= *latest)
+                    {
+                        calls.remove(index);
+                        self.details.remove(&id);
+                        return true;
+                    }
+                    expired
+                }
+                CallSignal::RespondedElsewhere { .. } => expired,
                 CallSignal::Ring { .. } | CallSignal::Accepted { .. } => expired,
             }
         });
@@ -969,25 +1012,19 @@ impl IncomingCalls {
 fn can_end_call(
     call: &crate::IncomingCall,
     verified: Option<CallEndpoint>,
-    own: &str,
     sender: &str,
     received_ms: i64,
-    endpoint: Option<CallEndpoint>,
+    endpoint: CallEndpoint,
 ) -> bool {
     received_ms >= call.received_ms
-        && match endpoint {
-            Some(leaving) => {
-                sender == call.caller
-                    && verified.is_some_and(|known| {
-                        if leaving.participant().is_some() {
-                            known.matches(leaving)
-                        } else {
-                            known.same_device(leaving)
-                        }
-                    })
+        && sender == call.caller
+        && verified.is_some_and(|known| {
+            if endpoint.participant().is_some() {
+                known.matches(endpoint)
+            } else {
+                known.same_device(endpoint)
             }
-            None => sender == own || sender == call.caller,
-        }
+        })
 }
 
 async fn send_tapback(
@@ -1241,7 +1278,7 @@ mod tests {
             id,
             sender: sender.into(),
             received_ms: time,
-            endpoint: None,
+            endpoint: CallEndpoint::new([1; 32], None),
         };
         let ring = |call, token, participant| CallSignal::Ring {
             call,
@@ -1252,7 +1289,7 @@ mod tests {
             id,
             sender: caller.into(),
             received_ms: now,
-            endpoint: Some(CallEndpoint::new([token; 32], Some(participant))),
+            endpoint: CallEndpoint::new([token; 32], Some(participant)),
         };
         let mut incoming = IncomingCalls::default();
         incoming.update(&status, own, ring(offer.clone(), 1, None));
@@ -1287,13 +1324,58 @@ mod tests {
         incoming.update(
             &status,
             own,
-            CallSignal::End {
+            CallSignal::RespondedElsewhere {
                 id,
                 sender: own.into(),
                 received_ms: now,
-                endpoint: None,
             },
         );
+        assert!(reader.borrow().incoming_calls.is_empty());
+    }
+
+    #[test]
+    fn a_sibling_response_clears_pending_and_delayed_rings_without_masking_a_new_invitation() {
+        let now = now_ms();
+        let own = "mailto:receiver@example.org";
+        let caller = "mailto:caller@example.org";
+        let id = uuid::Uuid::new_v4();
+        let (status, reader) = watch::channel(Status {
+            connected: true,
+            detail: String::new(),
+            tapback_revision: None,
+            facetime_registered: true,
+            incoming_calls: Vec::new(),
+        });
+        let ring = |received_ms| CallSignal::Ring {
+            call: crate::IncomingCall {
+                id,
+                caller: caller.into(),
+                mode: Some(crate::CallMode::Video),
+                received_ms,
+                expires_ms: received_ms + RING_TIMEOUT_MS,
+            },
+            endpoint: CallEndpoint::new([5; 32], None),
+            media: None,
+        };
+        let response = |sender: &str, received_ms| CallSignal::RespondedElsewhere {
+            id,
+            sender: sender.into(),
+            received_ms,
+        };
+        let mut incoming = IncomingCalls::default();
+        incoming.update(&status, own, response(own, now));
+        incoming.update(&status, own, ring(now - 1));
+        assert!(reader.borrow().incoming_calls.is_empty());
+
+        incoming.update(&status, own, ring(now + 1));
+        incoming.update(&status, own, response(own, now));
+        incoming.update(&status, own, response(caller, now + 2));
+        assert_eq!(reader.borrow().incoming_calls[0].received_ms, now + 1);
+
+        incoming.update(&status, own, response(own, now + 2));
+        assert!(reader.borrow().incoming_calls.is_empty());
+        assert!(!incoming.details.contains_key(&id));
+        incoming.update(&status, own, ring(now + 1));
         assert!(reader.borrow().incoming_calls.is_empty());
     }
 
@@ -1401,7 +1483,7 @@ mod tests {
                 id,
                 sender: caller.into(),
                 received_ms: now,
-                endpoint: None,
+                endpoint: CallEndpoint::new([1; 32], Some(7)),
             },
         );
         incoming.update(&status, own, parse(&offer.payload, 1)?);

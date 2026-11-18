@@ -112,9 +112,7 @@ impl RingResponses {
                 sender, endpoint, ..
             }
             | CallSignal::End {
-                sender,
-                endpoint: Some(endpoint),
-                ..
+                sender, endpoint, ..
             } => (sender, *endpoint),
             _ => return,
         };
@@ -663,7 +661,7 @@ mod tests {
             id: call.id,
             sender: call.caller.clone(),
             received_ms,
-            endpoint: Some(endpoint),
+            endpoint,
         };
         responses.receive(
             &call,
