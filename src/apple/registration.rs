@@ -253,6 +253,7 @@ fn registration_document(
         ("public-message-identity-key", Value::Data(public_identity)),
         ("public-message-identity-version", 2.into()),
         ("ec-version", 1.into()),
+        ("supports-emoji-tapbacks", Value::Boolean(true)),
     ]);
     let account = map(&[
         ("user-id", user_id.into()),
