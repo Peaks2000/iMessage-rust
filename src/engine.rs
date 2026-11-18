@@ -95,6 +95,7 @@ enum Request {
     },
     FinishOutgoing {
         id: uuid::Uuid,
+        relay_prekey: Option<(CallEndpoint, PeerPrekey)>,
         reply: oneshot::Sender<Result<OutgoingAnswer>>,
     },
     InstallRelayKeys {
@@ -552,14 +553,14 @@ async fn online(
                             let _ = reply.send(calls.ring_outgoing(identity, madrid, id).await);
                         }
                     }
-                    Request::FinishOutgoing { id, reply } => {
+                    Request::FinishOutgoing { id, relay_prekey, reply } => {
                         for notification in madrid.take_queued() {
                             receive_notification(identity, state, madrid, status, calls, notification).await?;
                         }
                         if reply.is_closed() {
                             continue;
                         }
-                        let result = calls.finish_outgoing(identity, madrid, id).await;
+                        let result = calls.finish_outgoing(identity, madrid, id, relay_prekey).await;
                         for notification in madrid.take_queued() {
                             receive_notification(identity, state, madrid, status, calls, notification).await?;
                         }

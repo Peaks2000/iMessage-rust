@@ -22,14 +22,24 @@ pub(in crate::engine) struct DialRequest {
 pub(in crate::engine) struct OutgoingAttempt {
     id: Uuid,
     _cancel: oneshot::Sender<()>,
-    answered: oneshot::Receiver<Result<()>>,
+    progress: watch::Receiver<OutgoingProgress>,
     relay: Arc<OutgoingRelay>,
+}
+
+#[derive(Clone)]
+enum OutgoingProgress {
+    Ringing,
+    Accepted {
+        endpoint: CallEndpoint,
+        allocation: Arc<CallRelayAllocation>,
+        has_prekey: bool,
+    },
+    Ended(&'static str),
 }
 
 pub(in crate::engine) struct OutgoingAnswer {
     handshake: Arc<CallMediaHandshake>,
     endpoint: CallEndpoint,
-    allocation: Arc<CallRelayAllocation>,
     local_keys: Arc<CallKeyOffer>,
     lifetime: AnswerLifetime,
 }
@@ -42,7 +52,7 @@ pub(in crate::engine) struct PendingOutgoing {
     invited: bool,
     responses: RingResponses,
     cancel: oneshot::Receiver<()>,
-    answered: Option<oneshot::Sender<Result<()>>>,
+    progress: watch::Sender<OutgoingProgress>,
 }
 
 struct RingResponses {
@@ -57,6 +67,17 @@ struct RingingDevice {
     mode: Option<CallMode>,
     keys: Vec<PeerKeyOffer>,
     ended: bool,
+}
+
+impl RingingDevice {
+    fn learn_relay_prekey(&mut self, source: CallEndpoint, prekey: PeerPrekey) -> Result<()> {
+        ensure!(
+            source == self.endpoint && !self.ended && self.description.is_some(),
+            "The FaceTime prekey belongs to a different device or call"
+        );
+        self.prekey.get_or_insert(prekey);
+        Ok(())
+    }
 }
 
 impl RingResponses {
@@ -120,27 +141,28 @@ impl RingResponses {
                 call: response,
                 media,
                 ..
-            } if endpoint.participant().is_some()
-                && response.received_ms >= call.received_ms
-                && device.description.is_none() =>
-            {
-                // The recipient may answer a video invitation with audio.
-                let description =
-                    CallMediaDescription::parse(&media.description, response.mode).ok();
-                let video = call.mode == Some(CallMode::Video)
-                    && match response.mode {
-                        Some(CallMode::Video) => true,
-                        Some(CallMode::Audio) => false,
-                        None => description.is_some_and(|description| description.video.is_some()),
-                    };
-                device.mode = Some(if video {
-                    CallMode::Video
-                } else {
-                    CallMode::Audio
-                });
-                device.description = Some(media.description);
-                // Prefer the prekey in the signed participant update over a standalone prekey.
-                if media.prekey.is_some() {
+            } if endpoint.participant().is_some() && response.received_ms >= call.received_ms => {
+                if device.description.is_none() {
+                    // The recipient may answer a video invitation with audio.
+                    let description =
+                        CallMediaDescription::parse(&media.description, response.mode).ok();
+                    let video = call.mode == Some(CallMode::Video)
+                        && match response.mode {
+                            Some(CallMode::Video) => true,
+                            Some(CallMode::Audio) => false,
+                            None => {
+                                description.is_some_and(|description| description.video.is_some())
+                            }
+                        };
+                    device.mode = Some(if video {
+                        CallMode::Video
+                    } else {
+                        CallMode::Audio
+                    });
+                    device.description = Some(media.description);
+                    // Prefer the initial participant update over a standalone prekey.
+                    device.prekey = media.prekey.or(device.prekey.take());
+                } else if device.prekey.is_none() {
                     device.prekey = media.prekey;
                 }
             }
@@ -159,22 +181,13 @@ impl RingResponses {
             }
             _ => (),
         }
-        if device.prekey.is_some() && device.description.is_some() {
+        if device.description.is_some() {
             self.selected = Some(index);
         }
     }
 
-    fn outcome(&self) -> Option<Result<()>> {
-        if self
-            .selected
-            .is_some_and(|index| !self.devices[index].ended)
-        {
-            Some(Ok(()))
-        } else if self.devices.iter().all(|device| device.ended) {
-            Some(Err(anyhow::anyhow!("The FaceTime call was declined")))
-        } else {
-            None
-        }
+    fn selected(&self) -> Option<&RingingDevice> {
+        self.selected.map(|index| &self.devices[index])
     }
 }
 
@@ -195,13 +208,63 @@ impl PendingOutgoing {
             return;
         }
         self.responses.receive(&self.call, signal);
-        if let Some(result) = self.responses.outcome()
-            && let Some(reply) = self.answered.take()
-        {
-            if result.is_ok() {
-                self.call.expires_ms = now_ms() + MEDIA_SETUP_TIMEOUT.as_millis() as i64;
-            }
-            let _ = reply.send(result);
+        self.progress.send_if_modified(|progress| {
+            let selected = self.responses.selected();
+            let replacement = match (&mut *progress, selected) {
+                (OutgoingProgress::Ringing, Some(device)) => {
+                    let Ok(allocation) = self
+                        .targets
+                        .allocation_for_peer(&self.call.caller, device.endpoint)
+                    else {
+                        *progress =
+                            OutgoingProgress::Ended("The FaceTime answering device is unavailable");
+                        return true;
+                    };
+                    self.call.expires_ms = now_ms() + MEDIA_SETUP_TIMEOUT.as_millis() as i64;
+                    OutgoingProgress::Accepted {
+                        endpoint: device.endpoint,
+                        allocation: Arc::new(allocation),
+                        has_prekey: device.prekey.is_some(),
+                    }
+                }
+                (OutgoingProgress::Ringing, None)
+                    if self.responses.devices.iter().all(|device| device.ended) =>
+                {
+                    OutgoingProgress::Ended("The FaceTime call was declined")
+                }
+                (OutgoingProgress::Accepted { .. }, Some(device)) if device.ended => {
+                    OutgoingProgress::Ended("The other device left the FaceTime call")
+                }
+                (OutgoingProgress::Accepted { has_prekey, .. }, Some(device))
+                    if !*has_prekey && device.prekey.is_some() =>
+                {
+                    *has_prekey = true;
+                    return true;
+                }
+                _ => return false,
+            };
+            *progress = replacement;
+            true
+        });
+    }
+
+    fn timed_out(&self) -> &'static str {
+        match *self.progress.borrow() {
+            OutgoingProgress::Ringing => "The FaceTime call was not answered",
+            OutgoingProgress::Accepted { .. } => "The FaceTime call ran out of time during setup",
+            OutgoingProgress::Ended(reason) => reason,
+        }
+    }
+
+    fn authenticated_peer(&self) -> Result<(CallEndpoint, Arc<CallRelayAllocation>)> {
+        match &*self.progress.borrow() {
+            OutgoingProgress::Accepted {
+                endpoint,
+                allocation,
+                ..
+            } => Ok((*endpoint, allocation.clone())),
+            OutgoingProgress::Ended(reason) => anyhow::bail!("{reason}"),
+            OutgoingProgress::Ringing => anyhow::bail!("The other device has not answered"),
         }
     }
 
@@ -217,10 +280,9 @@ impl PendingOutgoing {
         }
     }
 
-    pub(in crate::engine) async fn cancel(mut self, identity: &Identity, madrid: &mut Madrid) {
-        if let Some(answered) = self.answered.take() {
-            let _ = answered.send(Err(anyhow::anyhow!("The FaceTime call was not answered")));
-        }
+    pub(in crate::engine) async fn cancel(self, identity: &Identity, madrid: &mut Madrid) {
+        self.progress
+            .send_replace(OutgoingProgress::Ended(self.timed_out()));
         if self.invited {
             let _ = madrid
                 .send_outgoing_call(identity, &self.call, &self.targets, None)
@@ -276,7 +338,7 @@ impl IncomingCalls {
         };
         ensure!(!reply.is_closed(), "The FaceTime call was canceled");
         let (hangup, cancel) = oneshot::channel();
-        let (answer, answered) = oneshot::channel();
+        let (updates, progress) = watch::channel(OutgoingProgress::Ringing);
         let id = call.id;
         let relay = targets.relay.clone();
         self.outgoing = Some(PendingOutgoing {
@@ -287,12 +349,12 @@ impl IncomingCalls {
             avc: dial.avc,
             invited: false,
             cancel,
-            answered: Some(answer),
+            progress: updates,
         });
         Ok(OutgoingAttempt {
             id,
             _cancel: hangup,
-            answered,
+            progress,
             relay,
         })
     }
@@ -329,6 +391,7 @@ impl IncomingCalls {
         identity: &Identity,
         madrid: &mut Madrid,
         id: Uuid,
+        relay_prekey: Option<(CallEndpoint, PeerPrekey)>,
     ) -> Result<OutgoingAnswer> {
         let pending = self
             .outgoing
@@ -336,17 +399,21 @@ impl IncomingCalls {
             .filter(|outgoing| outgoing.invited && outgoing.call.id == id)
             .context("The FaceTime call has ended")?;
         pending.check_live()?;
+        let (endpoint, relay) = pending.authenticated_peer()?;
         let selected = pending
             .responses
             .selected
             .filter(|&index| !pending.responses.devices[index].ended)
             .context("The other device left the FaceTime call")?;
-        let device = &pending.responses.devices[selected];
-        let relay = Arc::new(
-            pending
-                .targets
-                .allocation_for_peer(&pending.call.caller, device.endpoint)?,
+        let device = &mut pending.responses.devices[selected];
+        ensure!(
+            device.endpoint == endpoint,
+            "The FaceTime answering device changed"
         );
+        if let Some((source, prekey)) = relay_prekey {
+            device.learn_relay_prekey(source, prekey)?;
+        }
+        ensure!(device.prekey.is_some(), "Missing FaceTime media prekey");
         let pending = self
             .outgoing
             .take()
@@ -379,7 +446,6 @@ impl IncomingCalls {
         Ok(OutgoingAnswer {
             handshake,
             endpoint: device.endpoint,
-            allocation: relay,
             local_keys,
             lifetime,
         })
@@ -424,7 +490,7 @@ impl Engine {
         let OutgoingAttempt {
             id,
             _cancel,
-            answered,
+            progress,
             relay,
         } = attempt
             .await
@@ -435,12 +501,11 @@ impl Engine {
         )
         .await
         .context("The FaceTime relay did not bind before ringing")??;
-        let answer = self.ring_and_wait(id, answered, &mut pending_relay).await;
+        let answer = self.ring_and_wait(id, progress, &mut pending_relay).await;
         drop(_cancel);
         let OutgoingAnswer {
             handshake,
             endpoint,
-            allocation,
             local_keys,
             mut lifetime,
         } = match answer {
@@ -459,7 +524,7 @@ impl Engine {
         let bound = tokio::select! {
             biased;
             _ = lifetime.ended.changed() => anyhow::bail!("The FaceTime call has ended"),
-            result = timeout(MEDIA_SETUP_TIMEOUT, pending_relay.join(endpoint, &allocation, &description)) =>
+            result = timeout(MEDIA_SETUP_TIMEOUT, pending_relay.join(&description)) =>
                 result.context("The FaceTime relay did not confirm the media offer")??,
         };
         complete_media(
@@ -479,7 +544,7 @@ impl Engine {
     async fn ring_and_wait(
         &self,
         id: Uuid,
-        mut answered: oneshot::Receiver<Result<()>>,
+        mut progress: watch::Receiver<OutgoingProgress>,
         relay: &mut RingingRelay,
     ) -> Result<OutgoingAnswer> {
         let (reply, result) = oneshot::channel();
@@ -495,19 +560,57 @@ impl Engine {
             tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            tokio::select! {
-                biased;
-                result = &mut answered => {
-                    result.context("The FaceTime call has ended")??;
+            match progress.borrow_and_update().clone() {
+                OutgoingProgress::Ringing => (),
+                OutgoingProgress::Accepted {
+                    endpoint,
+                    allocation,
+                    ..
+                } => {
+                    relay.select_peer(endpoint, &allocation)?;
                     break;
                 }
+                OutgoingProgress::Ended(reason) => anyhow::bail!("{reason}"),
+            }
+            tokio::select! {
+                biased;
+                result = progress.changed() => result.context("The FaceTime call has ended")?,
                 _ = keepalive.tick() => relay.keepalive().await?,
                 result = relay.service_during_ring() => result?,
             }
         }
+        let mut can_read_relay = true;
+        let relay_prekey = loop {
+            let endpoint = match *progress.borrow_and_update() {
+                OutgoingProgress::Accepted {
+                    has_prekey: true, ..
+                } => break None,
+                OutgoingProgress::Accepted {
+                    endpoint,
+                    has_prekey: false,
+                    ..
+                } => endpoint,
+                OutgoingProgress::Ended(reason) => anyhow::bail!("{reason}"),
+                OutgoingProgress::Ringing => anyhow::bail!("The other device has not answered"),
+            };
+            tokio::select! {
+                biased;
+                result = progress.changed() => result.context("The FaceTime call has ended")?,
+                result = relay.wait_for_peer_prekey(), if can_read_relay => {
+                    if let Some(prekey) = result.ok().flatten() {
+                        break Some((endpoint, prekey));
+                    }
+                    can_read_relay = false;
+                }
+            }
+        };
         let (reply, result) = oneshot::channel();
         self.requests
-            .try_send(Request::FinishOutgoing { id, reply })
+            .try_send(Request::FinishOutgoing {
+                id,
+                relay_prekey,
+                reply,
+            })
             .context("The Apple engine is busy or stopped")?;
         result
             .await
@@ -575,7 +678,7 @@ mod tests {
                 Some(prekey.clone()),
             )?,
         );
-        assert!(responses.outcome().is_none());
+        assert!(responses.selected().is_none());
 
         responses.receive(&call, answer(second, &call.caller, None)?);
         responses.receive(
@@ -587,26 +690,50 @@ mod tests {
                 key: prekey.clone(),
             },
         );
-        assert!(responses.outcome().is_none());
+        let selected = responses
+            .selected()
+            .context("Missing authenticated answer")?;
+        assert!(selected.endpoint == second);
+        assert!(selected.prekey.is_none());
+        let selected = &mut responses.devices[1];
+        assert!(selected.learn_relay_prekey(first, prekey.clone()).is_err());
+        assert!(selected.prekey.is_none());
+        selected.learn_relay_prekey(second, prekey.clone())?;
+        let conflicting = LocalCallPrekey::generate()?;
         responses.receive(&call, decline(CallEndpoint::new([2; 32], None)));
-        assert!(responses.outcome().is_none());
         responses.receive(
             &call,
             CallSignal::Prekey {
                 id: call.id,
                 sender: call.caller.clone(),
                 endpoint: CallEndpoint::new([3; 32], None),
-                key: prekey.clone(),
+                key: PeerPrekey::parse(1, conflicting.public())?,
             },
         );
-        assert!(responses.outcome().is_some_and(|result| result.is_ok()));
         assert_eq!(responses.selected, Some(1));
-        assert_eq!(responses.devices[1].mode, Some(CallMode::Audio));
+        let selected = responses.selected().context("Missing selected device")?;
+        assert_eq!(selected.mode, Some(CallMode::Audio));
+        assert!(
+            selected
+                .prekey
+                .as_ref()
+                .is_some_and(|key| key.same_as(&prekey))
+        );
         responses.receive(&call, answer(first, &call.caller, Some(prekey))?);
         responses.receive(&call, decline(CallEndpoint::new([3; 32], None)));
-        assert!(responses.outcome().is_some_and(|result| result.is_ok()));
+        assert!(
+            !responses
+                .selected()
+                .context("Missing selected device")?
+                .ended
+        );
         responses.receive(&call, decline(second));
-        assert!(responses.outcome().is_some_and(|result| result.is_err()));
+        assert!(
+            responses
+                .selected()
+                .context("Missing selected device")?
+                .ended
+        );
         Ok(())
     }
 }

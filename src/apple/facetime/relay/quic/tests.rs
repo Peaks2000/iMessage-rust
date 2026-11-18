@@ -482,23 +482,6 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
         assert_eq!(body[..2], [0x92, 1]); // QuickRelay envelope field 18.
         fixture_response(&mut relay, stats, &[0x9a, 1, 0]).await?;
 
-        let (publish, body) = fixture_request(&mut relay, b"/QR/Material").await?;
-        let submitted = TestMaterialEnvelope::decode(body.as_slice())?
-            .request
-            .context("Missing PutMaterial")?;
-        let [material] = submitted.materials.as_slice() else {
-            anyhow::bail!("Expected one encrypted media offer");
-        };
-        let [entry] = material.entries.as_slice() else {
-            anyhow::bail!("Expected one encrypted AVC description");
-        };
-        assert_eq!(material.owner, Some(0));
-        assert_eq!(material.receiver, Some(description::CALLER));
-        assert_eq!(entry.id, offer.material_id);
-        assert_eq!(entry.kind, 12);
-        assert_eq!(entry.ciphertext, offer.ciphertext);
-        fixture_response(&mut relay, publish, &[0xca, 1, 0]).await?;
-
         let wrong_device = indication(
             description::CALLER + 1,
             description::LOCAL,
@@ -564,6 +547,24 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
             .map_err(|_| anyhow::anyhow!("Waiting call ended early"))?;
         continue_indications.await?;
         indication_chunk(&mut relay, &mut indications, &valid_prekey[3..]).await?;
+
+        let (publish, body) = fixture_request(&mut relay, b"/QR/Material").await?;
+        let submitted = TestMaterialEnvelope::decode(body.as_slice())?
+            .request
+            .context("Missing PutMaterial")?;
+        let [material] = submitted.materials.as_slice() else {
+            anyhow::bail!("Expected one encrypted media offer");
+        };
+        let [entry] = material.entries.as_slice() else {
+            anyhow::bail!("Expected one encrypted AVC description");
+        };
+        assert_eq!(material.owner, Some(0));
+        assert_eq!(material.receiver, Some(description::CALLER));
+        assert_eq!(entry.id, offer.material_id);
+        assert_eq!(entry.kind, 12);
+        assert_eq!(entry.ciphertext, offer.ciphertext);
+        fixture_response(&mut relay, publish, &[0xca, 1, 0]).await?;
+
         indication_chunk(&mut relay, &mut indications, &media).await?;
         let valid_key = indication(
             description::CALLER,
@@ -613,27 +614,24 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
             shared_key: Zeroizing::default(),
             device_key: Some(verification),
         };
-        let mut connection = waiting.join(answered, &allocation, &offer).await?;
-        assert_eq!(connection.channel_id, 0x4008);
-        assert!(
-            connection
-                .peer_description(&description::remote_keys())?
-                .is_none()
-        );
+        assert!(waiting.select_peer(other, &allocation).is_err());
+        waiting.select_peer(answered, &allocation)?;
         has_partial_frame.await?;
         assert!(
-            tokio::time::timeout(Duration::from_millis(40), connection.wait_for_peer_prekey())
+            tokio::time::timeout(Duration::from_millis(40), waiting.wait_for_peer_prekey())
                 .await
                 .is_err()
         );
         paused
             .send(())
             .map_err(|_| anyhow::anyhow!("Relay stopped sending indications"))?;
-        let prekey = connection
+        let prekey = waiting
             .wait_for_peer_prekey()
             .await?
             .context("Missing relay-signed prekey")?;
         assert!(prekey.same_as(&PeerPrekey::parse(1, remote.handshake.public_prekey())?));
+        let mut connection = waiting.join(&offer).await?;
+        assert_eq!(connection.channel_id, 0x4008);
 
         assert!(matches!(
             connection.next_peer_update().await?,

@@ -112,12 +112,11 @@ impl RingingRelay {
         self.binding.unbind().await
     }
 
-    pub(crate) async fn join(
-        mut self,
+    pub(crate) fn select_peer(
+        &mut self,
         selected: CallEndpoint,
         allocation: &CallRelayAllocation,
-        offer: &CallAvcMaterial,
-    ) -> Result<CallRelayBinding> {
+    ) -> Result<()> {
         ensure!(
             self.eligible.contains(&selected),
             "Unexpected FaceTime answering device"
@@ -129,8 +128,6 @@ impl RingingRelay {
         ensure!(
             call.peer == 0
                 && call.local != peer
-                && call.id == offer.call_id
-                && call.local == offer.participant
                 && allocation.call_id == call.id
                 && allocation.local_participant == call.local
                 && allocation.caller_participant == peer
@@ -139,6 +136,14 @@ impl RingingRelay {
         );
         self.binding.control.transport.call.peer = peer;
         self.binding.control.transport.device_key = allocation.device_key.clone();
+        Ok(())
+    }
+
+    pub(crate) async fn wait_for_peer_prekey(&mut self) -> Result<Option<PeerPrekey>> {
+        self.binding.wait_for_peer_prekey().await
+    }
+
+    pub(crate) async fn join(mut self, offer: &CallAvcMaterial) -> Result<CallRelayBinding> {
         self.binding.publish_description(offer).await?;
         Ok(self.binding)
     }
