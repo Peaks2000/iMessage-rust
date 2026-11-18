@@ -18,7 +18,7 @@ If Apple sends a sign-in alert to your iPhone or another trusted device, tap **A
 
 Setup requests iMessage and FaceTime registration in the same sign-in. Apple can grant iMessage access independently. If Apple rejects the combined request, setup retries iMessage with a new validation proof when the device helper can generate one.
 
-If an existing desktop session has iMessage access, **Settings → This Computer → Enable FaceTime** requests the FaceTime certificates for the saved device and iMessage address. It reuses a remembered Apple Account password when available and uses the configured local device helper or a Mac for fresh Apple device validation.
+If an existing desktop session has iMessage access, **Settings → This Computer → Enable FaceTime** requests the FaceTime certificates for the saved device and iMessage address. It reuses a remembered Apple Account password when available and uses the configured local device helper or a Mac for fresh Apple device validation. Calling requests use the device metadata registered with FaceTime.
 
 For a Mac you can reach in person, copy the latest [Mac device helper](../tools/macos-device-helper) to that Mac and make it executable. Run it with `export-facetime-validation` and an output path, for example `./macos-device-helper export-facetime-validation ~/Desktop/FaceTime-validation.plist`. Transfer the file privately, keep its permissions at `600`, and choose it with **Use Validation File** in **Enable FaceTime**. The file contains device metadata and fresh validation proofs. Linux uses the saved APNs and iMessage keys throughout the upgrade and contacts Apple directly.
 
@@ -47,6 +47,7 @@ The plist is a dictionary with the following keys.
 | `push-certificate`, `push-private-key` | Matching DER X.509 certificate and RSA private key for the APNs session |
 | `ids-certificate`, `ids-private-key` | Matching DER X.509 certificate and RSA private key registered for the iMessage service and the same device |
 | `facetime-certificates` | Optional dictionary of DER X.509 certificates issued for `com.apple.private.alloy.facetime.multi` and `com.apple.ess`. Both use the same `ids-private-key`. |
+| `facetime-device` | Optional dictionary with `protocol-version` and `user-agent` from FaceTime registration. Calls use the top-level device values when this field is absent. |
 | `signing-private-key` | DER P-256 private key registered as the legacy iMessage signing identity |
 | `encryption-private-key` | DER 1280-bit RSA private key registered as the legacy iMessage encryption identity |
 | `protocol-version` | Integer for the provisioned Apple's device IDS protocol version |

@@ -294,16 +294,14 @@ impl Madrid {
             signed.extend_from_slice(&u32::try_from(field.len())?.to_be_bytes());
             signed.extend_from_slice(field);
         }
+        let (protocol_version, user_agent) = identity.ids_device(topic);
         let mut headers = dictionary([
             ("x-id-self-uri", value(&identity.handle)),
             ("x-push-token", value(STANDARD.encode(identity.token))),
-            (
-                "x-protocol-version",
-                value(identity.protocol_version.to_string()),
-            ),
+            ("x-protocol-version", value(protocol_version.to_string())),
             (
                 "user-agent",
-                value(format!("com.apple.madrid-lookup {}", identity.user_agent)),
+                value(format!("com.apple.madrid-lookup {user_agent}")),
             ),
             ("x-id-nonce", value(STANDARD.encode(nonce))),
             (
@@ -822,7 +820,7 @@ impl Madrid {
             call,
             id,
             &identity.handle,
-            &identity.user_agent,
+            identity.ids_device(facetime::relay::RELAY_TOPIC).1,
             devices,
         ))?;
         ensure!(
@@ -931,7 +929,7 @@ impl Madrid {
                         .into(),
                     ),
                     ("E", value("pair")),
-                    ("ua", value(&identity.user_agent)),
+                    ("ua", value(identity.ids_device(payload.topic()).1)),
                     ("v", 8.into()),
                     ("i", i32::from_be_bytes(id).into()),
                     ("U", data(payload.guid.as_bytes())),
@@ -1386,6 +1384,12 @@ mod tests {
         let query: Dictionary =
             plist::from_bytes(query_frame.field(3).context("Missing IDS query")?)?;
         assert_eq!(query["c"].as_unsigned_integer(), Some(96));
+        let headers = query["h"].as_dictionary().context("Missing IDS headers")?;
+        assert_eq!(field_str(headers, "x-protocol-version"), Some("1660"));
+        assert_eq!(
+            field_str(headers, "user-agent"),
+            Some("com.apple.madrid-lookup [macOS,15.7.5,24G624,Mac14,2]")
+        );
         let credential = |token| {
             Value::Dictionary(dictionary([
                 ("push-token", data(&[token; 32])),
@@ -1459,6 +1463,10 @@ mod tests {
             ids_key: PKey::from_rsa(rsa)?,
             facetime_certificates: [(facetime::SIGNALING.to_owned(), b"fixture".to_vec())].into(),
             facetime_relay_signing: None,
+            facetime_device: Some(super::super::IdsDevice {
+                protocol_version: 1660,
+                user_agent: "[macOS,15.7.5,24G624,Mac14,2]".into(),
+            }),
             message_keys: KeyPair::private(
                 &signing.private_key_to_der()?,
                 &Rsa::generate(1280)?.private_key_to_der()?,
@@ -1489,6 +1497,10 @@ mod tests {
             let request: Dictionary =
                 plist::from_bytes(allocation_frame.field(3).context("Missing relay request")?)?;
             assert_eq!(request["c"].as_unsigned_integer(), Some(200));
+            assert_eq!(
+                request["ua"].as_string(),
+                Some("[macOS,15.7.5,24G624,Mac14,2]")
+            );
             assert_eq!(
                 request["qids"].as_data(),
                 Some(call.id.as_bytes().as_slice())
@@ -1582,6 +1594,10 @@ mod tests {
                 let wire: Dictionary =
                     plist::from_bytes(frame.field(3).context("Missing FaceTime payload")?)?;
                 assert_eq!(wire["c"].as_unsigned_integer(), Some(command));
+                assert_eq!(
+                    wire["ua"].as_string(),
+                    Some("[macOS,15.7.5,24G624,Mac14,2]")
+                );
                 assert_eq!(wire["E"].as_string(), Some("pair"));
                 assert_eq!(wire["siu"].as_boolean(), Some(false));
                 assert_eq!(

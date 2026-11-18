@@ -20,7 +20,7 @@ use zeroize::Zeroizing;
 use crate::address;
 
 use super::{
-    Identity, Session,
+    Identity, IdsDevice, Session,
     aps::TOPIC,
     certified_rsa,
     crypto::KeyPair,
@@ -28,7 +28,7 @@ use super::{
     http::{apple_client, plist_xml_gzip, read_response},
     nonce,
     provisioning::DeviceProvider,
-    rsa_signature,
+    rsa_signature, valid_ids_user_agent,
 };
 
 const REGISTER_URL: &str =
@@ -112,12 +112,7 @@ impl DeviceRegistration {
             "Apple device validation data is required"
         );
         ensure!(
-            !self.user_agent.is_empty()
-                && self.user_agent.len() <= 256
-                && self
-                    .user_agent
-                    .bytes()
-                    .all(|byte| byte == b' ' || byte.is_ascii_graphic()),
+            valid_ids_user_agent(&self.user_agent),
             "Invalid Apple device user agent"
         );
         address(&self.handle)?;
@@ -325,6 +320,23 @@ async fn register_at(
         } else {
             None
         };
+    let messages_device = existing.map_or(
+        (
+            registration.protocol_version,
+            registration.user_agent.as_str(),
+        ),
+        |identity| identity.ids_device(TOPIC),
+    );
+    let calling_device = (
+        registration.protocol_version,
+        registration.user_agent.as_str(),
+    );
+    let facetime_device = (facetime_certificates.contains_key(facetime::SIGNALING)
+        && calling_device != messages_device)
+        .then(|| IdsDevice {
+            protocol_version: calling_device.0,
+            user_agent: calling_device.1.to_owned(),
+        });
     let session = Session {
         version: 1,
         handle,
@@ -335,14 +347,11 @@ async fn register_at(
         ids_private_key: Data::new(auth.key.private_key_to_der()?),
         facetime_certificates,
         facetime_relay_signing_private_key,
+        facetime_device,
         signing_private_key: Data::new(signing_bytes.to_vec()),
         encryption_private_key: Data::new(encryption_bytes.to_vec()),
-        protocol_version: existing.map_or(registration.protocol_version, |identity| {
-            identity.protocol_version
-        }),
-        user_agent: existing
-            .map_or(&registration.user_agent, |identity| &identity.user_agent)
-            .clone(),
+        protocol_version: messages_device.0,
+        user_agent: messages_device.1.to_owned(),
     };
     let mut serialized = Zeroizing::new(Vec::new());
     plist::to_writer_binary(&mut *serialized, &session)?;
@@ -418,21 +427,30 @@ fn registration_document(
         ));
     }
     if !matches!(services, Services::Messages) {
-        let mut account = account(client_data);
-        if let Some(directory) = relay_directory {
-            // Advertise only the device identity used for relay signatures. IDS signaling
-            // continues to use the legacy encryption identity above.
-            account.insert("kt-loggable-data".into(), Value::Data(directory.to_vec()));
-        }
-        let account = Value::Dictionary(account);
+        let calling_account = |capability: &str| {
+            let mut calling_data = client_data.clone();
+            calling_data.insert(capability.to_owned(), Value::Boolean(true));
+            let mut account = account(calling_data);
+            if let Some(directory) = relay_directory {
+                // This key signs relay material. IDS signaling uses the message identity above.
+                account.insert("kt-loggable-data".into(), Value::Data(directory.to_vec()));
+            }
+            Value::Dictionary(account)
+        };
         requested.extend([
-            service(facetime::SIGNALING, &[], "Invitation", 1, account.clone()),
+            service(
+                facetime::SIGNALING,
+                &[],
+                "Invitation",
+                1,
+                calling_account("supports-modern-gft"),
+            ),
             service(
                 facetime::VIDEO_SERVICE,
                 &[facetime::VIDEO],
                 "Invitation",
                 1,
-                account,
+                calling_account("supports-live-delivery"),
             ),
         ]);
     }
@@ -757,12 +775,16 @@ mod tests {
         user.get("kt-loggable-data")?.as_data()
     }
 
-    fn advertised_emoji_tapbacks(document: &Dictionary, service: usize) -> Option<bool> {
+    fn advertised_capability(
+        document: &Dictionary,
+        service: usize,
+        capability: &str,
+    ) -> Option<bool> {
         let service = document["services"].as_array()?[service].as_dictionary()?;
         let user = service["users"].as_array()?.first()?.as_dictionary()?;
         user["client-data"]
             .as_dictionary()?
-            .get("supports-emoji-tapbacks")?
+            .get(capability)?
             .as_boolean()
     }
 
@@ -786,6 +808,7 @@ mod tests {
             ids_private_key: Data::new(ids_key.private_key_to_der()?),
             facetime_certificates: BTreeMap::new(),
             facetime_relay_signing_private_key: None,
+            facetime_device: None,
             signing_private_key: Data::new(signing.private_key_to_der()?),
             encryption_private_key: Data::new(encryption.private_key_to_der()?),
             protocol_version: 1650,
@@ -836,6 +859,18 @@ mod tests {
             let (headers, payload) = captured.try_recv()?;
             let (document, advertised_key) =
                 request_identity(&headers, &payload, &push_key, &ids_key)?;
+            assert_eq!(
+                advertised_capability(&document, 0, "supports-modern-gft"),
+                Some(true)
+            );
+            assert_eq!(
+                advertised_capability(&document, 0, "supports-live-delivery"),
+                None
+            );
+            assert_eq!(
+                advertised_capability(&document, 1, "supports-live-delivery"),
+                Some(true)
+            );
             let advertised_relay_key =
                 advertised_relay_key(&document, 0).context("Missing FaceTime device key")?;
             facetime::PeerDeviceKey::from_directory(advertised_relay_key)?;
@@ -843,6 +878,26 @@ mod tests {
                 let upgraded = Identity::parse(&result?)?;
                 assert!(upgraded.same_messaging_registration(&previous)?);
                 assert_eq!(upgraded.profile_id(), previous.profile_id());
+                let registered_device = (1660, "[macOS,15.7.5,24G624,Mac14,2]");
+                assert_eq!(
+                    upgraded.ids_device(TOPIC),
+                    (1650, "[Mac OS X,10.11.6,15G31,MacBookPro11,3]")
+                );
+                for topic in [
+                    facetime::SIGNALING,
+                    facetime::VIDEO,
+                    facetime::relay::RELAY_TOPIC,
+                ] {
+                    assert_eq!(upgraded.ids_device(topic), registered_device);
+                }
+                #[cfg(feature = "desktop")]
+                assert_eq!(
+                    upgraded
+                        .call_device()
+                        .context("Missing FaceTime device")?
+                        .model,
+                    "Mac14,2"
+                );
                 assert_eq!(
                     upgraded.ids_certificate(TOPIC),
                     Some(messages_cert.as_ref())
@@ -983,9 +1038,18 @@ mod tests {
             assert_eq!(identity.can_sign_relay_prekey(), face_time_granted);
             assert!(advertised_relay_key(&initial, 0).is_none());
             assert!(advertised_relay_key(&initial, 1).is_some());
-            assert_eq!(advertised_emoji_tapbacks(&initial, 0), Some(true));
-            assert_eq!(advertised_emoji_tapbacks(&initial, 1), None);
-            assert_eq!(advertised_emoji_tapbacks(&initial, 2), None);
+            assert_eq!(
+                advertised_capability(&initial, 0, "supports-emoji-tapbacks"),
+                Some(true)
+            );
+            assert_eq!(
+                advertised_capability(&initial, 1, "supports-emoji-tapbacks"),
+                None
+            );
+            assert_eq!(
+                advertised_capability(&initial, 2, "supports-emoji-tapbacks"),
+                None
+            );
             assert_eq!(
                 service_names(&initial),
                 [TOPIC, facetime::SIGNALING, facetime::VIDEO_SERVICE]
@@ -1000,7 +1064,10 @@ mod tests {
                     request_identity(&retry_headers, &body, &push_key, &auth_key)?;
                 assert_eq!(service_names(&retry), [TOPIC]);
                 assert!(advertised_relay_key(&retry, 0).is_none());
-                assert_eq!(advertised_emoji_tapbacks(&retry, 0), Some(true));
+                assert_eq!(
+                    advertised_capability(&retry, 0, "supports-emoji-tapbacks"),
+                    Some(true)
+                );
                 assert_eq!(retry_key, initial_key);
                 assert_eq!(
                     retry["validation-data"].as_data(),

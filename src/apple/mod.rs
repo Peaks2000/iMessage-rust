@@ -74,7 +74,15 @@ pub struct Identity {
     ids_key: PKey<Private>,
     facetime_certificates: std::collections::BTreeMap<String, Vec<u8>>,
     facetime_relay_signing: Option<facetime::RelaySigningKey>,
+    facetime_device: Option<IdsDevice>,
     message_keys: crypto::KeyPair<Private>,
+    protocol_version: u32,
+    user_agent: String,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Clone)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct IdsDevice {
     protocol_version: u32,
     user_agent: String,
 }
@@ -93,6 +101,8 @@ struct Session {
     facetime_certificates: std::collections::BTreeMap<String, Data>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     facetime_relay_signing_private_key: Option<Data>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    facetime_device: Option<IdsDevice>,
     signing_private_key: Data,
     encryption_private_key: Data,
     protocol_version: u32,
@@ -158,7 +168,7 @@ impl Identity {
     #[cfg(feature = "desktop")]
     pub(crate) fn call_device(&self) -> Option<CallDevice> {
         self.facetime_registered()
-            .then(|| CallDevice::from_ids_user_agent(&self.user_agent))
+            .then(|| CallDevice::from_ids_user_agent(self.ids_device(facetime::SIGNALING).1))
             .flatten()
     }
 
@@ -178,6 +188,7 @@ impl Identity {
 
     pub(crate) fn same_facetime_registration(&self, other: &Self) -> bool {
         self.facetime_certificates == other.facetime_certificates
+            && self.facetime_device == other.facetime_device
             && match (&self.facetime_relay_signing, &other.facetime_relay_signing) {
                 (Some(first), Some(second)) => first.same_key(second),
                 (None, None) => true,
@@ -190,13 +201,7 @@ impl Identity {
             plist::from_bytes(bytes).context("Could not decode version 1 Apple session plist")?;
         ensure!(session.version == 1, "Unsupported Apple session version");
         ensure!(
-            session.protocol_version > 0
-                && session.user_agent.len() <= 256
-                && !session.user_agent.is_empty()
-                && session
-                    .user_agent
-                    .bytes()
-                    .all(|byte| byte == b' ' || byte.is_ascii_graphic()),
+            session.protocol_version > 0 && valid_ids_user_agent(&session.user_agent),
             "Invalid Apple device protocol version or user agent"
         );
         let token = session
@@ -238,6 +243,15 @@ impl Identity {
                 || facetime_certificates.contains_key(facetime::SIGNALING),
             "FaceTime relay key requires a calling registration"
         );
+        let facetime_device = session.facetime_device.as_ref();
+        ensure!(
+            facetime_device.is_none_or(|device| {
+                facetime_certificates.contains_key(facetime::SIGNALING)
+                    && device.protocol_version > 0
+                    && valid_ids_user_agent(&device.user_agent)
+            }),
+            "Invalid FaceTime device metadata"
+        );
         Ok(Self {
             handle: address(&session.handle)?,
             token,
@@ -248,10 +262,23 @@ impl Identity {
             ids_key,
             facetime_certificates,
             facetime_relay_signing,
+            facetime_device: facetime_device.cloned(),
             message_keys,
             protocol_version: session.protocol_version,
             user_agent: session.user_agent.clone(),
         })
+    }
+
+    fn ids_device(&self, topic: &str) -> (u32, &str) {
+        if matches!(
+            topic,
+            facetime::SIGNALING | facetime::VIDEO | facetime::relay::RELAY_TOPIC
+        ) && let Some(device) = &self.facetime_device
+        {
+            (device.protocol_version, &device.user_agent)
+        } else {
+            (self.protocol_version, &self.user_agent)
+        }
     }
 
     fn ids_certificate(&self, topic: &str) -> Option<&[u8]> {
@@ -280,6 +307,13 @@ impl Identity {
                 .collect::<String>()
         )
     }
+}
+
+fn valid_ids_user_agent(agent: &str) -> bool {
+    (1..=256).contains(&agent.len())
+        && agent
+            .bytes()
+            .all(|byte| byte == b' ' || byte.is_ascii_graphic())
 }
 
 fn certified_rsa(certificate: &Data, key: &Data) -> Result<PKey<Private>> {

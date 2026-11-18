@@ -981,6 +981,7 @@ mod tests {
             ids_key: key,
             facetime_certificates: Default::default(),
             facetime_relay_signing: None,
+            facetime_device: None,
             message_keys: crate::apple::crypto::KeyPair::private(
                 &signing.private_key_to_der()?,
                 &Rsa::generate(1280)?.private_key_to_der()?,
