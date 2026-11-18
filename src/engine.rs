@@ -31,12 +31,14 @@ use crate::{
 };
 use crate::{
     apple::{
-        AuthorizedDownload, CallEndpoint, CallKeyOffer, CallMediaExchange, CallMediaHandshake,
-        CallRelayAllocation, CallSignal, Identity, Incoming, LocalCallPrekey, Madrid, Notification,
-        PeerMediaOffer, PeerPrekey, RING_TIMEOUT_MS,
+        AuthorizedDownload, AuthorizedUpload, CallEndpoint, CallKeyOffer, CallMediaExchange,
+        CallMediaHandshake, CallRelayAllocation, CallSignal, Identity, Incoming, LocalCallPrekey,
+        Madrid, MessageDestinations, Notification, PeerMediaOffer, PeerPrekey, RING_TIMEOUT_MS,
     },
     history::History,
 };
+
+const COURIER_REQUEST_CAPACITY: usize = 16;
 
 #[derive(Clone)]
 pub struct Engine {
@@ -50,11 +52,27 @@ pub struct Engine {
 struct State {
     history: Mutex<History>,
     download_slot: Semaphore,
+    upload_slot: Semaphore,
+    upload_queue: Arc<Semaphore>,
     _lock: File,
 }
 
 enum Request {
     Send(SendText, oneshot::Sender<Result<Message>>),
+    BeginAttachmentSend {
+        message: SendText,
+        reply: oneshot::Sender<Result<(Message, Option<MessageDestinations>)>>,
+    },
+    AuthorizeUpload {
+        input: bytes::Bytes,
+        reply: oneshot::Sender<Result<AuthorizedUpload>>,
+    },
+    DeliverAttachmentMessage {
+        message: SendText,
+        destinations: MessageDestinations,
+        references: Vec<MediaReference>,
+        reply: oneshot::Sender<Result<Delivery>>,
+    },
     Tapback {
         target: uuid::Uuid,
         request: SetTapback,
@@ -129,6 +147,8 @@ impl Engine {
         let state = Arc::new(State {
             history: Mutex::new(History::open(root, &profile)?),
             download_slot: Semaphore::new(1),
+            upload_slot: Semaphore::new(1),
+            upload_queue: Arc::new(Semaphore::new(COURIER_REQUEST_CAPACITY + 1)),
             _lock: lock,
         });
         state.history()?.recover()?;
@@ -139,7 +159,7 @@ impl Engine {
             facetime_registered: identity.facetime_registered(),
             incoming_calls: Vec::new(),
         });
-        let (requests, receiver) = mpsc::channel(16);
+        let (requests, receiver) = mpsc::channel(COURIER_REQUEST_CAPACITY);
         #[cfg(feature = "desktop")]
         let call_device = identity.call_device().map(Arc::new);
         tokio::spawn(run_apple(identity, state.clone(), receiver, updates));
@@ -288,6 +308,22 @@ impl Engine {
                 <= FILE_LIMIT,
             "A message can contain up to 32 MiB of attachments"
         );
+        if !request.files.is_empty() {
+            let queued = self
+                .state
+                .upload_queue
+                .clone()
+                .try_acquire_owned()
+                .context("The attachment upload queue is full")?;
+            let engine = self.clone();
+            // Finish the send and record its outcome even if an API client disconnects.
+            return tokio::spawn(async move {
+                let _queued = queued;
+                engine.send_with_attachments(request).await
+            })
+            .await
+            .context("The attachment send task stopped")?;
+        }
         let (reply, answer) = oneshot::channel();
         self.requests
             .try_send(Request::Send(request, reply))
@@ -295,6 +331,53 @@ impl Engine {
         answer
             .await
             .context("The Apple engine stopped during the request")?
+    }
+
+    async fn send_with_attachments(&self, message: SendText) -> Result<Message> {
+        let _upload = self.state.upload_slot.acquire().await?;
+        let (reply, answer) = oneshot::channel();
+        self.requests
+            .try_send(Request::BeginAttachmentSend {
+                message: message.clone(),
+                reply,
+            })
+            .context("The Apple engine is busy or stopped")?;
+        let (item, destinations) = answer
+            .await
+            .context("The Apple engine stopped while preparing the message")??;
+        let Some(destinations) = destinations else {
+            return Ok(item);
+        };
+        let delivery = async {
+            let mut references = Vec::with_capacity(message.files.len());
+            for file in &message.files {
+                let (reply, answer) = oneshot::channel();
+                self.requests
+                    .try_send(Request::AuthorizeUpload {
+                        input: file.bytes.clone(),
+                        reply,
+                    })
+                    .context("The Apple engine is busy or stopped")?;
+                let authorized = answer
+                    .await
+                    .context("The Apple engine stopped while authorizing the upload")??;
+                references.push(authorized.transfer().await?);
+            }
+            let (reply, answer) = oneshot::channel();
+            self.requests
+                .try_send(Request::DeliverAttachmentMessage {
+                    message,
+                    destinations,
+                    references,
+                    reply,
+                })
+                .context("The Apple engine is busy or stopped")?;
+            answer
+                .await
+                .context("The Apple engine stopped while delivering the message")?
+        }
+        .await;
+        finish_send(&self.state, item, delivery)
     }
 
     pub async fn attachment(&self, id: uuid::Uuid, index: usize) -> Result<bytes::Bytes> {
@@ -386,6 +469,18 @@ async fn run_apple(
                                 .and_then(|previous| previous.context("Apple courier is disconnected"));
                             let _ = reply.send(result);
                         }
+                        Request::BeginAttachmentSend { message, reply } => {
+                            let result = state.history().and_then(|history| read_previous(&history, &message))
+                                .and_then(|previous| previous.context("Apple courier is disconnected"))
+                                .map(|item| (item, None));
+                            let _ = reply.send(result);
+                        }
+                        Request::AuthorizeUpload { reply, .. } => {
+                            let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
+                        }
+                        Request::DeliverAttachmentMessage { reply, .. } => {
+                            let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
+                        }
                         Request::AuthorizeDownload { reply, .. } => {
                             let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
                         }
@@ -473,6 +568,16 @@ async fn online(
                 match request {
                     Request::Send(message, reply) => {
                         let _ = reply.send(send_on_courier(identity, state, madrid, &message).await);
+                    }
+                    Request::BeginAttachmentSend { message, reply } => {
+                        let _ = reply.send(prepare_send(identity, state, madrid, &message).await);
+                    }
+                    Request::AuthorizeUpload { input, reply } => {
+                        let _ = reply.send(madrid.authorize_upload(identity, &input).await);
+                    }
+                    Request::DeliverAttachmentMessage { message, destinations, references, reply } => {
+                        let result = send_uploaded_message(identity, state, madrid, &message, destinations, references).await;
+                        let _ = reply.send(result);
                     }
                     Request::AuthorizeDownload { media, reply } => {
                         // Only MMCS authorization uses the courier. The HTTPS transfer runs
@@ -1139,15 +1244,58 @@ async fn send_on_courier(
     madrid: &mut Madrid,
     request: &SendText,
 ) -> Result<Message> {
-    let (mut item, is_new) = {
+    let (item, destinations) = prepare_send(identity, state, madrid, request).await?;
+    let Some(destinations) = destinations else {
+        return Ok(item);
+    };
+    let delivery = madrid
+        .send(identity, request, destinations, Vec::new())
+        .await;
+    finish_send(state, item, delivery)
+}
+
+async fn prepare_send(
+    identity: &Identity,
+    state: &State,
+    madrid: &mut Madrid,
+    request: &SendText,
+) -> Result<(Message, Option<MessageDestinations>)> {
+    let (item, is_new) = {
         let history = state.history()?;
         start_send(&history, request)?
     };
     if !is_new {
-        return Ok(item);
+        return Ok((item, None));
     }
     ensure!(item.status == Delivery::Pending, "Invalid outgoing state");
-    let delivery = madrid.send(identity, request).await;
+    match madrid.prepare_message(identity, &request.address).await {
+        Ok(destinations) => Ok((item, Some(destinations))),
+        Err(error) => {
+            state.history()?.update(&item.id, Delivery::Failed)?;
+            Err(error)
+        }
+    }
+}
+
+async fn send_uploaded_message(
+    identity: &Identity,
+    state: &State,
+    madrid: &mut Madrid,
+    request: &SendText,
+    destinations: MessageDestinations,
+    references: Vec<MediaReference>,
+) -> Result<Delivery> {
+    let pending = {
+        let history = state.history()?;
+        read_previous(&history, request)?.is_some_and(|item| item.status == Delivery::Pending)
+    };
+    ensure!(pending, "The attachment message is no longer pending");
+    madrid
+        .send(identity, request, destinations, references)
+        .await
+}
+
+fn finish_send(state: &State, mut item: Message, delivery: Result<Delivery>) -> Result<Message> {
     item.status = match &delivery {
         Ok(status) => *status,
         Err(_) => Delivery::Failed,
@@ -1570,6 +1718,8 @@ mod tests {
             state: Arc::new(State {
                 history: Mutex::new(history),
                 download_slot: Semaphore::new(1),
+                upload_slot: Semaphore::new(1),
+                upload_queue: Arc::new(Semaphore::new(COURIER_REQUEST_CAPACITY + 1)),
                 _lock: File::open(folder.path())?,
             }),
             requests: mpsc::channel(1).0,

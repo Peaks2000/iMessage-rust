@@ -170,11 +170,20 @@ impl Session {
     }
 }
 
-pub(super) async fn upload(
+pub(crate) struct AuthorizedUpload {
+    session: Session,
+    reference: MediaReference,
+    authorization: UploadAuthorization,
+    chunks: Vec<UploadChunk>,
+    encrypted: Bytes,
+    existing: bool,
+}
+
+pub(super) async fn authorize_upload(
     madrid: &mut Madrid,
     identity: &Identity,
     input: &[u8],
-) -> Result<MediaReference> {
+) -> Result<AuthorizedUpload> {
     let session = Session::new(identity)?;
     let mut key = [0; 32];
     rand_bytes(&mut key)?;
@@ -254,80 +263,104 @@ pub(super) async fn upload(
         authorization.targets.len() <= 16,
         "Too many MMCS upload locations"
     );
+    Ok(AuthorizedUpload {
+        session,
+        reference,
+        authorization,
+        chunks: manifest
+            .files
+            .into_iter()
+            .next()
+            .context("Missing MMCS upload file")?
+            .chunks,
+        encrypted,
+        existing,
+    })
+}
 
-    let data: HashMap<_, _> = manifest.files[0]
-        .chunks
-        .iter()
-        .enumerate()
-        .map(|(index, chunk)| {
-            let start = index * CHUNK_SIZE;
-            (
-                chunk.signature.as_slice(),
-                encrypted.slice(start..start + chunk.size as usize),
-            )
-        })
-        .collect();
-    let mut sent = HashSet::new();
-    for target in authorization.targets {
-        let edge = target.request.context("Missing MMCS upload request")?;
-        ensure!(
-            !target.chunks.is_empty() && target.chunks.len() <= data.len(),
-            "Invalid MMCS upload chunk list"
-        );
-        let mut buffer = BytesMut::new();
-        for chunk in &target.chunks {
-            let part = data
-                .get(chunk.checksum.as_slice())
-                .context("MMCS requested an unknown chunk")?;
-            buffer.extend_from_slice(part);
-            sent.insert(chunk.checksum.clone());
-        }
-        let length = buffer.len();
-        let md5 = hash(MessageDigest::md5(), &buffer)?.to_vec();
-        let finish_at_edge = edge.headers.iter().any(|field| {
-            field
-                .name
-                .eq_ignore_ascii_case("x-apple-put-complete-at-edge-version")
-                && field.value == "2"
-        });
-        let body = if finish_at_edge {
-            let footer = EdgeFooter {
-                md5: md5.clone(),
-                completion_data: authorization.completion_data.clone(),
-            }
-            .encode_to_vec();
-            buffer.put_u32(footer.len() as u32);
-            buffer.extend_from_slice(&footer);
-            Body::wrap_stream(futures_util::stream::once(async {
-                Ok::<_, std::io::Error>(buffer.freeze())
-            }))
-        } else {
-            Body::from(buffer.freeze())
-        };
-        let (response, url) = session.edge(&edge, Method::PUT, Some(body)).await?;
-        let receipt = make_receipt(&response, &url, &target.token, Some(md5));
-        let _ = read_body(response, 256 * 1024).await?;
-        if !finish_at_edge {
-            let completion = Completion {
-                requests: vec![receipt],
-                data: authorization.completion_data.clone(),
-            };
-            session
-                .complete(
-                    &reference,
-                    "putComplete",
-                    format!("{} {} {}", target.authorization, length, target.token),
-                    &reference.object,
-                    completion,
+impl AuthorizedUpload {
+    pub(crate) async fn transfer(self) -> Result<MediaReference> {
+        let Self {
+            session,
+            reference,
+            authorization,
+            chunks,
+            encrypted,
+            existing,
+        } = self;
+        let data: HashMap<_, _> = chunks
+            .iter()
+            .enumerate()
+            .map(|(index, chunk)| {
+                let start = index * CHUNK_SIZE;
+                (
+                    chunk.signature.as_slice(),
+                    encrypted.slice(start..start + chunk.size as usize),
                 )
-                .await?;
+            })
+            .collect();
+        let mut sent = HashSet::new();
+        for target in authorization.targets {
+            let edge = target.request.context("Missing MMCS upload request")?;
+            ensure!(
+                !target.chunks.is_empty() && target.chunks.len() <= data.len(),
+                "Invalid MMCS upload chunk list"
+            );
+            let mut buffer = BytesMut::new();
+            for chunk in &target.chunks {
+                let part = data
+                    .get(chunk.checksum.as_slice())
+                    .context("MMCS requested an unknown chunk")?;
+                buffer.extend_from_slice(part);
+                sent.insert(chunk.checksum.clone());
+            }
+            let length = buffer.len();
+            let md5 = hash(MessageDigest::md5(), &buffer)?.to_vec();
+            let finish_at_edge = edge.headers.iter().any(|field| {
+                field
+                    .name
+                    .eq_ignore_ascii_case("x-apple-put-complete-at-edge-version")
+                    && field.value == "2"
+            });
+            let body = if finish_at_edge {
+                let footer = EdgeFooter {
+                    md5: md5.clone(),
+                    completion_data: authorization.completion_data.clone(),
+                }
+                .encode_to_vec();
+                buffer.put_u32(footer.len() as u32);
+                buffer.extend_from_slice(&footer);
+                Body::wrap_stream(futures_util::stream::once(async {
+                    Ok::<_, std::io::Error>(buffer.freeze())
+                }))
+            } else {
+                Body::from(buffer.freeze())
+            };
+            let (response, url) = session.edge(&edge, Method::PUT, Some(body)).await?;
+            let receipt = make_receipt(&response, &url, &target.token, Some(md5));
+            let _ = read_body(response, 256 * 1024).await?;
+            if !finish_at_edge {
+                let completion = Completion {
+                    requests: vec![receipt],
+                    data: authorization.completion_data.clone(),
+                };
+                session
+                    .complete(
+                        &reference,
+                        "putComplete",
+                        format!("{} {} {}", target.authorization, length, target.token),
+                        &reference.object,
+                        completion,
+                    )
+                    .await?;
+            }
         }
+        ensure!(
+            existing || sent.len() == data.len(),
+            "MMCS did not accept every attachment chunk"
+        );
+        Ok(reference)
     }
-    ensure!(
-        existing || sent.len() == data.len(),
-        "MMCS did not accept every attachment chunk"
-    );
-    Ok(reference)
 }
 
 pub(crate) struct AuthorizedDownload {

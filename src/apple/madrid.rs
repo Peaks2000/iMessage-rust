@@ -59,6 +59,8 @@ struct Destination {
     device_key: Option<facetime::PeerDeviceKey>,
 }
 
+pub(crate) struct MessageDestinations(HashMap<String, Vec<Destination>>);
+
 pub(crate) struct OutgoingCallTargets {
     pub(crate) relay: Arc<facetime::OutgoingRelay>,
     targets: HashMap<String, Vec<Destination>>,
@@ -404,15 +406,28 @@ impl Madrid {
         Ok(results)
     }
 
+    pub(crate) async fn prepare_message(
+        &mut self,
+        identity: &Identity,
+        recipient: &str,
+    ) -> Result<MessageDestinations> {
+        self.message_destinations(identity, TOPIC, recipient)
+            .await
+            .map(MessageDestinations)
+    }
+
     pub(crate) async fn send(
         &mut self,
         identity: &Identity,
         message: &SendText,
+        destinations: MessageDestinations,
+        references: Vec<MediaReference>,
     ) -> Result<Delivery> {
+        ensure!(
+            message.files.len() == references.len(),
+            "Missing outgoing attachment references"
+        );
         let participants = [&identity.handle[..], &message.address[..]];
-        let targets = self
-            .message_destinations(identity, TOPIC, &message.address)
-            .await?;
         let plain = format!("{}{}", "\u{fffc}".repeat(message.files.len()), message.body);
         let mut content = dictionary([
             ("t", value(plain)),
@@ -427,14 +442,14 @@ impl Madrid {
         let text = if message.files.is_empty() {
             compress(&binary(&content)?)?
         } else {
-            let mut files = Vec::with_capacity(message.files.len());
-            for file in &message.files {
-                let reference = mmcs::upload(self, identity, &file.bytes).await?;
-                files.push((file.info.clone(), reference));
-            }
+            let files = message
+                .files
+                .iter()
+                .map(|file| file.info.clone())
+                .zip(references);
             content.insert(
                 "x".into(),
-                value(message_content::encode(&message.body, files.into_iter())?),
+                value(message_content::encode(&message.body, files)?),
             );
             binary(&content)?
         };
@@ -447,7 +462,7 @@ impl Madrid {
                 request_receipt: true,
                 kind: DeliveryKind::Message,
             },
-            &targets,
+            &destinations.0,
         )
         .await
     }
@@ -1014,6 +1029,14 @@ impl Madrid {
         reference: Box<MediaReference>,
     ) -> Result<mmcs::AuthorizedDownload> {
         mmcs::authorize_download(self, identity, reference).await
+    }
+
+    pub(crate) async fn authorize_upload(
+        &mut self,
+        identity: &Identity,
+        input: &[u8],
+    ) -> Result<mmcs::AuthorizedUpload> {
+        mmcs::authorize_upload(self, identity, input).await
     }
 
     pub(super) async fn media_request<const N: usize>(
@@ -2051,6 +2074,63 @@ mod tests {
             )
         })
         .await??;
+
+        use crate::apple::mmcs_wire::{ExistingFile, UploadAuthorization};
+        let simulate_upload = async {
+            let request = Frame::read(&mut mock).await?;
+            let wire: Dictionary =
+                plist::from_bytes(request.field(3).context("Missing MMCS upload")?)?;
+            assert_eq!(wire["c"].as_unsigned_integer(), Some(150));
+            let authorization = UploadAuthorization {
+                existing: vec![ExistingFile {
+                    signature: wire["mS"]
+                        .as_data()
+                        .context("Missing upload signature")?
+                        .to_vec(),
+                    receipt: "fixture".into(),
+                }],
+                ..Default::default()
+            };
+            let response = binary(&dictionary([
+                ("c", 150.into()),
+                ("i", wire["i"].clone()),
+                ("cB", data(&authorization.encode_to_vec())),
+                ("mR", value("https://mmcs.example.icloud.com")),
+                ("mU", value("test-upload")),
+            ]))?;
+            write_frame(
+                &mut mock,
+                0x0b,
+                &[
+                    (4, request.field(4).context("Missing upload push ID")?),
+                    (8, &[0]),
+                ],
+            )
+            .await?;
+            write_frame(
+                &mut mock,
+                0x0a,
+                &[(2, &sha1(TOPIC.as_bytes())), (3, &response), (4, &[8; 4])],
+            )
+            .await?;
+            assert_eq!(
+                Frame::read(&mut mock).await?.field(4),
+                Some([8; 4].as_slice())
+            );
+            Ok::<_, anyhow::Error>(())
+        };
+        let (upload, ()) = timeout(Duration::from_secs(3), async {
+            tokio::try_join!(
+                madrid.authorize_upload(&identity, b"fixture bytes"),
+                simulate_upload
+            )
+        })
+        .await??;
+        let reference = upload.transfer().await?;
+        assert_eq!(
+            reference.url.as_str(),
+            "https://mmcs.example.icloud.com/test-upload"
+        );
         Ok(())
     }
 }

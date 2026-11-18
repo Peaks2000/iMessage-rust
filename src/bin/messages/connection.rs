@@ -575,8 +575,14 @@ async fn work(
                 Event::Older { chat, result }
             }
             Action::Send(request) => {
-                let result = backend.send(&request).await;
-                Event::Sent { request, result }
+                let backend = backend.clone();
+                let events = events.clone();
+                let context = context.clone();
+                tokio::spawn(async move {
+                    let result = backend.send(&request).await;
+                    emit(&events, &context, Event::Sent { request, result });
+                });
+                continue;
             }
             Action::Tapback { id, request } => {
                 let result = backend.set_tapback(id, request).await;
@@ -994,6 +1000,89 @@ mod tests {
         assert_eq!(id, declined);
         drop(pause);
         assert_eq!(*connection.call_activity.borrow(), None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn desktop_can_decline_a_ring_while_an_attachment_send_is_pending() -> Result<()> {
+        use axum::{http::StatusCode, routing::post};
+        use tokio::{sync::Notify, time::timeout};
+
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let router = Router::new()
+            .route(
+                "/v1/messages",
+                post({
+                    let started = started.clone();
+                    let release = release.clone();
+                    move || async move {
+                        started.notify_one();
+                        release.notified().await;
+                        StatusCode::BAD_GATEWAY
+                    }
+                }),
+            )
+            .route(
+                "/v1/calls/{id}/decline",
+                post(|| async { StatusCode::NO_CONTENT }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let settings = Settings {
+            url: format!("http://{}", listener.local_addr()?),
+            mode: Mode::Remote,
+            ..Default::default()
+        };
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+        let backend = Arc::new(Backend::Remote(Remote::new(
+            &settings,
+            Zeroizing::default(),
+        )?));
+        let (actions, requests) = tokio::sync::mpsc::unbounded_channel();
+        let (report, events) = mpsc::channel();
+        let worker = tokio::spawn(async move {
+            work(requests, &report, &egui::Context::default(), backend).await
+        });
+        let fixture = bytes::Bytes::from_static(b"photo bytes");
+        actions
+            .send(Action::Send(SendText {
+                id: Uuid::new_v4(),
+                address: "peer@example.org".into(),
+                body: String::new(),
+                files: vec![linux_imessage::Upload {
+                    info: linux_imessage::Attachment {
+                        name: "photo.jpg".into(),
+                        mime: "image/jpeg".into(),
+                        size: fixture.len(),
+                        width: 0,
+                        height: 0,
+                        part: None,
+                    },
+                    bytes: fixture,
+                }],
+            }))
+            .map_err(|_| anyhow::anyhow!("Desktop worker stopped"))?;
+        let deadline = Duration::from_secs(3);
+        timeout(deadline, started.notified()).await?;
+        let (activity, _observed) = watch::channel(None);
+        let id = Uuid::new_v4();
+        actions
+            .send(Action::DeclineCall {
+                id,
+                pause: RingPause::new(&activity, id)?,
+            })
+            .map_err(|_| anyhow::anyhow!("Desktop worker stopped"))?;
+        let (event, events) =
+            tokio::task::spawn_blocking(move || (events.recv_timeout(deadline), events)).await?;
+        assert!(
+            matches!(event?, Event::CallDeclined { id: declined, result: Ok(()) } if declined == id)
+        );
+        release.notify_one();
+        let event = tokio::task::spawn_blocking(move || events.recv_timeout(deadline)).await??;
+        assert!(matches!(event, Event::Sent { result: Err(_), .. }));
+        drop(actions);
+        worker.await?;
+        server.abort();
         Ok(())
     }
 

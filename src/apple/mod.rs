@@ -49,8 +49,8 @@ pub(crate) use facetime::{
     PeerKeyOffer, PeerMediaOffer, PeerPrekey, RING_TIMEOUT_MS, RelayMediaEvent, RelayPeerUpdate,
     RingingRelay, SignedRelayKeys, SignedRelayPrekey,
 };
-pub(crate) use madrid::{Incoming, Madrid, Notification, OutgoingCallTargets};
-pub(crate) use mmcs::AuthorizedDownload;
+pub(crate) use madrid::{Incoming, Madrid, MessageDestinations, Notification, OutgoingCallTargets};
+pub(crate) use mmcs::{AuthorizedDownload, AuthorizedUpload};
 use openssl::{
     hash::MessageDigest,
     pkey::{Id, PKey, PKeyRef, Private},
