@@ -17,6 +17,7 @@ use crate::{
 use super::{
     AnsweredCall,
     aac::{self, Decoder, FRAME_SAMPLES, SAMPLE_RATE},
+    video::{VideoCallOptions, VideoSession},
 };
 
 const PCM_BYTES: usize = FRAME_SAMPLES * size_of::<i16>();
@@ -27,13 +28,37 @@ impl AnsweredCall {
     /// Run an accepted audio call on the default Linux microphone and speakers.
     /// Dropping the future or receiving a hangup releases both devices.
     pub async fn run_audio(
-        mut self,
-        mut muted: watch::Receiver<bool>,
+        self,
+        muted: watch::Receiver<bool>,
         audio_ready: impl FnOnce(),
     ) -> Result<()> {
+        self.run_media(muted, None, audio_ready).await
+    }
+
+    /// Run an accepted audio and video call using local Linux media devices.
+    pub async fn run_video(
+        self,
+        muted: watch::Receiver<bool>,
+        video: VideoCallOptions,
+        media_ready: impl FnOnce(),
+    ) -> Result<()> {
+        self.run_media(muted, Some(video), media_ready).await
+    }
+
+    async fn run_media(
+        mut self,
+        mut muted: watch::Receiver<bool>,
+        video: Option<VideoCallOptions>,
+        media_ready: impl FnOnce(),
+    ) -> Result<()> {
+        let mode = if video.is_some() {
+            CallMode::Video
+        } else {
+            CallMode::Audio
+        };
         ensure!(
-            self.local_description.mode == Some(CallMode::Audio),
-            "An audio-only session is required by this FaceTime device driver"
+            self.local_description.mode == Some(mode),
+            "The media devices do not match the accepted FaceTime call"
         );
         ensure!(
             self.local_description
@@ -51,6 +76,21 @@ impl AnsweredCall {
         if ended.has_changed().is_err() {
             return Ok(());
         }
+        let mut video = video
+            .map(|options| {
+                VideoSession::start(
+                    self.local_description
+                        .video
+                        .as_ref()
+                        .context("The call has no local camera stream")?,
+                    self.remote_description
+                        .video
+                        .as_ref()
+                        .context("The call has no remote camera stream")?,
+                    options,
+                )
+            })
+            .transpose()?;
         let (mut encoder, decoder) = aac::open()?;
         let mut capture_device = audio_device(true)?;
         let mut playback_device = audio_device(false)?;
@@ -71,13 +111,20 @@ impl AnsweredCall {
         let incoming_ssrc = self.remote_description.audio.ssrc;
         let playback = play_audio(output, decoder, pending, incoming_ssrc);
         tokio::pin!(playback);
-        audio_ready();
+        media_ready();
 
         let result = async {
             loop {
                 tokio::select! {
                     _ = ended.changed() => return Ok(()),
                     result = &mut playback => return result,
+                    packet = async {
+                        if let Some(video) = &mut video {
+                            video.next_packet().await
+                        } else {
+                            std::future::pending::<Result<Zeroizing<Vec<u8>>>>().await
+                        }
+                    } => self.send_rtp(packet?.as_slice()).await?,
                     frame = input.next_frame() => {
                         let mut frame = frame?;
                         let mute_changed = muted.has_changed().unwrap_or(false);
@@ -107,6 +154,8 @@ impl AnsweredCall {
                             feedback.observe(&header, &packet);
                             // A stalled sound device cannot block the authenticated relay.
                             let _ = packets.try_send(packet);
+                        } else if let Some(video) = &mut video {
+                            video.receive(&packet);
                         }
                     }
                 }

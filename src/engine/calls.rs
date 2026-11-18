@@ -12,6 +12,8 @@ use zeroize::Zeroizing;
 mod aac;
 #[cfg(feature = "desktop")]
 mod audio;
+#[cfg(feature = "desktop")]
+pub mod video;
 
 use super::{Engine, IncomingCalls, Request, active_call};
 use crate::{

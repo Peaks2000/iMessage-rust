@@ -128,6 +128,10 @@ pub(crate) struct RtpHeader {
     pub(crate) ssrc: u32,
     pub(crate) sequence: u16,
     pub(crate) payload_type: u8,
+    #[cfg(feature = "desktop")]
+    pub(crate) marker: bool,
+    #[cfg(feature = "desktop")]
+    pub(crate) timestamp: u32,
 }
 
 impl RtpHeader {
@@ -147,6 +151,10 @@ impl RtpHeader {
             ssrc: u32::from_be_bytes(bytes[8..12].try_into().ok()?),
             sequence: u16::from_be_bytes(bytes[2..4].try_into().ok()?),
             payload_type: bytes[1] & 0x7f,
+            #[cfg(feature = "desktop")]
+            marker: bytes[1] & 0x80 != 0,
+            #[cfg(feature = "desktop")]
+            timestamp: u32::from_be_bytes(bytes[4..8].try_into().ok()?),
             size,
         })
     }

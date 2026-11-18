@@ -1,5 +1,7 @@
 mod calls;
 
+#[cfg(feature = "desktop")]
+pub use calls::video;
 use calls::{AnswerAttempt, AnswerLifetime, ConnectedCall, JoinAnswer};
 pub use calls::{AnsweredCall, CallAnswerConfig};
 
