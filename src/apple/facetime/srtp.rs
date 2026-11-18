@@ -123,15 +123,15 @@ fn streams(
     )
 }
 
-struct RtpHeader {
+pub(crate) struct RtpHeader {
     size: usize,
-    ssrc: u32,
-    sequence: u16,
-    payload_type: u8,
+    pub(crate) ssrc: u32,
+    pub(crate) sequence: u16,
+    pub(crate) payload_type: u8,
 }
 
 impl RtpHeader {
-    fn parse(bytes: &[u8]) -> Option<Self> {
+    pub(crate) fn parse(bytes: &[u8]) -> Option<Self> {
         if !(FIXED_HEADER..=MAX_PACKET).contains(&bytes.len()) || bytes[0] >> 6 != 2 {
             return None;
         }
@@ -149,6 +149,26 @@ impl RtpHeader {
             payload_type: bytes[1] & 0x7f,
             size,
         })
+    }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn payload<'a>(&self, bytes: &'a [u8]) -> Option<&'a [u8]> {
+        let payload = bytes.get(self.size..)?;
+        if bytes[0] & 0x20 == 0 {
+            return Some(payload);
+        }
+        self.valid_padding(bytes)
+            .then(|| &payload[..payload.len() - usize::from(bytes[bytes.len() - 1])])
+    }
+
+    #[cfg(feature = "desktop")]
+    pub(crate) fn extension<'a>(&self, bytes: &'a [u8]) -> Option<(u16, &'a [u8])> {
+        if bytes.first()? & 0x10 == 0 {
+            return None;
+        }
+        let offset = FIXED_HEADER + usize::from(bytes[0] & 0x0f) * 4;
+        let profile = u16::from_be_bytes(bytes.get(offset..offset + 2)?.try_into().ok()?);
+        Some((profile, bytes.get(offset + 4..self.size)?))
     }
 
     fn valid_padding(&self, bytes: &[u8]) -> bool {

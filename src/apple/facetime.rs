@@ -18,6 +18,8 @@ pub use relay::{
     CallRelayStream, RelayChannel, RelayDatagramChannel, RelayStreamDirection,
 };
 pub(crate) use srtp::CallRtpProtection;
+#[cfg(feature = "desktop")]
+pub(crate) use srtp::RtpHeader;
 
 pub(super) const SIGNALING: &str = "com.apple.private.alloy.facetime.multi";
 pub(super) const VIDEO: &str = "com.apple.private.alloy.facetime.video";

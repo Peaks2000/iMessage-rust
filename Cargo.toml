@@ -9,7 +9,7 @@ publish = false
 [features]
 default = ["desktop"]
 desktop = [
-    "dep:arboard", "dep:eframe", "dep:heic-rs", "dep:image", "dep:linkify",
+    "dep:arboard", "dep:eframe", "dep:fdk-aac-sys", "dep:heic-rs", "dep:image", "dep:linkify",
     "dep:phonenumber", "dep:raw-window-handle", "dep:roxmltree",
     "dep:smithay-client-toolkit", "dep:wayland-client", "dep:winit",
 ]
@@ -36,6 +36,7 @@ clap = { version = "4", features = ["derive"] }
 compcol = { version = "0.7.3", default-features = false, features = ["qpack"] }
 directories = "6"
 eframe = { version = "0.33.3", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"], optional = true }
+fdk-aac-sys = { version = "0.5", optional = true }
 flate2 = "1"
 foreign-types = "0.3"
 fs2 = "0.4"

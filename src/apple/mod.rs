@@ -24,6 +24,8 @@ pub use registration::register_device;
 pub use ssh_setup::{SshPrompt, run_ssh_askpass};
 
 use anyhow::{Context, Result, ensure};
+#[cfg(feature = "desktop")]
+pub(crate) use facetime::RtpHeader as CallRtpHeader;
 #[cfg(test)]
 pub(crate) use facetime::decode as decode_call_fixture;
 #[cfg(test)]

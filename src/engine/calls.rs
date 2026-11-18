@@ -8,6 +8,11 @@ use tokio::{
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+#[cfg(feature = "desktop")]
+mod aac;
+#[cfg(feature = "desktop")]
+mod audio;
+
 use super::{Engine, IncomingCalls, Request, active_call};
 use crate::{
     CallMode, IncomingCall, Status,

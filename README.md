@@ -6,7 +6,7 @@ A desktop app for Linux modelled on macOS Sequoia Messages, an optional self-hos
 
 ## Try the desktop app
 
-Build on Linux with Rust 1.88 or newer, a C compiler, pkg-config, and the OpenSSL development headers. The desktop uses OpenGL on Wayland or X11. A desktop Secret Service provider, such as GNOME Keyring or KWallet with its Secret Service integration enabled, is required for desktop credential storage.
+Build on Linux with Rust 1.88 or newer, C and C++ compilers, pkg-config, and the OpenSSL development headers. The desktop uses OpenGL on Wayland or X11. A desktop Secret Service provider, such as GNOME Keyring or KWallet with its Secret Service integration enabled, is required for desktop credential storage.
 
 ```sh
 cargo build --locked --release
@@ -65,4 +65,4 @@ cargo test --locked --all-targets
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-The repository contains the Rust engine source. Protocol references are [Apple Platform Security](https://support.apple.com/guide/security/how-imessage-sends-and-receives-messages-sec70e68c949/web), [NowSecure's APNs research](https://www.nowsecure.com/blog/2021/01/27/reverse-engineering-imessage-leveraging-the-hardware-to-protect-the-software/), and [the RustPush protocol implementation](https://github.com/OpenBubbles/rustpush/tree/b3c96c23e1aae78d1229ebaccb12027624f1eaff). The bundled public roots are supplied by [Apple's Certificate Authority](https://www.apple.com/certificateauthority/). [Inter is distributed under the SIL Open Font License](assets/Inter-OFL.txt).
+The repository contains the Rust engine source. Protocol references are [Apple Platform Security](https://support.apple.com/guide/security/how-imessage-sends-and-receives-messages-sec70e68c949/web), [NowSecure's APNs research](https://www.nowsecure.com/blog/2021/01/27/reverse-engineering-imessage-leveraging-the-hardware-to-protect-the-software/), and [the RustPush protocol implementation](https://github.com/OpenBubbles/rustpush/tree/b3c96c23e1aae78d1229ebaccb12027624f1eaff). The bundled public roots are supplied by [Apple's Certificate Authority](https://www.apple.com/certificateauthority/). [Inter is distributed under the SIL Open Font License](assets/Inter-OFL.txt). The desktop build includes the [Fraunhofer FDK AAC codec](https://docs.rs/crate/fdk-aac-sys/0.5.0/source/aac/NOTICE).
