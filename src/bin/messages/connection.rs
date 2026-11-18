@@ -11,7 +11,7 @@ use anyhow::{Context, Result, ensure};
 use eframe::egui;
 use linux_imessage::{
     CallMode, Conversation, FILE_LIMIT, IncomingCall, Message, PAGE_SIZE, SendText, SetTapback,
-    Status, Tapback, api, display_address,
+    Status, Tapback, api,
     engine::{
         Engine,
         video::{VideoCallOptions, VideoFrame, prepare_camera},
@@ -28,6 +28,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use super::attachments::{AttachmentId, Contents, Purpose};
+use super::ringing::{RingAlert, RingPause};
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -90,7 +91,10 @@ pub enum Action {
         id: uuid::Uuid,
         request: SetTapback,
     },
-    DeclineCall(uuid::Uuid),
+    DeclineCall {
+        id: Uuid,
+        pause: RingPause,
+    },
     StartCall {
         id: Uuid,
         start: CallStart,
@@ -165,6 +169,7 @@ pub struct Connection {
     pub actions: UnboundedSender<Action>,
     pub events: Receiver<Event>,
     worker: std::thread::JoinHandle<()>,
+    call_activity: watch::Sender<Option<Uuid>>,
 }
 
 pub struct VideoAnswer {
@@ -181,6 +186,7 @@ pub struct CallControls {
     mute: watch::Sender<bool>,
     end: Option<oneshot::Sender<()>>,
     video: Option<VideoControls>,
+    _ring_pause: RingPause,
 }
 
 impl CallControls {
@@ -244,11 +250,13 @@ impl Connection {
     pub(super) fn test_channels() -> (Self, UnboundedReceiver<Action>, Sender<Event>) {
         let (actions, requests) = tokio::sync::mpsc::unbounded_channel();
         let (report, events) = mpsc::channel();
+        let (call_activity, _) = watch::channel(None);
         (
             Self {
                 actions,
                 events,
                 worker: std::thread::spawn(|| {}),
+                call_activity,
             },
             requests,
             report,
@@ -265,6 +273,7 @@ impl Connection {
     ) -> Self {
         let (actions, receive) = tokio::sync::mpsc::unbounded_channel();
         let (send, events) = mpsc::channel();
+        let (call_activity, activity) = watch::channel(None);
         let context = context.clone();
         let worker = std::thread::spawn(move || {
             if let Some(old) = stop_first {
@@ -275,7 +284,13 @@ impl Connection {
                 let _ = worker.join();
             }
             let result = run(
-                receive, &send, &context, &root, &settings, previous, password,
+                receive,
+                &send,
+                &context,
+                &root,
+                (&settings, previous),
+                password,
+                activity,
             );
             if let Err(error) = result {
                 let _ = send.send(Event::ConnectionError(error.to_string()));
@@ -286,6 +301,7 @@ impl Connection {
             actions,
             events,
             worker,
+            call_activity,
         }
     }
 
@@ -293,11 +309,19 @@ impl Connection {
         self.start_call(id, mode, CallStart::Answer)
     }
 
+    pub fn decline_call(&self, id: Uuid) -> Result<()> {
+        let pause = RingPause::new(&self.call_activity, id)?;
+        self.actions
+            .send(Action::DeclineCall { id, pause })
+            .map_err(|_| anyhow::anyhow!("The connection is closed"))
+    }
+
     pub fn dial_call(&self, id: Uuid, recipient: &str, mode: CallMode) -> Result<CallControls> {
         self.start_call(id, mode, CallStart::Dial(recipient.to_owned()))
     }
 
     fn start_call(&self, id: Uuid, mode: CallMode, start: CallStart) -> Result<CallControls> {
+        let ring_pause = RingPause::new(&self.call_activity, id)?;
         let (mute, muted) = watch::channel(false);
         let (end, hang_up) = oneshot::channel();
         let (video, controls) = if mode == CallMode::Video {
@@ -329,6 +353,7 @@ impl Connection {
             mute,
             end: Some(end),
             video: controls,
+            _ring_pause: ring_pause,
         })
     }
 }
@@ -338,9 +363,9 @@ fn run(
     events: &Sender<Event>,
     context: &egui::Context,
     root: &Path,
-    settings: &Settings,
-    previous: Option<Settings>,
+    (settings, previous): (&Settings, Option<Settings>),
     mut password: Zeroizing<String>,
+    activity: watch::Receiver<Option<Uuid>>,
 ) -> Result<()> {
     let identity = if settings.mode == Mode::Local {
         let Some(identity) = storage::load_local_session(root)? else {
@@ -377,77 +402,103 @@ fn run(
         persist(root, settings, &previous, &backend)?;
     }
     let calls_registered = status.facetime_registered;
-    emit(events, context, Event::Ready(status));
+    emit(events, context, Event::Ready(status.clone()));
     runtime.block_on(async {
         let backend = Arc::new(backend);
-        if calls_registered {
+        let (stop, shutdown) = oneshot::channel();
+        let watcher = calls_registered.then(|| {
             tokio::spawn(watch_calls(
                 backend.clone(),
                 events.clone(),
                 context.clone(),
-            ));
-        }
+                status,
+                activity,
+                shutdown,
+            ))
+        });
         work(actions, events, context, backend).await;
+        drop(stop);
+        if let Some(watcher) = watcher {
+            let _ = watcher.await;
+        }
     });
     Ok(())
 }
 
-async fn watch_calls(backend: Arc<Backend>, events: Sender<Event>, context: egui::Context) {
+async fn watch_calls(
+    backend: Arc<Backend>,
+    events: Sender<Event>,
+    context: egui::Context,
+    mut status: Status,
+    mut activity: watch::Receiver<Option<Uuid>>,
+    mut shutdown: oneshot::Receiver<()>,
+) {
     let mut status_changes = match backend.as_ref() {
         Backend::Local(engine) => Some(engine.watch_status()),
         Backend::Remote(_) => None,
     };
     let mut previous: Vec<IncomingCall> = Vec::new();
+    let mut alert: Option<RingAlert> = None;
     let delay = Duration::from_secs(4);
     let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + delay, delay);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        if let Ok(status) = backend.status().await {
-            let mut calls = status.incoming_calls;
-            calls.retain(|call| call.expires_ms > now_ms());
-            if calls != previous {
-                for call in &calls {
-                    if !previous.iter().any(|earlier| earlier.id == call.id) {
-                        let call = call.clone();
-                        tokio::spawn(async move {
-                            let kind = match call.mode {
-                                Some(CallMode::Video) => "FaceTime Video",
-                                Some(CallMode::Audio) => "FaceTime Audio",
-                                None => "FaceTime",
-                            };
-                            let caller = display_address(&call.caller);
-                            let _ = tokio::time::timeout(
-                                Duration::from_secs(5),
-                                tokio::process::Command::new("notify-send")
-                                    .args([
-                                        "--app-name",
-                                        "iMessage",
-                                        "--icon",
-                                        "camera-video",
-                                        "--expire-time=5000",
-                                        "--hint",
-                                        "string:sound-name:phone-incoming-call",
-                                        "--",
-                                        &format!("{kind} · {caller}"),
-                                    ])
-                                    .kill_on_drop(true)
-                                    .output(),
-                            )
-                            .await;
-                        });
-                    }
-                }
-                previous = calls.clone();
-                emit(&events, &context, Event::IncomingCalls(calls));
-            }
-        }
         if let Some(changes) = &mut status_changes {
-            if changes.changed().await.is_err() {
-                return;
-            }
-        } else {
-            timer.tick().await;
+            status = changes.borrow_and_update().clone();
         }
+        let now = now_ms();
+        let calls = if status.connected && status.facetime_registered {
+            status
+                .incoming_calls
+                .iter()
+                .filter(|call| call.expires_ms > now)
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if calls != previous {
+            previous = calls;
+            emit(&events, &context, Event::IncomingCalls(previous.clone()));
+        }
+        let ring = if activity.borrow_and_update().is_none() {
+            previous.first()
+        } else {
+            None
+        };
+        if alert.as_ref().map(|handle| handle.id) != ring.map(|call| call.id) {
+            if let Some(active) = alert.take() {
+                active.stop().await;
+            }
+            if let Some(call) =
+                ring.filter(|call| call.expires_ms > now_ms() && activity.borrow().is_none())
+            {
+                alert = Some(RingAlert::start(call.clone()));
+            }
+        }
+        let expiry = previous.iter().map(|call| call.expires_ms).min();
+        let next_status = async {
+            if let Some(changes) = &mut status_changes {
+                changes.changed().await.ok()?;
+            } else {
+                timer.tick().await;
+                match backend.status().await {
+                    Ok(current) => status = current,
+                    Err(_) => status.connected = false,
+                }
+            }
+            Some(())
+        };
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => break,
+            updated = activity.changed() => if updated.is_err() { break },
+            next = next_status => if next.is_none() { break },
+            () = tokio::time::sleep(Duration::from_millis(expiry.unwrap_or(0).saturating_sub(now_ms()).max(0) as u64)), if expiry.is_some() => (),
+        }
+    }
+    if let Some(active) = alert {
+        active.stop().await;
     }
 }
 
@@ -495,8 +546,9 @@ async fn work(
                 let result = backend.set_tapback(id, request).await;
                 Event::Tapback { id, result }
             }
-            Action::DeclineCall(id) => {
+            Action::DeclineCall { id, pause } => {
                 let result = backend.decline_call(id).await;
+                drop(pause);
                 Event::CallDeclined { id, result }
             }
             Action::StartCall {
@@ -855,6 +907,12 @@ mod tests {
         let (connection, mut requests, _report) = Connection::test_channels();
         let id = Uuid::new_v4();
         let mut controls = connection.answer_call(id, CallMode::Audio)?;
+        assert_eq!(*connection.call_activity.borrow(), Some(id));
+        assert!(
+            connection
+                .answer_call(Uuid::new_v4(), CallMode::Audio)
+                .is_err()
+        );
         let Some(Action::StartCall {
             id: answered,
             start: CallStart::Answer,
@@ -874,6 +932,9 @@ mod tests {
         controls.hang_up();
         hang_up.await?;
         assert!(controls.ending());
+        assert_eq!(*connection.call_activity.borrow(), Some(id));
+        drop(controls);
+        assert_eq!(*connection.call_activity.borrow(), None);
 
         let controls = connection.answer_call(Uuid::new_v4(), CallMode::Audio)?;
         let Some(Action::StartCall { hang_up, .. }) = requests.recv().await else {
@@ -881,6 +942,17 @@ mod tests {
         };
         drop(controls);
         assert!(hang_up.await.is_err());
+        assert_eq!(*connection.call_activity.borrow(), None);
+
+        let declined = Uuid::new_v4();
+        connection.decline_call(declined)?;
+        assert_eq!(*connection.call_activity.borrow(), Some(declined));
+        let Some(Action::DeclineCall { id, pause }) = requests.recv().await else {
+            panic!("Expected a call decline");
+        };
+        assert_eq!(id, declined);
+        drop(pause);
+        assert_eq!(*connection.call_activity.borrow(), None);
         Ok(())
     }
 

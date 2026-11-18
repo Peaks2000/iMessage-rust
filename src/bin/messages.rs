@@ -19,6 +19,8 @@ mod contacts;
 mod links;
 #[path = "messages/mac_setup.rs"]
 mod mac_setup;
+#[path = "messages/ringing.rs"]
+mod ringing;
 #[path = "messages/session_import.rs"]
 mod session_import;
 #[path = "messages/window.rs"]

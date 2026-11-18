@@ -2494,6 +2494,7 @@ dependencies = [
  "uuid",
  "wayland-client",
  "winit",
+ "zbus 4.4.0",
  "zeroize",
 ]
 

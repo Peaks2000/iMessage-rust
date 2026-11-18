@@ -1023,12 +1023,21 @@ impl MessagesApp {
                         .status
                         .as_ref()
                         .is_some_and(|status| status.connected && status.facetime_registered);
+                let unavailable = match self.status.as_ref() {
+                    _ if self.config.mode == Mode::Remote => {
+                        "Use FaceTime with the Apple session on this computer"
+                    }
+                    Some(status) if !status.facetime_registered => {
+                        "Set up FaceTime in Messages Settings"
+                    }
+                    Some(status) if !status.connected => "FaceTime is disconnected",
+                    _ if self.active_call.is_some() => "A FaceTime call is in progress",
+                    _ => "Choose a conversation to call",
+                };
                 let facetime = controls
                     .add_enabled_ui(can_call, |ui| {
                         chrome::icon_button(ui, Icon::Video, "FaceTime", None)
-                            .on_disabled_hover_text(
-                                "FaceTime uses the Apple session on this computer",
-                            )
+                            .on_disabled_hover_text(unavailable)
                     })
                     .inner;
                 let mut outgoing = None;
@@ -1805,14 +1814,14 @@ impl MessagesApp {
                 }
                 Err(error) => self.call_error = Some((call.id, error.to_string())),
             }
-        } else if decline
-            && connection
-                .actions
-                .send(Action::DeclineCall(call.id))
-                .is_ok()
-        {
-            self.declining_call = Some(call.id);
-            self.call_error = None;
+        } else if decline {
+            match connection.decline_call(call.id) {
+                Ok(()) => {
+                    self.declining_call = Some(call.id);
+                    self.call_error = None;
+                }
+                Err(error) => self.call_error = Some((call.id, error.to_string())),
+            }
         }
     }
 
@@ -2019,6 +2028,19 @@ impl MessagesApp {
                                 "Connect directly to Apple using a registered session."
                             };
                             ui.label(RichText::new(label).color(MUTED));
+                            if self.config.mode == Mode::Local
+                                && self
+                                    .status
+                                    .as_ref()
+                                    .is_some_and(|status| !status.facetime_registered)
+                            {
+                                ui.label(
+                                    RichText::new(
+                                        "This Apple session needs FaceTime registration.",
+                                    )
+                                    .color(MUTED),
+                                );
+                            }
                             ui.add_space(3.);
                             ui.horizontal_wrapped(|ui| {
                                 setup_mac = ui

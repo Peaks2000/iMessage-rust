@@ -11,7 +11,7 @@ default = ["desktop"]
 desktop = [
     "dep:arboard", "dep:eframe", "dep:fdk-aac-sys", "dep:heic-rs", "dep:image", "dep:linkify",
     "dep:phonenumber", "dep:raw-window-handle", "dep:roxmltree",
-    "dep:smithay-client-toolkit", "dep:wayland-client", "dep:winit",
+    "dep:smithay-client-toolkit", "dep:wayland-client", "dep:winit", "dep:zbus",
 ]
 
 [[bin]]
@@ -71,4 +71,5 @@ url = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 wayland-client = { version = "0.31", features = ["system", "dlopen"], optional = true }
 winit = { version = "0.30", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen", "x11"], optional = true }
+zbus = { version = "4.4", optional = true }
 zeroize = { version = "1", features = ["derive", "serde"] }
