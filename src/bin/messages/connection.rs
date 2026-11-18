@@ -14,7 +14,7 @@ use linux_imessage::{
     Status, Tapback, api,
     engine::{
         Engine,
-        video::{VideoCallOptions, VideoFrame, prepare_camera},
+        video::{VideoCallOptions, VideoFrame, VideoStatus},
     },
     now_ms, storage,
 };
@@ -181,11 +181,13 @@ pub struct Connection {
 pub struct VideoAnswer {
     pub camera_enabled: watch::Receiver<bool>,
     pub frames: watch::Sender<Option<Arc<VideoFrame>>>,
+    pub status: watch::Sender<VideoStatus>,
 }
 
 struct VideoControls {
     camera_enabled: watch::Sender<bool>,
     frames: watch::Receiver<Option<Arc<VideoFrame>>>,
+    status: watch::Receiver<VideoStatus>,
 }
 
 pub struct CallControls {
@@ -236,12 +238,22 @@ impl CallControls {
         }
     }
 
-    pub fn next_video_frame(&mut self) -> Option<Arc<VideoFrame>> {
-        let video = self.video.as_mut()?;
-        if !video.frames.has_changed().unwrap_or(false) {
-            return None;
+    pub fn video_status(&self) -> Option<VideoStatus> {
+        self.video
+            .as_ref()
+            .map(|video| video.status.borrow().clone())
+    }
+
+    pub fn retry_camera(&self) {
+        if let Some(video) = &self.video {
+            video.camera_enabled.send_replace(true);
         }
-        video.frames.borrow_and_update().clone()
+    }
+
+    pub fn next_video_frame(&mut self) -> Option<Option<Arc<VideoFrame>>> {
+        let video = self.video.as_mut()?;
+        let frame = video.frames.borrow_and_update();
+        frame.has_changed().then(|| frame.clone())
     }
 
     pub fn hang_up(&mut self) {
@@ -333,14 +345,17 @@ impl Connection {
         let (video, controls) = if mode == CallMode::Video {
             let (camera, camera_enabled) = watch::channel(true);
             let (publish, frames) = watch::channel(None);
+            let (status, video_status) = watch::channel(VideoStatus::default());
             (
                 Some(VideoAnswer {
                     camera_enabled,
                     frames: publish,
+                    status,
                 }),
                 Some(VideoControls {
                     camera_enabled: camera,
                     frames,
+                    status: video_status,
                 }),
             )
         } else {
@@ -587,10 +602,10 @@ async fn work(
                         let Backend::Local(engine) = backend.as_ref() else {
                             anyhow::bail!("Use FaceTime with the Apple session on this computer");
                         };
-                        let (mode, camera) = if video.is_some() {
-                            (CallMode::Video, Some(prepare_camera().await?))
+                        let mode = if video.is_some() {
+                            CallMode::Video
                         } else {
-                            (CallMode::Audio, None)
+                            CallMode::Audio
                         };
                         let accepted = match start {
                             CallStart::Answer => engine.answer_desktop_call(id, mode).await?,
@@ -603,19 +618,24 @@ async fn work(
                             .mode
                             .context("Missing FaceTime media mode")?;
                         let ready = || emit(&events, &context, Event::CallConnected { id, mode });
-                        if let (CallMode::Video, Some(camera), Some(video)) = (mode, camera, video)
-                        {
+                        if let (CallMode::Video, Some(video)) = (mode, video) {
                             let mut frames = video.frames.subscribe();
+                            let mut status = video.status.subscribe();
                             let update = async {
-                                while frames.changed().await.is_ok() {
+                                loop {
+                                    tokio::select! {
+                                        Ok(()) = frames.changed() => (),
+                                        Ok(()) = status.changed() => (),
+                                        else => return std::future::pending::<Result<()>>().await,
+                                    }
                                     context.request_repaint();
                                 }
-                                std::future::pending::<Result<()>>().await
                             };
                             let options = VideoCallOptions {
-                                camera,
+                                camera: None,
                                 camera_enabled: video.camera_enabled,
                                 frames: video.frames,
+                                status: video.status,
                             };
                             tokio::select! {
                                 result = accepted.run_video(muted, options, ready) => result,

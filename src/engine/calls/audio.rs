@@ -119,10 +119,9 @@ impl AnsweredCall {
                         if let Some(video) = &mut video {
                             video.next_packet().await
                         } else {
-                            pending::<Result<Zeroizing<Vec<u8>>>>().await
+                            pending::<Zeroizing<Vec<u8>>>().await
                         }
                     } => {
-                        let packet = packet?;
                         if let Some(video) = &video {
                             let mut camera = video.camera_switch();
                             if *camera.borrow() && camera.has_changed().is_ok_and(|changed| !changed) {

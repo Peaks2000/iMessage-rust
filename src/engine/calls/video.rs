@@ -3,11 +3,9 @@ mod format;
 mod linux;
 mod session;
 
-pub use linux::{
-    DecodedFrames, HevcCamera, HevcDecoder, VIDEO_HEIGHT, VIDEO_WIDTH, VideoFrame, prepare_camera,
-};
-pub use session::VideoCallOptions;
+pub use linux::{DecodedFrames, HevcCamera, HevcDecoder, VIDEO_HEIGHT, VIDEO_WIDTH, VideoFrame};
 pub(super) use session::VideoSession;
+pub use session::{VideoCallOptions, VideoStatus};
 
 use std::collections::BTreeMap;
 

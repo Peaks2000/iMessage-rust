@@ -6,7 +6,6 @@ use std::{
     },
     path::{Path, PathBuf},
     process::Stdio,
-    time::Duration,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -23,48 +22,29 @@ pub const VIDEO_WIDTH: u16 = 640;
 pub const VIDEO_HEIGHT: u16 = 360;
 const RGBA_BYTES: usize = VIDEO_WIDTH as usize * VIDEO_HEIGHT as usize * 4;
 
-/// Check local codec support and select a capture device without starting a camera stream.
-pub async fn prepare_camera() -> Result<PathBuf> {
-    let camera = default_camera()?;
-    let encoder = tokio::time::timeout(
-        Duration::from_secs(3),
-        ffmpeg()
-            .args(["-h", "encoder=libx265"])
-            .stdin(Stdio::null())
-            .output(),
-    )
-    .await
-    .context("Checking the Linux video encoder timed out")?
-    .context("FaceTime video needs FFmpeg with the libx265 encoder")?;
-    ensure!(
-        encoder.status.success() && encoder.stdout.starts_with(b"Encoder libx265 "),
-        "FaceTime video needs FFmpeg with the libx265 encoder"
-    );
-    Ok(camera)
-}
-
-fn default_camera() -> Result<PathBuf> {
+pub(super) fn default_camera() -> Result<PathBuf> {
     let mut devices = std::fs::read_dir("/dev")
         .context("Looking for Linux cameras")?
         .filter_map(|entry| {
             let entry = entry.ok()?;
-            let number = entry
-                .file_name()
-                .to_str()?
-                .strip_prefix("video")?
-                .parse::<u32>()
-                .ok()?;
+            let name = entry.file_name();
+            let number = name.to_str()?.strip_prefix("video")?.parse::<u32>().ok()?;
+            let hardware = Path::new("/sys/class/video4linux")
+                .join(name)
+                .join("device")
+                .exists();
             entry
                 .file_type()
                 .ok()?
                 .is_char_device()
-                .then(|| (number, entry.path()))
+                .then(|| (!hardware, number, entry.path()))
         })
         .collect::<Vec<_>>();
-    devices.sort_unstable_by_key(|(number, _)| *number);
+    // An idle virtual camera can claim capture support without delivering frames.
+    devices.sort_unstable_by_key(|(virtual_device, number, _)| (*virtual_device, *number));
     devices
         .into_iter()
-        .map(|(_, path)| path)
+        .map(|(_, _, path)| path)
         .find(|path| is_capture_device(path))
         .context("No accessible Linux camera was found")
 }

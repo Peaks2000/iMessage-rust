@@ -1673,19 +1673,24 @@ impl MessagesApp {
                     "Cancel",
                 )
             };
-            if let Some(frame) = call.controls.next_video_frame() {
-                let image = egui::ColorImage::from_rgba_unmultiplied(
-                    [usize::from(frame.width), usize::from(frame.height)],
-                    &frame.rgba,
-                );
-                if let Some(texture) = &mut call.video_texture {
-                    texture.set(image, egui::TextureOptions::LINEAR);
+            let video_status = call.controls.video_status().unwrap_or_default();
+            if let Some(update) = call.controls.next_video_frame() {
+                if let Some(frame) = update {
+                    let image = egui::ColorImage::from_rgba_unmultiplied(
+                        [usize::from(frame.width), usize::from(frame.height)],
+                        &frame.rgba,
+                    );
+                    if let Some(texture) = &mut call.video_texture {
+                        texture.set(image, egui::TextureOptions::LINEAR);
+                    } else {
+                        call.video_texture = Some(ctx.load_texture(
+                            "FaceTime remote video",
+                            image,
+                            egui::TextureOptions::LINEAR,
+                        ));
+                    }
                 } else {
-                    call.video_texture = Some(ctx.load_texture(
-                        "FaceTime remote video",
-                        image,
-                        egui::TextureOptions::LINEAR,
-                    ));
+                    call.video_texture = None;
                 }
             }
             call_card(ctx, name, &detail, symbol, width, |ui| {
@@ -1699,10 +1704,20 @@ impl MessagesApp {
                         ui.painter().text(
                             rect.center(),
                             Align2::CENTER_CENTER,
-                            "Waiting for video…",
+                            if video_status.playback_error.is_some() {
+                                "Video unavailable"
+                            } else {
+                                "Waiting for video…"
+                            },
                             FontId::proportional(13.),
                             Color32::WHITE,
                         );
+                    }
+                    if let Some(error) = &video_status.camera_error {
+                        ui.colored_label(DANGER, error);
+                    }
+                    if let Some(error) = &video_status.playback_error {
+                        ui.colored_label(DANGER, error);
                     }
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1732,7 +1747,9 @@ impl MessagesApp {
                             && ui
                                 .add_enabled(
                                     enabled,
-                                    egui::Button::new(if camera_enabled {
+                                    egui::Button::new(if video_status.camera_error.is_some() {
+                                        "Retry Camera"
+                                    } else if camera_enabled {
                                         "Camera Off"
                                     } else {
                                         "Camera On"
@@ -1741,7 +1758,11 @@ impl MessagesApp {
                                 )
                                 .clicked()
                         {
-                            call.controls.toggle_camera();
+                            if video_status.camera_error.is_some() {
+                                call.controls.retry_camera();
+                            } else {
+                                call.controls.toggle_camera();
+                            }
                         }
                     }
                 });
@@ -3183,6 +3204,18 @@ mod tests {
             assert!(!*video.camera_enabled.borrow());
             click(&mut frame, "Camera On");
             assert!(*video.camera_enabled.borrow());
+
+            video.status.send_modify(|status| {
+                status.camera_error = Some("Could not open the camera".into());
+                status.playback_error = Some("The video decoder stopped".into());
+            });
+            video.frames.send_replace(None);
+            find_label(&mut frame, "Video unavailable");
+            let mut camera = video.camera_enabled.clone();
+            camera.borrow_and_update();
+            click(&mut frame, "Retry Camera");
+            assert!(camera.has_changed()?);
+            assert!(*camera.borrow());
         }
         click(&mut frame, "Mute");
         assert!(*muted.borrow());
