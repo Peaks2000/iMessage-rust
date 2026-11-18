@@ -45,7 +45,7 @@ pub use facetime::{
 };
 pub(crate) use facetime::{
     CallEndpoint, CallMediaExchange, CallRtpProtection, CallSignal, LocalCallPrekey, OutgoingRelay,
-    PeerKeyOffer, PeerMediaOffer, PeerPrekey, RING_TIMEOUT_MS, RingingRelay,
+    PeerKeyOffer, PeerMediaOffer, PeerPrekey, RING_TIMEOUT_MS, RelayPeerUpdate, RingingRelay,
 };
 pub(crate) use madrid::{Incoming, Madrid, Notification, OutgoingCallTargets};
 use openssl::{

@@ -1,4 +1,7 @@
-use std::time::{Duration, SystemTime};
+use std::{
+    collections::VecDeque,
+    time::{Duration, SystemTime},
+};
 
 use anyhow::{Context, Result, ensure};
 use openssl::rand::rand_bytes;
@@ -6,12 +9,12 @@ use prost::Message;
 use zeroize::Zeroizing;
 
 use crate::apple::facetime::{
-    CallAvcMaterial, CallEndpoint, CallMediaDescription, CallPeerKeys,
+    CallAvcMaterial, CallEndpoint, CallMediaDescription, CallPeerKeys, PeerKeyOffer,
     description::{open_description, valid_ciphertext},
 };
 
 use super::{
-    CallRelayConnection,
+    CallRelayAllocation, CallRelayConnection,
     http3::RelayHttp3,
     one_to_one::OneToOnePath,
     pod::{Pod, RelayDatagramChannel},
@@ -23,7 +26,10 @@ const WILDCARD_CHANNEL_BINDING: u32 = 512;
 const AVC: i32 = 0;
 const IDS: i32 = 1;
 const AVC_MATERIAL: i32 = 12;
+const MEDIA_KEY_MATERIAL: i32 = 13;
+const SESSION_KEY_MATERIAL: i32 = 14;
 const MAX_PEER_DESCRIPTIONS: usize = 8;
+const MAX_PENDING_PEER_KEYS: usize = 16;
 
 /// Device and media capabilities advertised during this call's registration.
 pub struct CallRelayProfile<'a> {
@@ -44,10 +50,16 @@ pub struct CallRelayBinding {
     signaling: Pod,
     one_to_one: Option<OneToOnePath>,
     peer_descriptions: Vec<MaterialInfo>,
+    peer_keys: VecDeque<PeerKeyOffer>,
     pub channel_id: u16,
     pub link_id: u32,
     pub avc: RelayChannel,
     pub ids: RelayChannel,
+}
+
+pub(crate) enum RelayPeerUpdate {
+    Description,
+    Keys(Box<PeerKeyOffer>),
 }
 
 /// An authenticated local relay binding that has no peer or media keys yet.
@@ -100,6 +112,7 @@ impl RingingRelay {
     pub(crate) async fn join(
         mut self,
         selected: CallEndpoint,
+        allocation: &CallRelayAllocation,
         offer: &CallAvcMaterial,
     ) -> Result<CallRelayBinding> {
         ensure!(
@@ -114,7 +127,11 @@ impl RingingRelay {
             call.peer == 0
                 && call.local != peer
                 && call.id == offer.call_id
-                && call.local == offer.participant,
+                && call.local == offer.participant
+                && allocation.call_id == call.id
+                && allocation.local_participant == call.local
+                && allocation.caller_participant == peer
+                && allocation.endpoint == self.binding.control.transport.peer_addr()?,
             "FaceTime relay and answering device belong to different calls"
         );
         let request = PutMaterialEnvelope {
@@ -134,6 +151,7 @@ impl RingingRelay {
             "Missing FaceTime relay material acknowledgement"
         );
         self.binding.control.transport.call.peer = peer;
+        self.binding.control.transport.device_key = allocation.device_key.clone();
         Ok(self.binding)
     }
 }
@@ -186,24 +204,66 @@ impl CallRelayBinding {
         self.control.open_indications().await
     }
 
-    pub(crate) async fn wait_for_peer_descriptions(&mut self) -> Result<bool> {
-        let call = self.control.transport.call;
-        ensure!(call.peer != 0, "Missing authenticated FaceTime participant");
+    pub(crate) async fn next_peer_update(&mut self) -> Result<Option<RelayPeerUpdate>> {
+        ensure!(
+            self.control.transport.call.peer != 0,
+            "Missing authenticated FaceTime participant"
+        );
+        if let Some(offer) = self.peer_keys.pop_front() {
+            return Ok(Some(RelayPeerUpdate::Keys(Box::new(offer))));
+        }
         while let Some(payload) = self.control.next_indication().await? {
             let indication = PutMaterialIndicationEnvelope::decode(payload)
                 .context("Invalid FaceTime relay indication")?;
-            if let Some(update) = indication.indication
-                && append_peer_descriptions(
-                    &mut self.peer_descriptions,
-                    update.materials,
-                    call.peer,
-                    call.local,
-                )?
-            {
-                return Ok(true);
+            if let Some(update) = indication.indication {
+                let description = self.record_peer_materials(update.materials)?;
+                if let Some(offer) = self.peer_keys.pop_front() {
+                    return Ok(Some(RelayPeerUpdate::Keys(Box::new(offer))));
+                }
+                if description {
+                    return Ok(Some(RelayPeerUpdate::Description));
+                }
             }
         }
-        Ok(false)
+        Ok(None)
+    }
+
+    fn record_peer_materials(&mut self, materials: Vec<Material>) -> Result<bool> {
+        let call = self.control.transport.call;
+        if call.peer == 0 {
+            return Ok(false);
+        }
+        let previous_count = self.peer_descriptions.len();
+        for group in materials {
+            if group.owner != Some(call.peer)
+                || !matches!(group.receiver, None | Some(0)) && group.receiver != Some(call.local)
+            {
+                continue;
+            }
+            for entry in group.entries {
+                match entry.kind {
+                    AVC_MATERIAL => append_peer_description(&mut self.peer_descriptions, entry)?,
+                    MEDIA_KEY_MATERIAL | SESSION_KEY_MATERIAL
+                        if group.receiver == Some(call.local)
+                            && self.peer_keys.len() < MAX_PENDING_PEER_KEYS =>
+                    {
+                        if let Some(signing) = &self.control.transport.device_key
+                            && let Ok(payload) = signing.verify_material(call.id, &entry.content)
+                            && let Some(offer) = PeerKeyOffer::from_relay(
+                                &payload,
+                                entry.kind == MEDIA_KEY_MATERIAL,
+                                &entry.id,
+                                call.peer,
+                            )
+                        {
+                            self.peer_keys.push_back(offer);
+                        }
+                    }
+                    _ => (),
+                }
+            }
+        }
+        Ok(self.peer_descriptions.len() != previous_count)
     }
 
     /// Send a call-protocol datagram over the relay. The call layer encrypts peer payloads.
@@ -410,25 +470,22 @@ impl CallRelayConnection {
             .context("Invalid FaceTime relay channel")?;
         let link_id = binding.link_id.context("Missing FaceTime relay link ID")?;
         let (avc, ids) = bound_channels(&binding.connections, avc, ids)?;
-        let call = control.transport.call;
-        let peer_descriptions = if call.peer == 0 {
-            Vec::new()
-        } else {
-            collect_peer_descriptions(binding.materials, call.peer, call.local)?
-        };
         let media = Pod::new(&control.transport, avc, RelayDatagramChannel::Media)?;
         let signaling = Pod::new(&control.transport, ids, RelayDatagramChannel::Signaling)?;
-        Ok(CallRelayBinding {
+        let mut bound = CallRelayBinding {
             control,
             media,
             signaling,
             one_to_one: None,
-            peer_descriptions,
+            peer_descriptions: Vec::new(),
+            peer_keys: VecDeque::new(),
             channel_id,
             link_id,
             avc,
             ids,
-        })
+        };
+        bound.record_peer_materials(binding.materials)?;
+        Ok(bound)
     }
 }
 
@@ -444,52 +501,24 @@ fn avc_material(offer: &CallAvcMaterial, receiver: u64) -> Material {
     }
 }
 
-fn collect_peer_descriptions(
-    materials: Vec<Material>,
-    peer: u64,
-    local: u64,
-) -> Result<Vec<MaterialInfo>> {
-    let mut accepted: Vec<MaterialInfo> = Vec::new();
-    append_peer_descriptions(&mut accepted, materials, peer, local)?;
-    Ok(accepted)
-}
-
-fn append_peer_descriptions(
-    accepted: &mut Vec<MaterialInfo>,
-    materials: Vec<Material>,
-    peer: u64,
-    local: u64,
-) -> Result<bool> {
-    let previous_count = accepted.len();
-    for group in materials {
-        if group.owner != Some(peer)
-            || !matches!(group.receiver, None | Some(0)) && group.receiver != Some(local)
-        {
-            continue;
-        }
-        for entry in group.entries {
-            if entry.kind != AVC_MATERIAL {
-                continue;
-            }
-            ensure!(
-                entry.id.len() == 20 && valid_ciphertext(&entry.content),
-                "Invalid FaceTime relay description material"
-            );
-            if let Some(previous) = accepted.iter().find(|previous| previous.id == entry.id) {
-                ensure!(
-                    previous.content == entry.content,
-                    "Conflicting FaceTime relay description material"
-                );
-            } else {
-                ensure!(
-                    accepted.len() < MAX_PEER_DESCRIPTIONS,
-                    "Too many FaceTime relay descriptions"
-                );
-                accepted.push(entry);
-            }
-        }
+fn append_peer_description(accepted: &mut Vec<MaterialInfo>, entry: MaterialInfo) -> Result<()> {
+    ensure!(
+        entry.id.len() == 20 && valid_ciphertext(&entry.content),
+        "Invalid FaceTime relay description material"
+    );
+    if let Some(previous) = accepted.iter().find(|previous| previous.id == entry.id) {
+        ensure!(
+            previous.content == entry.content,
+            "Conflicting FaceTime relay description material"
+        );
+    } else {
+        ensure!(
+            accepted.len() < MAX_PEER_DESCRIPTIONS,
+            "Too many FaceTime relay descriptions"
+        );
+        accepted.push(entry);
     }
-    Ok(accepted.len() != previous_count)
+    Ok(())
 }
 
 fn new_connection_id(kind: i32) -> Result<[u8; 4]> {

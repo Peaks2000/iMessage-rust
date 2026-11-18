@@ -75,6 +75,29 @@ pub(crate) struct PeerKeyOffer {
 }
 
 impl PeerKeyOffer {
+    pub(super) fn from_relay(
+        payload: &[u8],
+        media: bool,
+        identifier: &[u8],
+        participant: u64,
+    ) -> Option<Self> {
+        let fields: Dictionary = plist::from_bytes(payload).ok()?;
+        let wrapped = WrappedCallKey::parse(&fields, media)?;
+        if wrapped.identifier != identifier || wrapped.participant != participant {
+            return None;
+        }
+        let (session, media) = if media {
+            (None, Some(wrapped))
+        } else {
+            (Some(wrapped), None)
+        };
+        Some(Self {
+            session,
+            media,
+            participant,
+        })
+    }
+
     pub(super) fn parse(
         session: Option<&plist::Dictionary>,
         media: Option<&plist::Dictionary>,

@@ -56,11 +56,32 @@ struct Destination {
     push: Vec<u8>,
     session: Vec<u8>,
     public_key: KeyPair<Public>,
+    device_key: Option<facetime::PeerDeviceKey>,
 }
 
 pub(crate) struct OutgoingCallTargets {
     pub(crate) relay: Arc<facetime::OutgoingRelay>,
     targets: HashMap<String, Vec<Destination>>,
+}
+
+impl OutgoingCallTargets {
+    pub(crate) fn allocation_for_peer(
+        &self,
+        caller: &str,
+        endpoint: facetime::CallEndpoint,
+    ) -> Result<facetime::CallRelayAllocation> {
+        let device = self
+            .targets
+            .get(caller)
+            .into_iter()
+            .flatten()
+            .find(|device| device.push == endpoint.push_token())
+            .context("The FaceTime answering device is unavailable")?;
+        Ok(self
+            .relay
+            .for_peer(endpoint)?
+            .with_device_key(device.device_key.clone()))
+    }
 }
 
 struct DeliveryPayload<'a> {
@@ -111,12 +132,14 @@ struct LookupDevice {
     push_token: Data,
     session_token: Data,
     client_data: LookupClient,
+    kt_loggable_data: Option<Value>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case")]
 struct LookupClient {
     public_message_identity_key: Option<Data>,
+    ngm_public_identity: Option<Value>,
 }
 
 impl Madrid {
@@ -360,10 +383,21 @@ impl Madrid {
                     continue;
                 }
                 if let Ok(public_key) = KeyPair::decode(key.as_ref()) {
+                    let device_key = if matches!(topic, facetime::SIGNALING | facetime::VIDEO) {
+                        device
+                            .kt_loggable_data
+                            .iter()
+                            .chain(&device.client_data.ngm_public_identity)
+                            .filter_map(Value::as_data)
+                            .find_map(|bytes| facetime::PeerDeviceKey::from_directory(bytes).ok())
+                    } else {
+                        None
+                    };
                     destinations.push(Destination {
                         push: device.push_token.into(),
                         session: device.session_token.into(),
                         public_key,
+                        device_key,
                     });
                 }
             }
@@ -641,13 +675,13 @@ impl Madrid {
         );
         timeout(Duration::from_millis(remaining as u64), async {
             let targets = self
-                .query(identity, facetime::SIGNALING, &[&call.caller], true)
+                .call_destination(identity, &call.caller, endpoint)
                 .await?;
             let caller = targets
                 .get(&call.caller)
                 .into_iter()
                 .flatten()
-                .find(|target| target.push == endpoint.push_token())
+                .next()
                 .context("The FaceTime caller device is no longer in the IDS directory")?;
             ensure!(call.expires_ms > now_ms(), "This FaceTime call has ended");
             let (request, response) = self
@@ -661,13 +695,14 @@ impl Madrid {
                     )],
                 )
                 .await?;
-            facetime::CallRelayAllocation::parse(
+            Ok(facetime::CallRelayAllocation::parse(
                 response,
                 request,
                 call.id,
                 (&identity.handle, &identity.token),
                 (&call.caller, endpoint),
-            )
+            )?
+            .with_device_key(caller.device_key.clone()))
         })
         .await
         .context("The FaceTime call ended while waiting for a relay")?

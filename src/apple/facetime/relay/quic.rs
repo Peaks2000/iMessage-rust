@@ -208,6 +208,7 @@ pub struct CallRelayConnection {
     api: &'static QuicApi,
     keys: CallRelayKeys,
     pub(super) call: RelayCall,
+    pub(super) device_key: Option<super::PeerDeviceKey>,
 }
 
 pub struct CallRelayStream {
@@ -224,7 +225,7 @@ pub(super) enum RelayWireDatagram {
 impl CallRelayAllocation {
     /// Connect to the allocated relay using the per-call external PSK and HTTP/3 ALPN.
     pub async fn connect(&self) -> Result<CallRelayConnection> {
-        CallRelayConnection::connect(
+        let mut connection = CallRelayConnection::connect(
             self.endpoint,
             self.derive_keys()?,
             RelayCall {
@@ -233,7 +234,9 @@ impl CallRelayAllocation {
                 peer: self.caller_participant,
             },
         )
-        .await
+        .await?;
+        connection.device_key = self.device_key.clone();
+        Ok(connection)
     }
 }
 
@@ -293,6 +296,7 @@ impl CallRelayConnection {
             api,
             keys,
             call,
+            device_key: None,
         };
         connection
             .retry(HANDSHAKE_TIMEOUT, |ssl| {

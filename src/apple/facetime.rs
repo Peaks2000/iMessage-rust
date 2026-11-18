@@ -1,6 +1,7 @@
 mod description;
 mod media;
 pub(super) mod relay;
+mod signed_material;
 mod srtp;
 
 use plist::Value;
@@ -26,7 +27,8 @@ pub use relay::{
     CallRelayAllocation, CallRelayBinding, CallRelayConnection, CallRelayKeys, CallRelayProfile,
     CallRelayStream, RelayChannel, RelayDatagramChannel, RelayStreamDirection,
 };
-pub(crate) use relay::{OutgoingRelay, RingingRelay};
+pub(crate) use relay::{OutgoingRelay, RelayPeerUpdate, RingingRelay};
+pub(crate) use signed_material::PeerDeviceKey;
 pub(crate) use srtp::CallRtpProtection;
 #[cfg(feature = "desktop")]
 pub(crate) use srtp::RtpHeader;

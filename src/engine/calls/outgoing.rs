@@ -29,6 +29,7 @@ pub(in crate::engine) struct OutgoingAttempt {
 pub(in crate::engine) struct OutgoingAnswer {
     handshake: Arc<CallMediaHandshake>,
     endpoint: CallEndpoint,
+    allocation: Arc<CallRelayAllocation>,
     local_keys: Arc<CallKeyOffer>,
     lifetime: AnswerLifetime,
 }
@@ -341,7 +342,11 @@ impl IncomingCalls {
             .filter(|&index| !pending.responses.devices[index].ended)
             .context("The other device left the FaceTime call")?;
         let device = &pending.responses.devices[selected];
-        let relay = Arc::new(pending.targets.relay.for_peer(device.endpoint)?);
+        let relay = Arc::new(
+            pending
+                .targets
+                .allocation_for_peer(&pending.call.caller, device.endpoint)?,
+        );
         let pending = self
             .outgoing
             .take()
@@ -374,6 +379,7 @@ impl IncomingCalls {
         Ok(OutgoingAnswer {
             handshake,
             endpoint: device.endpoint,
+            allocation: relay,
             local_keys,
             lifetime,
         })
@@ -434,6 +440,7 @@ impl Engine {
         let OutgoingAnswer {
             handshake,
             endpoint,
+            allocation,
             local_keys,
             mut lifetime,
         } = match answer {
@@ -452,10 +459,11 @@ impl Engine {
         let bound = tokio::select! {
             biased;
             _ = lifetime.ended.changed() => anyhow::bail!("The FaceTime call has ended"),
-            result = timeout(MEDIA_SETUP_TIMEOUT, pending_relay.join(endpoint, &description)) =>
+            result = timeout(MEDIA_SETUP_TIMEOUT, pending_relay.join(endpoint, &allocation, &description)) =>
                 result.context("The FaceTime relay did not confirm the media offer")??,
         };
         complete_media(
+            self,
             handshake,
             bound,
             local_keys,

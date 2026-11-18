@@ -22,7 +22,7 @@ use crate::{
     apple::{
         CallEndpoint, CallKeyOffer, CallMediaDescription, CallMediaExchange, CallMediaHandshake,
         CallPeerKeys, CallRelayAllocation, CallRelayBinding, CallRelayProfile, CallRtpProtection,
-        Identity, Madrid,
+        Identity, Madrid, RelayPeerUpdate,
     },
     now_ms,
 };
@@ -237,6 +237,7 @@ impl Engine {
             .await
             .context("The Apple engine stopped before joining FaceTime")??;
         complete_media(
+            self,
             handshake,
             relay,
             local_keys,
@@ -287,6 +288,7 @@ async fn wait_for_ring_to_end(mut status: watch::Receiver<Status>, id: Uuid) -> 
 }
 
 async fn complete_media(
+    engine: &Engine,
     handshake: Arc<CallMediaHandshake>,
     mut relay: CallRelayBinding,
     local_keys: Arc<CallKeyOffer>,
@@ -298,7 +300,7 @@ async fn complete_media(
     // Announce our route while the IDS engine receives the peer's keys.
     let media_setup = async {
         relay.negotiate_media_path().await?;
-        wait_for_media(&handshake, &mut relay, &mut peer_keys).await
+        wait_for_media(engine, &handshake, &mut relay, &mut peer_keys).await
     };
     let remote_description = tokio::select! {
         biased;
@@ -326,6 +328,7 @@ async fn complete_media(
 }
 
 async fn wait_for_media(
+    engine: &Engine,
     handshake: &CallMediaHandshake,
     relay: &mut CallRelayBinding,
     keys: &mut watch::Receiver<CallPeerKeys>,
@@ -350,9 +353,14 @@ async fn wait_for_media(
         }
         tokio::select! {
             result = keys.changed() => result.context("This FaceTime call has ended")?,
-            result = relay.wait_for_peer_descriptions(), if indications_open => {
+            result = relay.next_peer_update(), if indications_open => {
                 match result {
-                    Ok(open) => indications_open = open,
+                    Ok(Some(RelayPeerUpdate::Description)) => (),
+                    Ok(Some(RelayPeerUpdate::Keys(offer))) => {
+                        engine.requests.send(Request::InstallRelayKeys { id: handshake.call().id, offer })
+                            .await.context("The Apple engine stopped while installing FaceTime keys")?;
+                    }
+                    Ok(None) => indications_open = false,
                     Err(_) if signed_description.is_some() => indications_open = false,
                     Err(error) => return Err(error),
                 }

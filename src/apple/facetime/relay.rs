@@ -15,10 +15,10 @@ use zeroize::Zeroizing;
 
 use crate::address;
 
-use super::{CallEndpoint, SIGNALING, media::hkdf, participant_id};
+use super::{CallEndpoint, PeerDeviceKey, SIGNALING, media::hkdf, participant_id};
 
-pub(crate) use binding::RingingRelay;
 pub use binding::{CallRelayBinding, CallRelayProfile, RelayChannel};
+pub(crate) use binding::{RelayPeerUpdate, RingingRelay};
 pub use pod::RelayDatagramChannel;
 pub use quic::{CallRelayConnection, CallRelayStream, RelayStreamDirection};
 
@@ -72,6 +72,7 @@ pub struct CallRelayAllocation {
     relay_id: Vec<u8>,
     token: Zeroizing<Vec<u8>>,
     shared_key: Zeroizing<Vec<u8>>,
+    device_key: Option<PeerDeviceKey>,
 }
 
 struct RelayGrant {
@@ -166,6 +167,7 @@ impl RelayGrant {
             relay_id: self.relay_id.clone(),
             token: self.token.clone(),
             shared_key: self.shared_key.clone(),
+            device_key: None,
         }
     }
 }
@@ -286,6 +288,11 @@ pub struct CallRelayKeys {
 }
 
 impl CallRelayAllocation {
+    pub(in crate::apple) fn with_device_key(mut self, key: Option<PeerDeviceKey>) -> Self {
+        self.device_key = key;
+        self
+    }
+
     pub(in crate::apple) fn parse(
         reply: Dictionary,
         request: Uuid,

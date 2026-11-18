@@ -136,6 +136,7 @@ fn loopback_listener() -> Result<Option<(SocketAddr, CallRelayConnection, Listen
             api,
             keys,
             call: test_call(),
+            device_key: None,
         },
         accept_connection,
     )))
@@ -303,8 +304,14 @@ async fn fixture_response(
 #[tokio::test]
 async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answering_device()
 -> Result<()> {
-    use super::super::RingingRelay;
-    use crate::apple::CallEndpoint;
+    use super::super::{CallRelayAllocation, RelayPeerUpdate, RingingRelay};
+    use crate::{
+        CallMode, IncomingCall,
+        apple::{
+            CallEndpoint, CallMediaExchange, LocalCallPrekey, PeerPrekey,
+            facetime::signed_material::tests::{fixture_signer, signed_key},
+        },
+    };
 
     #[derive(Message)]
     struct TestMaterialEnvelope {
@@ -322,17 +329,13 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
         material: Option<TestPutMaterial>,
     }
 
-    fn indication(owner: u64, receiver: u64, ciphertext: Vec<u8>) -> Vec<u8> {
+    fn indication(owner: u64, receiver: u64, entry: TestAvcMaterial) -> Vec<u8> {
         let payload = TestIndication {
             material: Some(TestPutMaterial {
                 materials: vec![TestParticipantMaterial {
                     owner: Some(owner),
                     receiver: Some(receiver),
-                    entries: vec![TestAvcMaterial {
-                        id: vec![7; 20],
-                        kind: 12,
-                        ciphertext,
-                    }],
+                    entries: vec![entry],
                 }],
             }),
         }
@@ -360,6 +363,45 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
     let answered = CallEndpoint::new([7; 32], Some(description::CALLER));
     let other = CallEndpoint::new([8; 32], Some(description::CALLER + 1));
     let offer = description::local_offer()?;
+    let (signing, verification) = fixture_signer()?;
+    let call = IncomingCall {
+        id: description::CALL,
+        caller: "mailto:caller@example.org".to_owned(),
+        mode: Some(CallMode::Video),
+        received_ms: 1,
+        expires_ms: 45_001,
+    };
+    let local_prekey = LocalCallPrekey::generate()?;
+    let remote = CallMediaExchange::prepare(
+        call.clone(),
+        &[],
+        &PeerPrekey::parse(1, local_prekey.public())?,
+    )?;
+    let local_exchange = CallMediaExchange::with_prekey(
+        call,
+        &[],
+        &PeerPrekey::parse(1, remote.handshake.public_prekey())?,
+        local_prekey,
+    );
+    let remote_offer = remote.handshake.build_key_offer(description::CALLER)?;
+    let payload: plist::Dictionary = plist::from_bytes(&remote_offer.payload)?;
+    let mut media_key = Vec::new();
+    plist::to_writer_binary(&mut media_key, &payload["rtmkm"])?;
+    let mut session_key = Vec::new();
+    plist::to_writer_binary(&mut session_key, &payload["rtskm"])?;
+    let wrong_group = openssl::ec::EcGroup::from_curve_name(openssl::nid::Nid::X9_62_PRIME256V1)?;
+    let wrong_signing =
+        openssl::pkey::PKey::from_ec_key(openssl::ec::EcKey::generate(&wrong_group)?)?;
+    let media_key_record = |signed| TestAvcMaterial {
+        id: remote_offer.media.identifier.to_vec(),
+        kind: 13,
+        ciphertext: signed,
+    };
+    let description_record = |ciphertext| TestAvcMaterial {
+        id: vec![7; 20],
+        kind: 12,
+        ciphertext,
+    };
     let (started, has_partial_frame) = tokio::sync::oneshot::channel();
     let (paused, continue_indications) = tokio::sync::oneshot::channel();
     let server = async {
@@ -439,12 +481,34 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
         assert_eq!(entry.ciphertext, offer.ciphertext);
         fixture_response(&mut relay, publish, &[0xca, 1, 0]).await?;
 
-        let wrong_device = indication(description::CALLER + 1, description::LOCAL, vec![0]);
+        let wrong_device = indication(
+            description::CALLER + 1,
+            description::LOCAL,
+            description_record(vec![0]),
+        );
         indication_chunk(&mut relay, &mut indications, &wrong_device).await?;
+        let wrong_signer = indication(
+            description::CALLER,
+            description::LOCAL,
+            media_key_record(signed_key(&wrong_signing, description::CALL, &media_key)?),
+        );
+        indication_chunk(&mut relay, &mut indications, &wrong_signer).await?;
+        let wrong_receiver = indication(
+            description::CALLER,
+            description::LOCAL + 1,
+            media_key_record(signed_key(&signing, description::CALL, &media_key)?),
+        );
+        indication_chunk(&mut relay, &mut indications, &wrong_receiver).await?;
+        let mut wrong_identifier =
+            media_key_record(signed_key(&signing, description::CALL, &media_key)?);
+        wrong_identifier.id[0] ^= 1;
+        let wrong_identifier =
+            indication(description::CALLER, description::LOCAL, wrong_identifier);
+        indication_chunk(&mut relay, &mut indications, &wrong_identifier).await?;
         let media = indication(
             description::CALLER,
             description::LOCAL,
-            description::opaque_peer_offer()?,
+            description_record(description::opaque_peer_offer()?),
         );
         indication_chunk(&mut relay, &mut indications, &media[..3]).await?;
         started
@@ -452,6 +516,22 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
             .map_err(|_| anyhow::anyhow!("Waiting call ended early"))?;
         continue_indications.await?;
         indication_chunk(&mut relay, &mut indications, &media[3..]).await?;
+        let valid_key = indication(
+            description::CALLER,
+            description::LOCAL,
+            media_key_record(signed_key(&signing, description::CALL, &media_key)?),
+        );
+        indication_chunk(&mut relay, &mut indications, &valid_key).await?;
+        let valid_session = indication(
+            description::CALLER,
+            description::LOCAL,
+            TestAvcMaterial {
+                id: remote_offer.session.identifier.to_vec(),
+                kind: 14,
+                ciphertext: signed_key(&signing, description::CALL, &session_key)?,
+            },
+        );
+        indication_chunk(&mut relay, &mut indications, &valid_session).await?;
         relay.finish_stream(&mut indications)?;
 
         let (release, _) = fixture_request(&mut relay, b"/QR/UnAllocBind").await?;
@@ -474,7 +554,17 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
         };
         let mut waiting = RingingRelay::bind(wire, profile, vec![answered, other]).await?;
         waiting.keepalive().await?;
-        let mut connection = waiting.join(answered, &offer).await?;
+        let allocation = CallRelayAllocation {
+            call_id: description::CALL,
+            endpoint,
+            local_participant: description::LOCAL,
+            caller_participant: description::CALLER,
+            relay_id: Vec::new(),
+            token: Zeroizing::default(),
+            shared_key: Zeroizing::default(),
+            device_key: Some(verification),
+        };
+        let mut connection = waiting.join(answered, &allocation, &offer).await?;
         assert_eq!(connection.channel_id, 0x4008);
         assert!(
             connection
@@ -483,17 +573,17 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
         );
         has_partial_frame.await?;
         assert!(
-            tokio::time::timeout(
-                Duration::from_millis(40),
-                connection.wait_for_peer_descriptions()
-            )
-            .await
-            .is_err()
+            tokio::time::timeout(Duration::from_millis(40), connection.next_peer_update())
+                .await
+                .is_err()
         );
         paused
             .send(())
             .map_err(|_| anyhow::anyhow!("Relay stopped sending indications"))?;
-        assert!(connection.wait_for_peer_descriptions().await?);
+        assert!(matches!(
+            connection.next_peer_update().await?,
+            Some(RelayPeerUpdate::Description)
+        ));
         let media = connection
             .peer_description(&description::remote_keys())?
             .context("Missing authenticated late media offer")?;
@@ -502,6 +592,34 @@ async fn outgoing_relay_binds_before_the_invite_and_publishes_only_to_the_answer
             media.video.context("Missing late video stream")?.ssrc,
             0x5060_7080
         );
+        let Some(RelayPeerUpdate::Keys(offer)) = connection.next_peer_update().await? else {
+            anyhow::bail!("Missing relay-signed media key");
+        };
+        local_exchange.receive(*offer)?;
+        let Some(RelayPeerUpdate::Keys(offer)) = connection.next_peer_update().await? else {
+            anyhow::bail!("Missing relay-signed session key");
+        };
+        local_exchange.receive(*offer)?;
+        {
+            let received = local_exchange.handshake.watch_peer_keys();
+            let received = received.borrow();
+            assert_eq!(
+                received
+                    .media
+                    .as_ref()
+                    .context("Media key was not unwrapped")?
+                    .identifier,
+                remote_offer.media.identifier,
+            );
+            assert_eq!(
+                received
+                    .session
+                    .as_ref()
+                    .context("Session key was not unwrapped")?
+                    .identifier,
+                remote_offer.session.identifier,
+            );
+        }
         connection.unbind().await
     };
     tokio::time::timeout(Duration::from_secs(5), async {

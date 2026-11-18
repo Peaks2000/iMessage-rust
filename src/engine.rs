@@ -91,6 +91,10 @@ enum Request {
         id: uuid::Uuid,
         reply: oneshot::Sender<Result<OutgoingAnswer>>,
     },
+    InstallRelayKeys {
+        id: uuid::Uuid,
+        offer: Box<crate::apple::PeerKeyOffer>,
+    },
     Download {
         id: uuid::Uuid,
         index: usize,
@@ -382,6 +386,7 @@ async fn run_apple(
                         Request::FinishOutgoing { reply, .. } => {
                             let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
                         }
+                        Request::InstallRelayKeys { .. } => (),
                     }
                 }
             }
@@ -549,6 +554,14 @@ async fn online(
                             Ok(answer)
                         });
                         let _ = reply.send(result);
+                    }
+                    Request::InstallRelayKeys { id, offer } => {
+                        if let Some(active) = &calls.connected
+                            && active.call.id == id
+                            && active.endpoint.participant() == Some(offer.participant)
+                        {
+                            let _ = active.exchange.receive(*offer);
+                        }
                     }
                 }
             }
