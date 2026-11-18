@@ -35,7 +35,7 @@ pub use facetime::{
     RelayStreamDirection,
 };
 pub(crate) use facetime::{
-    CallEndpoint, CallMediaExchange, CallSignal, PeerMediaOffer, PeerPrekey,
+    CallEndpoint, CallMediaExchange, CallRtpProtection, CallSignal, PeerMediaOffer, PeerPrekey,
 };
 pub(crate) use madrid::{Incoming, Madrid, Notification};
 use openssl::{

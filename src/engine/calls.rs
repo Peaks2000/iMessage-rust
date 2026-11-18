@@ -6,13 +6,15 @@ use tokio::{
     time::timeout,
 };
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use super::{Engine, IncomingCalls, Request, active_call};
 use crate::{
     CallMode, IncomingCall, Status,
     apple::{
         CallEndpoint, CallKeyOffer, CallMediaDescription, CallMediaExchange, CallMediaHandshake,
-        CallPeerKeys, CallRelayAllocation, CallRelayBinding, CallRelayProfile, Identity, Madrid,
+        CallPeerKeys, CallRelayAllocation, CallRelayBinding, CallRelayProfile, CallRtpProtection,
+        Identity, Madrid,
     },
     now_ms,
 };
@@ -36,6 +38,7 @@ pub struct AnsweredCall {
     pub relay: CallRelayBinding,
     peer_keys: watch::Receiver<CallPeerKeys>,
     lifetime: AnswerLifetime,
+    rtp: CallRtpProtection,
 }
 
 impl AnsweredCall {
@@ -47,6 +50,30 @@ impl AnsweredCall {
     /// The channel closes when the caller hangs up or the connection is lost.
     pub fn watch_end(&self) -> watch::Receiver<()> {
         self.lifetime.ended.clone()
+    }
+
+    /// Encrypt and authenticate an RTP packet belonging to a negotiated local stream.
+    pub fn protect_rtp(&mut self, packet: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        self.lifetime
+            .ended
+            .has_changed()
+            .context("This FaceTime call has ended")?;
+        self.rtp.protect(packet)
+    }
+
+    /// Verify a protected packet from the negotiated peer before handing it to a decoder.
+    pub fn open_rtp(&mut self, packet: &[u8]) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        self.lifetime
+            .ended
+            .has_changed()
+            .context("This FaceTime call has ended")?;
+        let key = self
+            .peer_keys
+            .borrow()
+            .media
+            .clone()
+            .context("Missing FaceTime caller media key")?;
+        self.rtp.open(key, packet)
     }
 
     /// End the local call and release the relay channels.
@@ -126,9 +153,9 @@ impl Engine {
                 .await?
                 .bind_with_description(config.relay_profile, &description)
                 .await?;
-            Ok::<_, anyhow::Error>((relay, local_keys, attempt))
+            Ok::<_, anyhow::Error>((relay, local_keys, allocation.caller_participant, attempt))
         };
-        let (mut relay, local_keys, AnswerAttempt { lease, handshake }) = tokio::select! {
+        let (mut relay, local_keys, caller_participant, AnswerAttempt { lease, handshake }) = tokio::select! {
             biased;
             error = wait_for_ring_to_end(self.watch_status(), id) => return Err(error),
             result = timeout(remaining, setup) => result.context("The FaceTime call expired during setup")??,
@@ -156,6 +183,13 @@ impl Engine {
             result = timeout(MEDIA_SETUP_TIMEOUT, wait_for_media(&handshake, &mut relay, &mut peer_keys)) =>
                 result.context("The caller did not finish FaceTime media setup")??,
         };
+        let rtp = CallRtpProtection::new(
+            id,
+            caller_participant,
+            &local_keys.media,
+            &local_description,
+            &remote_description,
+        )?;
         Ok(AnsweredCall {
             call: handshake.call().clone(),
             local_description,
@@ -164,6 +198,7 @@ impl Engine {
             relay,
             peer_keys,
             lifetime,
+            rtp,
         })
     }
 

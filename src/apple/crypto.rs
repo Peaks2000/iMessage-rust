@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use openssl::{
     bn::BigNumContext,
+    cipher_ctx::CipherCtx,
     ec::{EcGroup, EcKey, EcPoint, PointConversionForm},
     encrypt::{Decrypter, Encrypter},
     hash::MessageDigest,
@@ -14,6 +15,20 @@ use openssl::{
     symm::{Cipher, decrypt, encrypt},
 };
 use zeroize::Zeroizing;
+
+pub(super) fn aes128_ctr(key: &[u8], counter: &[u8; 16], data: &mut [u8]) -> Result<()> {
+    let mut cipher = CipherCtx::new()?;
+    cipher.encrypt_init(
+        Some(openssl::cipher::Cipher::aes_128_ctr()),
+        Some(key),
+        Some(counter),
+    )?;
+    ensure!(
+        cipher.cipher_update_inplace(data, data.len())? == data.len(),
+        "Unexpected AES-CTR output length"
+    );
+    Ok(())
+}
 
 const CTR_IV: [u8; 16] = 1u128.to_be_bytes();
 const RSA_PREFIX: usize = 100;

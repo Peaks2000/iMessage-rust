@@ -162,7 +162,8 @@ pub struct CallKey {
 pub(super) enum CallKeyKind {
     LocalSession,
     PeerSession,
-    Media,
+    LocalMedia,
+    PeerMedia,
 }
 
 pub struct CallKeyOffer {
@@ -208,7 +209,11 @@ impl CallMediaExchange {
             current.session.as_deref(),
             CallKeyKind::PeerSession,
         )?;
-        let media = self.open_newer(offer.media, current.media.as_deref(), CallKeyKind::Media)?;
+        let media = self.open_newer(
+            offer.media,
+            current.media.as_deref(),
+            CallKeyKind::PeerMedia,
+        )?;
         if session.is_some() || media.is_some() {
             self.received.send_replace(CallPeerKeys {
                 session: session.or(current.session),
@@ -336,7 +341,7 @@ impl CallMediaHandshake {
             key: media,
             call_id: self.call.id,
             participant: local_participant,
-            kind: CallKeyKind::Media,
+            kind: CallKeyKind::LocalMedia,
         };
         let common = || {
             Dictionary::from_iter([

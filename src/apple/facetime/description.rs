@@ -39,6 +39,7 @@ pub struct CallMediaDescription {
     pub video: Option<CallRtpDescription>,
 }
 
+#[derive(Clone)]
 pub struct CallRtpDescription {
     pub ssrc: u32,
     pub payload_types: Vec<u8>,
@@ -457,7 +458,7 @@ pub(super) mod tests {
         let keys = CallKeyOffer {
             payload: Vec::new(),
             session: fixture_key(LOCAL, CallKeyKind::LocalSession),
-            media: fixture_key(LOCAL, CallKeyKind::Media),
+            media: fixture_key(LOCAL, CallKeyKind::LocalMedia),
         };
         keys.seal_description(&hex::decode(AVC)?, CallMode::Video)
     }
@@ -482,7 +483,7 @@ pub(super) mod tests {
         // The encrypted frame names CALLER. Even with its key, resist relabeling.
         let moved_key = fixture_key(LOCAL, CallKeyKind::PeerSession);
         assert!(open_description(CALL, LOCAL, &moved_key, &encrypted).is_err());
-        let media_key = fixture_key(CALLER, CallKeyKind::Media);
+        let media_key = fixture_key(CALLER, CallKeyKind::PeerMedia);
         assert!(open_description(CALL, CALLER, &media_key, &encrypted).is_err());
         assert!(open_description(CALL, CALLER, &key, &encrypted[..HEADER_LEN]).is_err());
         Ok(())

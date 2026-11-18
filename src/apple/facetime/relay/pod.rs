@@ -13,6 +13,7 @@ use openssl::{
 use zeroize::Zeroizing;
 
 use super::{CallRelayConnection, RelayChannel, wire::take_varint};
+use crate::apple::crypto::aes128_ctr;
 
 const TAG_LEN: usize = 6;
 const PN_OFFSET: usize = 5;
@@ -260,17 +261,7 @@ impl DirectionKeys {
         for (byte, number) in counter[8..12].iter_mut().zip(number.to_be_bytes()) {
             *byte ^= number;
         }
-        let mut ctx = CipherCtx::new()?;
-        ctx.encrypt_init(
-            Some(Cipher::aes_128_ctr()),
-            Some(self.payload.as_ref()),
-            Some(counter.as_ref()),
-        )?;
-        ensure!(
-            ctx.cipher_update_inplace(data, data.len())? == data.len(),
-            "Invalid FaceTime relay cipher length"
-        );
-        Ok(())
+        aes128_ctr(self.payload.as_ref(), &counter, data)
     }
 
     fn tag(&self, packet: &[u8], header_len: usize) -> Result<[u8; TAG_LEN]> {

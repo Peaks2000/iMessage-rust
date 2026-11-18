@@ -1,6 +1,7 @@
 mod description;
 mod media;
 pub(super) mod relay;
+mod srtp;
 
 use plist::Value;
 use prost::Message as _;
@@ -16,6 +17,7 @@ pub use relay::{
     CallRelayAllocation, CallRelayBinding, CallRelayConnection, CallRelayKeys, CallRelayProfile,
     CallRelayStream, RelayChannel, RelayDatagramChannel, RelayStreamDirection,
 };
+pub(crate) use srtp::CallRtpProtection;
 
 pub(super) const SIGNALING: &str = "com.apple.private.alloy.facetime.multi";
 pub(super) const VIDEO: &str = "com.apple.private.alloy.facetime.video";
