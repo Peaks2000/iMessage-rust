@@ -14,8 +14,8 @@ use tokio::{
 
 use crate::media::MediaSource;
 use crate::{
-    Conversation, Delivery, FILE_LIMIT, MAX_ATTACHMENTS, Message, SendText, Status, TEXT_LIMIT,
-    Tapback, TapbackEvent, TapbackKind, address, now_ms, now_ns,
+    Conversation, Delivery, FILE_LIMIT, MAX_ATTACHMENTS, Message, SendText, SetTapback, Status,
+    TEXT_LIMIT, Tapback, TapbackEvent, TapbackKind, address, now_ms, now_ns,
 };
 use crate::{
     apple::{Identity, Incoming, Madrid},
@@ -38,7 +38,7 @@ enum Request {
     Send(SendText, oneshot::Sender<Result<Message>>),
     Tapback {
         target: uuid::Uuid,
-        reaction: Option<TapbackKind>,
+        request: SetTapback,
         reply: oneshot::Sender<Result<Vec<Tapback>>>,
     },
     Download {
@@ -98,14 +98,29 @@ impl Engine {
         target: uuid::Uuid,
         reaction: Option<TapbackKind>,
     ) -> Result<Vec<Tapback>> {
-        if let Some(kind) = &reaction {
+        self.set_message_tapback(
+            target,
+            SetTapback {
+                reaction,
+                part: None,
+            },
+        )
+        .await
+    }
+
+    pub async fn set_message_tapback(
+        &self,
+        target: uuid::Uuid,
+        request: SetTapback,
+    ) -> Result<Vec<Tapback>> {
+        if let Some(kind) = &request.reaction {
             kind.validate()?;
         }
         let (reply, answer) = oneshot::channel();
         self.requests
             .try_send(Request::Tapback {
                 target,
-                reaction,
+                request,
                 reply,
             })
             .context("The Apple engine is busy or stopped")?;
@@ -126,8 +141,9 @@ impl Engine {
             request.files.len() <= MAX_ATTACHMENTS,
             "Too many attachments"
         );
-        for file in &request.files {
+        for file in &mut request.files {
             file.validate()?;
+            file.info.part = None;
         }
         ensure!(
             request
@@ -249,8 +265,8 @@ async fn online(
                     Request::Download { id, index, reply } => {
                         let _ = reply.send(download(identity, state, madrid, id, index).await);
                     }
-                    Request::Tapback { target, reaction, reply } => {
-                        let _ = reply.send(send_tapback(identity, state, madrid, target, reaction).await);
+                    Request::Tapback { target, request, reply } => {
+                        let _ = reply.send(send_tapback(identity, state, madrid, target, request).await);
                     }
                 }
             }
@@ -264,7 +280,7 @@ async fn send_tapback(
     state: &State,
     madrid: &mut Madrid,
     target: uuid::Uuid,
-    desired: Option<TapbackKind>,
+    request: SetTapback,
 ) -> Result<Vec<Tapback>> {
     let message = state
         .history()?
@@ -274,16 +290,29 @@ async fn send_tapback(
         matches!(message.status, Delivery::Received | Delivery::Accepted),
         "This message is awaiting delivery"
     );
+    let first = message.first_part();
+    let part = request.part.unwrap_or_else(|| {
+        message
+            .tapbacks
+            .iter()
+            .filter(|tapback| tapback.outgoing)
+            .min_by_key(|tapback| tapback.part != first)
+            .map_or(first, |tapback| tapback.part)
+    });
     let previous = message
         .tapbacks
         .iter()
-        .find(|tapback| tapback.outgoing && tapback.part == 0)
-        .or_else(|| message.tapbacks.iter().find(|tapback| tapback.outgoing));
-    if previous.map(|tapback| &tapback.kind) == desired.as_ref() {
+        .find(|tapback| tapback.outgoing && tapback.part == part);
+    ensure!(
+        message.has_part(part) || (request.reaction.is_none() && previous.is_some()),
+        "This part of the message is unavailable"
+    );
+    if previous.map(|tapback| &tapback.kind) == request.reaction.as_ref() {
         return Ok(message.tapbacks);
     }
-    let removed = desired.is_none();
-    let kind = desired
+    let removed = request.reaction.is_none();
+    let kind = request
+        .reaction
         .or_else(|| previous.map(|tapback| tapback.kind.clone()))
         .context("No tapback to remove")?;
     let event = TapbackEvent {
@@ -295,7 +324,7 @@ async fn send_tapback(
         tapback: Tapback {
             kind,
             outgoing: true,
-            part: previous.map_or(0, |tapback| tapback.part),
+            part,
         },
     };
     let result = madrid.send_tapback(identity, &message, &event).await?;
@@ -364,6 +393,7 @@ fn start_send(history: &History, request: &SendText) -> Result<(Message, bool)> 
         id: request.id.to_string(),
         address: request.address.clone(),
         body: request.body.clone(),
+        text_part: None,
         outgoing: true,
         timestamp_ms: now_ms(),
         status: Delivery::Pending,
@@ -425,6 +455,7 @@ mod tests {
                     size: 4,
                     width: 4,
                     height: 4,
+                    part: None,
                 },
                 bytes: bytes::Bytes::from_static(b"1234"),
             }],
@@ -463,6 +494,7 @@ mod tests {
                     size: 1,
                     width: 1,
                     height: 1,
+                    part: None,
                 },
                 bytes: bytes::Bytes::from_static(b"x"),
             }],
@@ -474,6 +506,7 @@ mod tests {
             id: uuid::Uuid::new_v4().to_string(),
             address: "mailto:another@example.com".into(),
             body: "Another conversation".into(),
+            text_part: None,
             outgoing: false,
             timestamp_ms: now_ms(),
             status: Delivery::Received,

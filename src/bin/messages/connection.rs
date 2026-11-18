@@ -364,7 +364,7 @@ impl Backend {
 
     async fn set_tapback(&self, id: uuid::Uuid, request: SetTapback) -> Result<Vec<Tapback>> {
         match self {
-            Self::Local(engine) => engine.set_tapback(id, request.reaction).await,
+            Self::Local(engine) => engine.set_message_tapback(id, request).await,
             Self::Remote(remote) => {
                 remote
                     .fetch(

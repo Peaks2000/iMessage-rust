@@ -24,6 +24,8 @@ pub struct Message {
     pub id: String,
     pub address: String,
     pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_part: Option<u32>,
     pub outgoing: bool,
     pub timestamp_ms: i64,
     pub status: Delivery,
@@ -31,6 +33,29 @@ pub struct Message {
     pub attachments: Vec<Attachment>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tapbacks: Vec<Tapback>,
+}
+
+impl Message {
+    pub fn body_part(&self) -> u32 {
+        self.text_part.unwrap_or(self.attachments.len() as u32)
+    }
+
+    pub fn attachment_part(&self, index: usize) -> u32 {
+        self.attachments[index].part.unwrap_or(index as u32)
+    }
+
+    pub fn first_part(&self) -> u32 {
+        if self.attachments.is_empty() {
+            self.body_part()
+        } else {
+            self.attachment_part(0)
+        }
+    }
+
+    pub fn has_part(&self, part: u32) -> bool {
+        (!self.body.trim().is_empty() && self.body_part() == part)
+            || (0..self.attachments.len()).any(|index| self.attachment_part(index) == part)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -70,6 +95,8 @@ pub struct Tapback {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SetTapback {
     pub reaction: Option<TapbackKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part: Option<u32>,
 }
 
 pub(crate) struct TapbackEvent {

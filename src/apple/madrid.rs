@@ -54,6 +54,13 @@ struct Destination {
     public_key: KeyPair<Public>,
 }
 
+struct DeliveryPayload<'a> {
+    recipient: &'a str,
+    guid: Uuid,
+    bytes: &'a [u8],
+    request_receipt: bool,
+}
+
 #[derive(Deserialize)]
 struct LookupResponse {
     status: u64,
@@ -332,8 +339,17 @@ impl Madrid {
             );
             binary(&content)?
         };
-        self.deliver_message(identity, message.id, &message.address, &text, &targets)
-            .await
+        self.deliver_message(
+            identity,
+            DeliveryPayload {
+                recipient: &message.address,
+                guid: message.id,
+                bytes: &text,
+                request_receipt: true,
+            },
+            &targets,
+        )
+        .await
     }
 
     pub(crate) async fn send_tapback(
@@ -342,11 +358,19 @@ impl Madrid {
         target: &Message,
         event: &TapbackEvent,
     ) -> Result<Delivery> {
-        let payload = tapback::encode(event, target, &identity.handle)?;
-        let payload = compress(&binary(&payload)?)?;
+        let payload = binary(&tapback::encode(event, target, &identity.handle)?)?;
         let targets = self.message_destinations(identity, &event.chat).await?;
-        self.deliver_message(identity, event.id, &event.chat, &payload, &targets)
-            .await
+        self.deliver_message(
+            identity,
+            DeliveryPayload {
+                recipient: &event.chat,
+                guid: event.id,
+                bytes: &payload,
+                request_receipt: false,
+            },
+            &targets,
+        )
+        .await
     }
 
     async fn message_destinations(
@@ -370,20 +394,20 @@ impl Madrid {
     async fn deliver_message(
         &mut self,
         identity: &Identity,
-        guid: Uuid,
-        recipient: &str,
-        text: &[u8],
+        payload: DeliveryPayload<'_>,
         targets: &HashMap<String, Vec<Destination>>,
     ) -> Result<Delivery> {
         let mut batches = vec![Vec::new()];
         let mut batch_bytes = 0;
         let mut seen = HashSet::new();
-        for uri in [recipient, identity.handle.as_str()] {
+        for uri in [payload.recipient, identity.handle.as_str()] {
             for device in targets.get(uri).into_iter().flatten() {
                 if device.push == identity.token || !seen.insert(device.push.as_slice()) {
                     continue;
                 }
-                let encrypted = identity.message_keys.seal(&device.public_key, text)?;
+                let encrypted = identity
+                    .message_keys
+                    .seal(&device.public_key, payload.bytes)?;
                 let cost = encrypted.len() + device.session.len() + 512;
                 ensure!(
                     cost <= MAX_BATCH && seen.len() <= 64,
@@ -399,7 +423,10 @@ impl Madrid {
                     .expect("A batch always exists")
                     .push(Value::Dictionary(dictionary([
                         ("tP", value(uri)),
-                        ("D", Value::Boolean(uri == recipient)),
+                        (
+                            "D",
+                            Value::Boolean(payload.request_receipt && uri == payload.recipient),
+                        ),
                         ("sT", data(&device.session)),
                         ("P", data(&encrypted)),
                         ("t", data(&device.push)),
@@ -418,7 +445,7 @@ impl Madrid {
                     ("ua", value(&identity.user_agent)),
                     ("v", 8.into()),
                     ("i", i32::from_be_bytes(id).into()),
-                    ("U", data(guid.as_bytes())),
+                    ("U", data(payload.guid.as_bytes())),
                     ("sP", value(&identity.handle)),
                     ("fcn", (index as u32 + 1).into()),
                     ("dtl", Value::Array(bundle)),
@@ -592,7 +619,11 @@ impl Madrid {
                 return Ok(tapback::decode(&body, guid, peer, outgoing, timestamp_ns)
                     .map(Incoming::Tapback));
             }
-            let (text, files) = message_content::decode(&body);
+            let message_content::Content {
+                text,
+                text_part,
+                files,
+            } = message_content::decode(&body);
             if text.trim().is_empty() && files.is_empty() {
                 return Ok(None);
             }
@@ -602,6 +633,7 @@ impl Madrid {
                     id: guid.to_string(),
                     address: peer,
                     body: text,
+                    text_part,
                     attachments,
                     outgoing,
                     timestamp_ms: timestamp_ns / 1_000_000,

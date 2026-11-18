@@ -20,6 +20,7 @@ impl History {
                 id TEXT PRIMARY KEY,
                 address TEXT NOT NULL,
                 body TEXT NOT NULL,
+                text_part INTEGER,
                 outgoing INTEGER NOT NULL,
                 timestamp_ms INTEGER NOT NULL,
                 status TEXT NOT NULL
@@ -48,6 +49,14 @@ impl History {
             CREATE INDEX IF NOT EXISTS tapbacks_for_message
                 ON tapback_events(address, message_id, timestamp_ns, id);
         ")?;
+        let has_text_part = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('messages') WHERE name = 'text_part')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !has_text_part {
+            db.execute("ALTER TABLE messages ADD COLUMN text_part INTEGER", [])?;
+        }
         Ok(Self(db))
     }
 
@@ -74,7 +83,7 @@ impl History {
     pub fn messages(&self, address: &str, offset: u32) -> Result<Vec<Message>> {
         let mut query = self.0.prepare(
             "
-            SELECT id, address, body, outgoing, timestamp_ms, status FROM messages
+            SELECT id, address, body, outgoing, timestamp_ms, status, text_part FROM messages
             WHERE address = ?1 ORDER BY timestamp_ms DESC, id DESC LIMIT ?2 OFFSET ?3
         ",
         )?;
@@ -116,7 +125,7 @@ impl History {
     }
 
     pub fn get(&self, id: &str) -> Result<Option<Message>> {
-        let mut row = self.0.query_row("SELECT id, address, body, outgoing, timestamp_ms, status FROM messages WHERE id = ?1",
+        let mut row = self.0.query_row("SELECT id, address, body, outgoing, timestamp_ms, status, text_part FROM messages WHERE id = ?1",
             [id], read_message).optional()?;
         if let Some(row) = &mut row {
             row.attachments = self.attachment_info(id)?;
@@ -206,8 +215,8 @@ impl History {
     ) -> Result<()> {
         let transaction = self.0.unchecked_transaction()?;
         let inserted = transaction.execute(
-            "INSERT INTO messages (id, address, body, outgoing, timestamp_ms, status)
-            SELECT ?1, ?2, ?3, ?4, ?5, ?6
+            "INSERT INTO messages (id, address, body, outgoing, timestamp_ms, status, text_part)
+            SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
             WHERE NOT EXISTS (SELECT 1 FROM deleted_messages WHERE id = ?1)
             ON CONFLICT(id) DO NOTHING",
             params![
@@ -216,7 +225,8 @@ impl History {
                 message.body,
                 message.outgoing,
                 message.timestamp_ms,
-                status_value(message.status)
+                status_value(message.status),
+                message.text_part,
             ],
         )? > 0;
         if inserted {
@@ -282,6 +292,7 @@ fn read_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         id: row.get(0)?,
         address: row.get(1)?,
         body: row.get(2)?,
+        text_part: row.get(6)?,
         outgoing: row.get(3)?,
         timestamp_ms: row.get(4)?,
         status: match row.get_ref(5)?.as_str()? {
@@ -300,6 +311,48 @@ fn read_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
 mod tests {
     use super::*;
     use crate::TapbackKind;
+
+    #[test]
+    fn opening_older_history_keeps_messages_and_saves_part_indices() -> Result<()> {
+        let folder = tempfile::tempdir()?;
+        let old = Connection::open(folder.path().join("old.sqlite"))?;
+        old.execute_batch("CREATE TABLE messages (
+            id TEXT PRIMARY KEY, address TEXT NOT NULL, body TEXT NOT NULL,
+            outgoing INTEGER NOT NULL, timestamp_ms INTEGER NOT NULL, status TEXT NOT NULL
+        ); INSERT INTO messages VALUES ('old', 'mailto:peer@example.org', 'hello', 0, 1, 'received');")?;
+        drop(old);
+        let history = History::open(folder.path(), "old")?;
+        let mut message = history.get("old")?.unwrap();
+        assert_eq!(message.body_part(), 0);
+        message.id = "new".into();
+        message.text_part = Some(4);
+        message.attachments.push(Attachment {
+            name: "photo.png".into(),
+            mime: "image/png".into(),
+            size: 1,
+            width: 1,
+            height: 1,
+            part: Some(7),
+        });
+        history.insert(
+            &message,
+            [MediaSource::Local(bytes::Bytes::from_static(b"a"))],
+        )?;
+        drop(history);
+        let history = History::open(folder.path(), "old")?;
+        let messages = history.messages(&message.address, 0)?;
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages
+                .iter()
+                .find(|row| row.id == "new")
+                .unwrap()
+                .body_part(),
+            4
+        );
+        assert_eq!(history.get("new")?.unwrap().attachment_part(0), 7);
+        Ok(())
+    }
     use uuid::Uuid;
 
     #[test]

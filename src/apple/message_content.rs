@@ -77,9 +77,16 @@ pub(super) fn encode(
     Ok(String::from_utf8(writer.into_inner().into_inner())?)
 }
 
-pub(super) fn decode(body: &Dictionary) -> (String, Vec<(Attachment, MediaSource)>) {
+pub(super) struct Content {
+    pub text: String,
+    pub text_part: Option<u32>,
+    pub files: Vec<(Attachment, MediaSource)>,
+}
+
+pub(super) fn decode(body: &Dictionary) -> Content {
     let mut rich_text = String::new();
     let mut media = Vec::new();
+    let mut text_part = None;
     if let Some(xml) = body.get("x").and_then(Value::as_string) {
         let mut reader = Reader::from_str(xml);
         loop {
@@ -91,6 +98,13 @@ pub(super) fn decode(body: &Dictionary) -> (String, Vec<(Attachment, MediaSource
                         && let Ok(file) = parse_file(&element, body, reader.decoder())
                     {
                         media.push(file);
+                    }
+                    if name.as_ref().eq_ignore_ascii_case(b"span") && text_part.is_none() {
+                        text_part = element
+                            .try_get_attribute("message-part")
+                            .ok()
+                            .flatten()
+                            .and_then(|part| part.unescape_value().ok()?.parse().ok());
                     }
                     if name.as_ref().eq_ignore_ascii_case(b"br") {
                         rich_text.push('\n');
@@ -145,7 +159,11 @@ pub(super) fn decode(body: &Dictionary) -> (String, Vec<(Attachment, MediaSource
             .expect("UTF-8 characters are no longer than four bytes");
         text.truncate(end);
     }
-    (text, media)
+    Content {
+        text,
+        text_part,
+        files: media,
+    }
 }
 
 fn parse_file(
@@ -211,6 +229,7 @@ fn parse_file(
         height: value("height")
             .and_then(|value| value.parse().ok())
             .unwrap_or(0),
+        part: value("message-part").and_then(|part| part.parse().ok()),
     };
     info.validate()?;
     Ok((info, source))
@@ -305,8 +324,13 @@ mod tests {
             ("x", Value::String(r#"<html><body><FILE name="Photo &amp; notes.png" uti-type="public.png" width="800" height="600" inline-attachment="ia-0"/><span>Photo &amp; notes<br/>for tomorrow</span></body></html>"#.into())),
             ("ia-0", Value::Data(vec![1, 2, 3, 4])),
         ]);
-        let (text, files) = decode(&body);
+        let Content {
+            text,
+            text_part,
+            files,
+        } = decode(&body);
         assert_eq!(text, "Photo & notes\nfor tomorrow");
+        assert_eq!(text_part, None);
         let [(info, MediaSource::Local(bytes))] = &files[..] else {
             panic!("Missing inline photo")
         };
@@ -343,7 +367,7 @@ mod tests {
             ),
             ("bp", Value::Data(encoded.finish()?)),
         ]);
-        assert_eq!(decode(&body).0, "https://example.com/article");
+        assert_eq!(decode(&body).text, "https://example.com/article");
         Ok(())
     }
 }
