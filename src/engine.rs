@@ -19,7 +19,7 @@ use crate::{
     TEXT_LIMIT, Tapback, TapbackEvent, TapbackKind, address, now_ms, now_ns,
 };
 use crate::{
-    apple::{CallSignal, Identity, Incoming, Madrid},
+    apple::{CallEndpoint, CallSignal, Identity, Incoming, Madrid},
     history::History,
 };
 
@@ -217,6 +217,7 @@ async fn run_apple(
     status: watch::Sender<Status>,
 ) {
     let mut retry_delay = Duration::from_secs(3);
+    let mut calls = IncomingCalls::default();
     loop {
         let connection = tokio::select! {
             connection = Madrid::connect(&identity) => connection,
@@ -226,7 +227,16 @@ async fn run_apple(
             Ok(mut madrid) => {
                 retry_delay = Duration::from_secs(3);
                 set_status(&status, true, "Connected to Apple courier");
-                match online(&identity, &state, &mut madrid, &mut requests, &status).await {
+                match online(
+                    &identity,
+                    &state,
+                    &mut madrid,
+                    &mut requests,
+                    &status,
+                    &mut calls,
+                )
+                .await
+                {
                     Ok(()) => break,
                     Err(error) => error,
                 }
@@ -271,16 +281,25 @@ async fn online(
     madrid: &mut Madrid,
     requests: &mut mpsc::Receiver<Request>,
     status: &watch::Sender<Status>,
+    calls: &mut IncomingCalls,
 ) -> Result<()> {
-    let mut ended_calls = HashMap::new();
     loop {
+        let next_expiry = status
+            .borrow()
+            .incoming_calls
+            .iter()
+            .map(|call| call.expires_ms)
+            .min();
         tokio::select! {
+            () = sleep(Duration::from_millis(next_expiry.unwrap_or_default().saturating_sub(now_ms()).max(0) as u64)), if next_expiry.is_some() => {
+                status.send_if_modified(|status| calls.expire(status, now_ms()));
+            }
             notification = madrid.next_notification() => {
                 let notification = notification?;
                 match madrid.decode(identity, &notification).await? {
                     Some(Incoming::Message(message, media)) => state.history()?.insert(&message, media)?,
                     Some(Incoming::Tapback(event)) => state.history()?.insert_tapback(&event)?,
-                    Some(Incoming::Call(signal)) => update_calls(status, identity.handle(), &mut ended_calls, signal),
+                    Some(Incoming::Call(signal)) => calls.update(status, identity.handle(), signal),
                     None => (),
                 }
                 madrid.acknowledge(notification.id).await?;
@@ -304,7 +323,7 @@ async fn online(
                             Some(call) => {
                                 let result = madrid.decline_call(identity, &call).await;
                                 if result.is_ok() {
-                                    ended_calls.insert(id, call.expires_ms);
+                                    calls.end(id, now_ms());
                                 }
                                 result
                             }
@@ -322,43 +341,94 @@ async fn online(
     }
 }
 
-fn update_calls(
-    status: &watch::Sender<Status>,
-    own: &str,
-    ended: &mut HashMap<uuid::Uuid, i64>,
-    signal: CallSignal,
-) {
-    let now = now_ms();
-    ended.retain(|_, expires_ms| *expires_ms > now);
-    status.send_modify(|status| {
-        let calls = &mut status.incoming_calls;
-        calls.retain(|call| call.expires_ms > now);
-        match signal {
-            CallSignal::Ring(offer)
-                if !ended.contains_key(&offer.id)
-                    && !calls.iter().any(|call| call.id == offer.id) =>
-            {
-                if calls.len() >= 16 {
-                    calls.remove(0);
-                }
-                calls.push(offer);
-            }
-            CallSignal::End {
-                id,
-                sender,
-                received_ms,
-            } => {
-                if let Some(index) = calls.iter().position(|call| {
-                    call.id == id
-                        && (sender == own || sender == call.caller)
-                        && received_ms >= call.received_ms
-                }) {
-                    ended.insert(id, calls.remove(index).expires_ms);
-                }
-            }
-            CallSignal::Ring(_) => (),
+#[derive(Default)]
+struct IncomingCalls {
+    endpoints: HashMap<uuid::Uuid, CallEndpoint>,
+    ended: HashMap<uuid::Uuid, i64>,
+}
+
+impl IncomingCalls {
+    fn expire(&mut self, status: &mut Status, now: i64) -> bool {
+        let previous = status.incoming_calls.len();
+        status.incoming_calls.retain(|call| call.expires_ms > now);
+        self.endpoints
+            .retain(|id, _| status.incoming_calls.iter().any(|call| call.id == *id));
+        self.ended.retain(|_, expires_ms| *expires_ms > now);
+        status.incoming_calls.len() != previous
+    }
+
+    fn end(&mut self, id: uuid::Uuid, now: i64) {
+        self.endpoints.remove(&id);
+        if self.ended.len() >= 256
+            && let Some((&oldest, _)) = self.ended.iter().min_by_key(|(_, expiry)| *expiry)
+        {
+            self.ended.remove(&oldest);
         }
-    });
+        self.ended.insert(id, now + 120_000);
+    }
+
+    fn update(&mut self, status: &watch::Sender<Status>, own: &str, signal: CallSignal) {
+        let now = now_ms();
+        status.send_if_modified(|status| {
+            let expired = self.expire(status, now);
+            let calls = &mut status.incoming_calls;
+            match signal {
+                CallSignal::Ring {
+                    call: offer,
+                    endpoint,
+                } if offer.expires_ms > now && !self.ended.contains_key(&offer.id) => {
+                    if let Some(existing) = calls.iter_mut().find(|call| call.id == offer.id) {
+                        // Bind a standalone invitation to its join without extending the original ring.
+                        if existing.caller == offer.caller
+                            && self
+                                .endpoints
+                                .get(&offer.id)
+                                .is_some_and(|first| first.matches(endpoint))
+                        {
+                            self.endpoints.insert(offer.id, endpoint);
+                            if existing.mode.is_none() && offer.mode.is_some() {
+                                existing.mode = offer.mode;
+                                return true;
+                            }
+                        }
+                        return expired;
+                    }
+                    if calls.len() >= 16 {
+                        self.endpoints.remove(&calls.remove(0).id);
+                    }
+                    self.endpoints.insert(offer.id, endpoint);
+                    calls.push(offer);
+                    true
+                }
+                CallSignal::End {
+                    id,
+                    sender,
+                    received_ms,
+                    endpoint,
+                } => {
+                    if let Some(index) = calls.iter().position(|call| {
+                        let can_end = match endpoint {
+                            Some(leaving) => {
+                                sender == call.caller
+                                    && self
+                                        .endpoints
+                                        .get(&id)
+                                        .is_some_and(|first| first.matches(leaving))
+                            }
+                            None => sender == own || sender == call.caller,
+                        };
+                        call.id == id && can_end && received_ms >= call.received_ms
+                    }) {
+                        calls.remove(index);
+                        self.end(id, now);
+                        return true;
+                    }
+                    expired
+                }
+                CallSignal::Ring { .. } => expired,
+            }
+        });
+    }
 }
 
 async fn send_tapback(
@@ -500,7 +570,6 @@ fn set_status(status: &watch::Sender<Status>, connected: bool, detail: &str) {
     status.send_modify(|status| {
         status.connected = connected;
         status.detail = detail.to_owned();
-        status.incoming_calls.clear();
     });
 }
 
@@ -542,7 +611,7 @@ mod tests {
         let offer = crate::IncomingCall {
             id,
             caller: caller.into(),
-            mode: Some(crate::CallMode::Video),
+            mode: None,
             received_ms: now,
             expires_ms: now + 45_000,
         };
@@ -550,19 +619,58 @@ mod tests {
             id,
             sender: sender.into(),
             received_ms: time,
+            endpoint: None,
         };
-        let mut ended = HashMap::new();
-        update_calls(&status, own, &mut ended, CallSignal::Ring(offer.clone()));
-        update_calls(
+        let ring = |call, token, participant| CallSignal::Ring {
+            call,
+            endpoint: CallEndpoint::new([token; 32], participant),
+        };
+        let leave = |token, participant| CallSignal::End {
+            id,
+            sender: caller.into(),
+            received_ms: now,
+            endpoint: Some(CallEndpoint::new([token; 32], Some(participant))),
+        };
+        let mut incoming = IncomingCalls::default();
+        incoming.update(&status, own, ring(offer.clone(), 1, None));
+        incoming.update(&status, own, end("mailto:stranger@example.org", now));
+        incoming.update(&status, own, end(caller, now - 1));
+        let join = crate::IncomingCall {
+            mode: Some(crate::CallMode::Video),
+            expires_ms: offer.expires_ms + 1_000,
+            ..offer.clone()
+        };
+        incoming.update(&status, own, ring(join.clone(), 2, Some(11)));
+        assert_eq!(reader.borrow().incoming_calls, vec![offer.clone()]);
+        incoming.update(&status, own, ring(join.clone(), 1, Some(11)));
+        incoming.update(&status, own, leave(1, 12));
+        incoming.update(&status, own, leave(2, 11));
+        assert_eq!(
+            reader.borrow().incoming_calls,
+            vec![crate::IncomingCall {
+                mode: join.mode,
+                ..offer.clone()
+            }]
+        );
+        incoming.update(&status, own, leave(1, 11));
+        incoming.update(&status, own, ring(offer.clone(), 1, None));
+        assert!(reader.borrow().incoming_calls.is_empty());
+        let id = uuid::Uuid::new_v4();
+        incoming.update(
             &status,
             own,
-            &mut ended,
-            end("mailto:stranger@example.org", now),
+            ring(crate::IncomingCall { id, ..offer }, 1, None),
         );
-        update_calls(&status, own, &mut ended, end(caller, now - 1));
-        assert_eq!(reader.borrow().incoming_calls, vec![offer.clone()]);
-        update_calls(&status, own, &mut ended, end(own, now));
-        update_calls(&status, own, &mut ended, CallSignal::Ring(offer));
+        incoming.update(
+            &status,
+            own,
+            CallSignal::End {
+                id,
+                sender: own.into(),
+                received_ms: now,
+                endpoint: None,
+            },
+        );
         assert!(reader.borrow().incoming_calls.is_empty());
     }
 

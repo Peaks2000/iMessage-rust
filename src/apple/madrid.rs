@@ -612,13 +612,19 @@ impl Madrid {
     ) -> Result<Option<Incoming>> {
         let wire = &notice.data;
         let command = wire.get("c").and_then(Value::as_unsigned_integer);
-        let call = notice.topic == facetime::SIGNALING
-            && command == Some(facetime::INVITATION_COMMAND)
-            && field_str(wire, "E") == Some("pair");
+        let encryption = field_str(wire, "E");
+        let call = command.filter(|command| {
+            matches!(notice.topic, facetime::SIGNALING | facetime::VIDEO)
+                && matches!(
+                    *command,
+                    facetime::INVITATION_COMMAND | facetime::JOIN_COMMAND | facetime::LEAVE_COMMAND
+                )
+                && encryption == Some("pair")
+        });
         let message = notice.topic == TOPIC
             && command == Some(100)
-            && field_str(wire, "E").is_none_or(|name| name == "pair");
-        if !call && !message {
+            && encryption.is_none_or(|name| name == "pair");
+        if call.is_none() && !message {
             return Ok(None);
         }
         let (Some(sender), Some(target), Some(token), Some(envelope), Some(guid)) = (
@@ -630,12 +636,15 @@ impl Madrid {
         ) else {
             return Ok(None);
         };
-        let (Ok(sender), Ok(target), Ok(guid)) =
-            (address(sender), address(target), Uuid::from_slice(guid))
-        else {
+        let (Ok(sender), Ok(target), Ok(guid), Ok(push_token)) = (
+            address(sender),
+            address(target),
+            Uuid::from_slice(guid),
+            token.try_into(),
+        ) else {
             return Ok(None);
         };
-        if target != identity.handle || token.len() != 32 {
+        if target != identity.handle {
             return Ok(None);
         }
 
@@ -669,18 +678,25 @@ impl Madrid {
         };
         let decoded = (|| -> Result<Option<Incoming>> {
             let plaintext = identity.message_keys.open(&device.public_key, envelope)?;
-            if call {
+            if let Some(command) = call {
                 let Some(received_ms) = wire
                     .get("e")
                     .and_then(Value::as_unsigned_integer)
+                    .map(|published| {
+                        wire.get("oe")
+                            .and_then(Value::as_unsigned_integer)
+                            .map_or(published, |original| original.min(published))
+                    })
                     .and_then(|ns| i64::try_from(ns / 1_000_000).ok())
                 else {
                     return Ok(None);
                 };
                 return Ok(facetime::decode(
+                    command,
                     &decompress(&plaintext)?,
                     sender,
                     &identity.handle,
+                    push_token,
                     received_ms,
                 )
                 .map(Incoming::Call));
