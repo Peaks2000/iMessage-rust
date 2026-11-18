@@ -278,18 +278,10 @@ impl DeviceProvider {
             let status = connection.run("activation-status", &[], 128).await?;
             match status.as_slice() {
                 b"ready" => (),
-                b"unknown-system-signer" => anyhow::bail!(
-                    "This El Capitan build uses an Apple push signer that iMessage does not recognize"
-                ),
-                b"unavailable-system-signer" => {
-                    anyhow::bail!("El Capitan could not load its Apple push signer")
-                }
-                b"missing-signing-key" => anyhow::bail!(
-                    "The Mac needs an Apple-issued activation signing key in ~/Library/Application Support/LinuxMessages/activation-key.pem, readable only by your Mac user"
-                ),
-                b"missing-certificate-chain" => anyhow::bail!(
-                    "The Mac needs the matching Apple activation certificate chain in ~/Library/Application Support/LinuxMessages/activation-chain.pem"
-                ),
+                b"unknown-system-signer"
+                | b"unavailable-system-signer"
+                | b"missing-signing-key"
+                | b"missing-certificate-chain" => return sign_mac_push_activation(payload).await,
                 _ => anyhow::bail!("The Mac returned an unknown activation status"),
             }
         }
@@ -300,6 +292,21 @@ impl DeviceProvider {
             .context("The device helper returned an invalid activation signature")?;
         Ok(signed)
     }
+}
+
+async fn sign_mac_push_activation(payload: &[u8]) -> Result<ActivationSignature> {
+    // The software signer and the device push key are separate identities.
+    let signer = std::env::current_exe()?.with_file_name("imessage-apple-push-signer");
+    let bytes = provider_command::run(
+        &signer,
+        &[],
+        "local push activation",
+        payload,
+        MAX_HELPER_OUTPUT,
+    )
+    .await
+    .context("Could not run the Linux push signer from the iMessage installation")?;
+    serde_json::from_slice(&bytes).context("The Linux push signer returned an invalid response")
 }
 
 async fn validation_reply(request: reqwest::RequestBuilder) -> Result<Dictionary> {

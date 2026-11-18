@@ -25,6 +25,7 @@ path = "src/bin/messages-server.rs"
 
 [dependencies]
 anyhow = "1"
+aps = { git = "https://tangled.org/dadoum.zone/apple-crates.git", rev = "b6e2ac2e5eb971fed221e298a043d6a61402645b" }
 arboard = { version = "3.7", optional = true }
 argon2 = "0.5"
 axum = { version = "0.8", features = ["json"] }
