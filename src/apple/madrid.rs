@@ -1012,9 +1012,8 @@ impl Madrid {
         &mut self,
         identity: &Identity,
         reference: &MediaReference,
-        size: usize,
     ) -> Result<bytes::Bytes> {
-        mmcs::download(self, identity, reference, size).await
+        mmcs::download(self, identity, reference).await
     }
 
     pub(super) async fn media_request<const N: usize>(

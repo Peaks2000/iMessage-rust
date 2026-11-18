@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    ops::Range,
     time::Duration,
 };
 
@@ -333,12 +334,11 @@ pub(super) async fn download(
     madrid: &mut Madrid,
     identity: &Identity,
     reference: &MediaReference,
-    size: usize,
 ) -> Result<Bytes> {
     let session = Session::new(identity)?;
     validate_url(&reference.url, false)?;
     ensure!(
-        valid_object(&reference.object) && (1..=FILE_LIMIT).contains(&size),
+        valid_object(&reference.object),
         "Invalid attachment reference"
     );
     let mut base = reference.url.clone();
@@ -385,7 +385,7 @@ pub(super) async fn download(
         !file.chunks.is_empty() && file.chunks.len() <= 64,
         "Invalid MMCS download chunk list"
     );
-    let mut encrypted = Vec::with_capacity(size);
+    let mut encrypted = Vec::new();
     let mut containers = HashMap::new();
     let mut receipts = Vec::new();
     let mut downloaded = 0;
@@ -399,16 +399,7 @@ pub(super) async fn download(
             .get(index.index as usize)
             .and_then(|chunk| chunk.data.as_ref())
             .context("Missing MMCS download chunk")?;
-        let end = chunk
-            .offset
-            .checked_add(chunk.size)
-            .context("Invalid chunk offset")?;
-        ensure!(
-            end <= MAX_RESPONSE as u64
-                && chunk.size > 0
-                && chunk.size <= (size - encrypted.len()) as u64,
-            "Invalid MMCS chunk size"
-        );
+        let range = download_chunk_range(chunk, encrypted.len())?;
         if let std::collections::hash_map::Entry::Vacant(entry) = containers.entry(index.container)
         {
             let request = container
@@ -422,13 +413,12 @@ pub(super) async fn download(
             entry.insert(data);
         }
         let part = containers[&index.container]
-            .get(chunk.offset as usize..end as usize)
+            .get(range)
             .context("Apple returned an incomplete attachment")?;
         append_verified_chunk(&mut encrypted, chunk, part)?;
     }
     ensure!(
-        encrypted.len() == size
-            && file_signature(reference.signature[0], &encrypted) == reference.signature,
+        file_signature(reference.signature[0], &encrypted) == reference.signature,
         "Apple returned an attachment with an invalid signature"
     );
     let first = catalogue
@@ -449,6 +439,20 @@ pub(super) async fn download(
         )
         .await?;
     Ok(crypt(&reference.key, &encrypted)?.into())
+}
+
+fn download_chunk_range(chunk: &ChunkData, assembled: usize) -> Result<Range<usize>> {
+    // The message's advertised file size can differ from the authorized transfer.
+    ensure!(
+        chunk.size > 0 && chunk.size <= FILE_LIMIT.saturating_sub(assembled) as u64,
+        "Invalid MMCS chunk size"
+    );
+    let end = chunk
+        .offset
+        .checked_add(chunk.size)
+        .filter(|end| *end <= MAX_RESPONSE as u64)
+        .context("Invalid MMCS chunk offset")?;
+    Ok(chunk.offset as usize..end as usize)
 }
 
 fn make_receipt(
@@ -577,4 +581,32 @@ pub(super) fn valid_object(object: &str) -> bool {
         && object
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"-_.+=%".contains(&byte))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_download_ranges_against_transfer_limits() -> Result<()> {
+        let mut chunk = ChunkData {
+            size: 2 * 1024 * 1024,
+            offset: 1024,
+            ..Default::default()
+        };
+        assert_eq!(
+            download_chunk_range(&chunk, 0)?,
+            1024..1024 + 2 * 1024 * 1024
+        );
+        assert!(download_chunk_range(&chunk, FILE_LIMIT - 1024).is_err());
+
+        chunk.offset = MAX_RESPONSE as u64;
+        assert!(download_chunk_range(&chunk, 0).is_err());
+        chunk.offset = u64::MAX;
+        assert!(download_chunk_range(&chunk, 0).is_err());
+        chunk.offset = 0;
+        chunk.size = 0;
+        assert!(download_chunk_range(&chunk, 0).is_err());
+        Ok(())
+    }
 }

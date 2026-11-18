@@ -205,10 +205,16 @@ impl History {
         Ok((serde_json::from_str(&metadata)?, source))
     }
 
-    pub fn cache_attachment(&self, id: uuid::Uuid, index: usize, bytes: &[u8]) -> Result<()> {
+    pub fn cache_attachment(
+        &self,
+        id: uuid::Uuid,
+        index: usize,
+        info: &Attachment,
+        bytes: &[u8],
+    ) -> Result<()> {
         self.0.execute(
-            "UPDATE attachments SET bytes = ?3, reference = NULL WHERE message_id = ?1 AND position = ?2",
-            params![id.to_string(), index, bytes],
+            "UPDATE attachments SET bytes = ?3, info = ?4, reference = NULL WHERE message_id = ?1 AND position = ?2",
+            params![id.to_string(), index, bytes, serde_json::to_string(info)?],
         )?;
         Ok(())
     }
