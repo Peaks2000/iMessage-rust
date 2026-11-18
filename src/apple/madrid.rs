@@ -1008,12 +1008,12 @@ impl Madrid {
         Ok(Delivery::Accepted)
     }
 
-    pub(crate) async fn download(
+    pub(crate) async fn authorize_download(
         &mut self,
         identity: &Identity,
-        reference: &MediaReference,
-    ) -> Result<bytes::Bytes> {
-        mmcs::download(self, identity, reference).await
+        reference: Box<MediaReference>,
+    ) -> Result<mmcs::AuthorizedDownload> {
+        mmcs::authorize_download(self, identity, reference).await
     }
 
     pub(super) async fn media_request<const N: usize>(
@@ -1958,6 +1958,99 @@ mod tests {
             madrid.notify_answer_elsewhere(&identity, call.id),
             simulate_sibling_devices
         )?;
+
+        use crate::apple::mmcs_wire::{DownloadAuthorization, DownloadCatalogue};
+        use prost::Message as _;
+        let storage_response = DownloadAuthorization {
+            catalogue: Some(DownloadCatalogue::default()),
+        }
+        .encode_to_vec();
+        let media = Box::new(MediaReference {
+            url: "https://mmcs.example.icloud.com/item".parse()?,
+            object: "item".into(),
+            signature: [0x81; 21],
+            key: [0; 32],
+        });
+        let simulate_download_then_ring = async {
+            let request = Frame::read(&mut mock).await?;
+            let wire: Dictionary =
+                plist::from_bytes(request.field(3).context("Missing MMCS request")?)?;
+            assert_eq!(wire["c"].as_unsigned_integer(), Some(151));
+            let response = binary(&dictionary([
+                ("c", 151.into()),
+                ("i", wire["i"].clone()),
+                ("cB", data(&storage_response)),
+                ("mU", value("fixture")),
+            ]))?;
+            write_frame(
+                &mut mock,
+                0x0b,
+                &[
+                    (4, request.field(4).context("Missing MMCS push ID")?),
+                    (8, &[0]),
+                ],
+            )
+            .await?;
+            write_frame(
+                &mut mock,
+                0x0a,
+                &[(2, &sha1(TOPIC.as_bytes())), (3, &response), (4, &[5; 4])],
+            )
+            .await?;
+            assert_eq!(
+                Frame::read(&mut mock).await?.field(4),
+                Some([5; 4].as_slice())
+            );
+
+            let invitation = facetime::participant_update(
+                &relay,
+                CALLER,
+                LOCAL,
+                Some((&description, local_prekey.public(), CallMode::Video)),
+                true,
+            );
+            let envelope = recipient.seal(&sender_key, &compress(&binary(&invitation)?)?)?;
+            let ring = binary(&dictionary([
+                ("c", facetime::JOIN_COMMAND.into()),
+                ("E", value("pair")),
+                ("sP", value(CALLER)),
+                ("tP", value(LOCAL)),
+                ("t", data(&[2; 32])),
+                ("P", data(&envelope)),
+                ("U", data(Uuid::new_v4().as_bytes())),
+                ("e", (now_ms() as u64 * 1_000_000).into()),
+            ]))?;
+            write_frame(
+                &mut mock,
+                0x0a,
+                &[
+                    (2, &sha1(facetime::SIGNALING.as_bytes())),
+                    (3, &ring),
+                    (4, &[6; 4]),
+                ],
+            )
+            .await?;
+            answer_directory_lookup(&mut mock, &recipient_key, CALLER, &[2]).await?;
+            Ok::<_, anyhow::Error>(())
+        };
+        let listen_while_download_is_pending = async {
+            let download = madrid.authorize_download(&identity, media).await?;
+            let notice = madrid.next_notification().await?;
+            assert!(matches!(madrid.decode(&identity, &notice).await?,
+                Some(Incoming::Call(facetime::CallSignal::Ring { call: offer, .. }))
+                if offer.id == call.id && offer.mode == Some(CallMode::Video)
+            ));
+            let error = download.transfer().await.unwrap_err();
+            assert_eq!(error.to_string(), "MMCS returned a different file");
+            Ok::<_, anyhow::Error>(())
+        };
+        timeout(Duration::from_secs(3), async {
+            tokio::try_join!(
+                listen_while_download_is_pending,
+                simulate_download_then_ring
+            )
+        })
+        .await??;
         Ok(())
     }
 }

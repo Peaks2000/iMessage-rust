@@ -330,11 +330,18 @@ pub(super) async fn upload(
     Ok(reference)
 }
 
-pub(super) async fn download(
+pub(crate) struct AuthorizedDownload {
+    session: Session,
+    reference: Box<MediaReference>,
+    dsid: String,
+    catalogue: DownloadCatalogue,
+}
+
+pub(super) async fn authorize_download(
     madrid: &mut Madrid,
     identity: &Identity,
-    reference: &MediaReference,
-) -> Result<Bytes> {
+    reference: Box<MediaReference>,
+) -> Result<AuthorizedDownload> {
     let session = Session::new(identity)?;
     validate_url(&reference.url, false)?;
     ensure!(
@@ -376,69 +383,87 @@ pub(super) async fn download(
     )?
     .catalogue
     .context("Apple could not authorize this download")?;
-    let file = catalogue
-        .files
-        .iter()
-        .find(|file| file.signature == reference.signature)
-        .context("MMCS returned a different file")?;
-    ensure!(
-        !file.chunks.is_empty() && file.chunks.len() <= 64,
-        "Invalid MMCS download chunk list"
-    );
-    let mut encrypted = Vec::new();
-    let mut containers = HashMap::new();
-    let mut receipts = Vec::new();
-    let mut downloaded = 0;
-    for index in &file.chunks {
-        let container = catalogue
-            .containers
-            .get(index.container as usize)
-            .context("Missing MMCS storage container")?;
-        let chunk = container
-            .chunks
-            .get(index.index as usize)
-            .and_then(|chunk| chunk.data.as_ref())
-            .context("Missing MMCS download chunk")?;
-        let range = download_chunk_range(chunk, encrypted.len())?;
-        if let std::collections::hash_map::Entry::Vacant(entry) = containers.entry(index.container)
-        {
-            let request = container
-                .request
-                .as_ref()
-                .context("Missing MMCS storage request")?;
-            let (response, url) = session.edge(request, Method::GET, None).await?;
-            receipts.push(make_receipt(&response, &url, &container.token, None));
-            let data = read_body(response, MAX_RESPONSE - downloaded).await?;
-            downloaded += data.len();
-            entry.insert(data);
-        }
-        let part = containers[&index.container]
-            .get(range)
-            .context("Apple returned an incomplete attachment")?;
-        append_verified_chunk(&mut encrypted, chunk, part)?;
-    }
-    ensure!(
-        file_signature(reference.signature[0], &encrypted) == reference.signature,
-        "Apple returned an attachment with an invalid signature"
-    );
-    let first = catalogue
-        .containers
-        .get(file.chunks[0].container as usize)
-        .context("Missing MMCS storage container")?;
-    let completion = Completion {
-        requests: receipts,
-        data: None,
-    };
-    session
-        .complete(
+    Ok(AuthorizedDownload {
+        session,
+        reference,
+        dsid: dsid.to_owned(),
+        catalogue,
+    })
+}
+
+impl AuthorizedDownload {
+    pub(crate) async fn transfer(self) -> Result<Bytes> {
+        let Self {
+            session,
             reference,
-            "getComplete",
-            format!("{} {}", first.authorization, first.token),
             dsid,
-            completion,
-        )
-        .await?;
-    Ok(crypt(&reference.key, &encrypted)?.into())
+            catalogue,
+        } = self;
+        let file = catalogue
+            .files
+            .iter()
+            .find(|file| file.signature == reference.signature)
+            .context("MMCS returned a different file")?;
+        ensure!(
+            !file.chunks.is_empty() && file.chunks.len() <= 64,
+            "Invalid MMCS download chunk list"
+        );
+        let mut encrypted = Vec::new();
+        let mut containers = HashMap::new();
+        let mut receipts = Vec::new();
+        let mut downloaded = 0;
+        for index in &file.chunks {
+            let container = catalogue
+                .containers
+                .get(index.container as usize)
+                .context("Missing MMCS storage container")?;
+            let chunk = container
+                .chunks
+                .get(index.index as usize)
+                .and_then(|chunk| chunk.data.as_ref())
+                .context("Missing MMCS download chunk")?;
+            let range = download_chunk_range(chunk, encrypted.len())?;
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                containers.entry(index.container)
+            {
+                let request = container
+                    .request
+                    .as_ref()
+                    .context("Missing MMCS storage request")?;
+                let (response, url) = session.edge(request, Method::GET, None).await?;
+                receipts.push(make_receipt(&response, &url, &container.token, None));
+                let data = read_body(response, MAX_RESPONSE - downloaded).await?;
+                downloaded += data.len();
+                entry.insert(data);
+            }
+            let part = containers[&index.container]
+                .get(range)
+                .context("Apple returned an incomplete attachment")?;
+            append_verified_chunk(&mut encrypted, chunk, part)?;
+        }
+        ensure!(
+            file_signature(reference.signature[0], &encrypted) == reference.signature,
+            "Apple returned an attachment with an invalid signature"
+        );
+        let first = catalogue
+            .containers
+            .get(file.chunks[0].container as usize)
+            .context("Missing MMCS storage container")?;
+        let completion = Completion {
+            requests: receipts,
+            data: None,
+        };
+        session
+            .complete(
+                &reference,
+                "getComplete",
+                format!("{} {}", first.authorization, first.token),
+                &dsid,
+                completion,
+            )
+            .await?;
+        Ok(crypt(&reference.key, &encrypted)?.into())
+    }
 }
 
 fn download_chunk_range(chunk: &ChunkData, assembled: usize) -> Result<Range<usize>> {

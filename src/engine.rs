@@ -20,20 +20,20 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use tokio::{
-    sync::{mpsc, oneshot, watch},
+    sync::{Semaphore, mpsc, oneshot, watch},
     time::sleep,
 };
 
-use crate::media::MediaSource;
+use crate::media::{MediaReference, MediaSource};
 use crate::{
     Conversation, Delivery, FILE_LIMIT, MAX_ATTACHMENTS, Message, SendText, SetTapback, Status,
     TEXT_LIMIT, Tapback, TapbackEvent, TapbackKind, address, now_ms, now_ns,
 };
 use crate::{
     apple::{
-        CallEndpoint, CallKeyOffer, CallMediaExchange, CallMediaHandshake, CallRelayAllocation,
-        CallSignal, Identity, Incoming, LocalCallPrekey, Madrid, Notification, PeerMediaOffer,
-        PeerPrekey, RING_TIMEOUT_MS,
+        AuthorizedDownload, CallEndpoint, CallKeyOffer, CallMediaExchange, CallMediaHandshake,
+        CallRelayAllocation, CallSignal, Identity, Incoming, LocalCallPrekey, Madrid, Notification,
+        PeerMediaOffer, PeerPrekey, RING_TIMEOUT_MS,
     },
     history::History,
 };
@@ -49,6 +49,7 @@ pub struct Engine {
 
 struct State {
     history: Mutex<History>,
+    download_slot: Semaphore,
     _lock: File,
 }
 
@@ -108,10 +109,9 @@ enum Request {
         offer: Box<crate::apple::PeerKeyOffer>,
         reply: oneshot::Sender<()>,
     },
-    Download {
-        id: uuid::Uuid,
-        index: usize,
-        reply: oneshot::Sender<Result<bytes::Bytes>>,
+    AuthorizeDownload {
+        media: Box<MediaReference>,
+        reply: oneshot::Sender<Result<AuthorizedDownload>>,
     },
 }
 
@@ -128,6 +128,7 @@ impl Engine {
         fs2::FileExt::try_lock_exclusive(&lock).context("This profile is already open. Connect through the running server or close the other instance")?;
         let state = Arc::new(State {
             history: Mutex::new(History::open(root, &profile)?),
+            download_slot: Semaphore::new(1),
             _lock: lock,
         });
         state.history()?.recover()?;
@@ -301,13 +302,25 @@ impl Engine {
         if let MediaSource::Local(bytes) = source {
             return Ok(bytes);
         }
+        let _download = self.state.download_slot.acquire().await?;
+        let (mut info, source) = self.state.history()?.attachment(id, index)?;
+        let media = match source {
+            MediaSource::Local(bytes) => return Ok(bytes),
+            MediaSource::Apple(media) => media,
+        };
         let (reply, answer) = oneshot::channel();
         self.requests
-            .try_send(Request::Download { id, index, reply })
+            .try_send(Request::AuthorizeDownload { media, reply })
             .context("The Apple engine is busy or stopped")?;
-        answer
+        let authorized = answer
             .await
-            .context("The Apple engine stopped during the download")?
+            .context("The Apple engine stopped while authorizing the attachment")??;
+        let bytes = authorized.transfer().await?;
+        info.size = bytes.len();
+        self.state
+            .history()?
+            .cache_attachment(id, index, &info, &bytes)?;
+        Ok(bytes)
     }
 }
 
@@ -373,7 +386,7 @@ async fn run_apple(
                                 .and_then(|previous| previous.context("Apple courier is disconnected"));
                             let _ = reply.send(result);
                         }
-                        Request::Download { reply, .. } => {
+                        Request::AuthorizeDownload { reply, .. } => {
                             let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
                         }
                         Request::Tapback { reply, .. } => {
@@ -461,8 +474,12 @@ async fn online(
                     Request::Send(message, reply) => {
                         let _ = reply.send(send_on_courier(identity, state, madrid, &message).await);
                     }
-                    Request::Download { id, index, reply } => {
-                        let _ = reply.send(download(identity, state, madrid, id, index).await);
+                    Request::AuthorizeDownload { media, reply } => {
+                        // Only MMCS authorization uses the courier. The HTTPS transfer runs
+                        // in the requesting task so this loop can continue receiving calls.
+                        if !reply.is_closed() {
+                            let _ = reply.send(madrid.authorize_download(identity, media).await);
+                        }
                     }
                     Request::Tapback { target, request, reply } => {
                         let _ = reply.send(send_tapback(identity, state, madrid, status, target, request).await);
@@ -1196,27 +1213,6 @@ fn set_status(status: &watch::Sender<Status>, connected: bool, detail: &str) {
     });
 }
 
-async fn download(
-    identity: &Identity,
-    state: &State,
-    madrid: &mut Madrid,
-    id: uuid::Uuid,
-    index: usize,
-) -> Result<bytes::Bytes> {
-    let (mut info, source) = state.history()?.attachment(id, index)?;
-    match source {
-        MediaSource::Local(bytes) => Ok(bytes),
-        MediaSource::Apple(media) => {
-            let bytes = madrid.download(identity, &media).await?;
-            info.size = bytes.len();
-            state
-                .history()?
-                .cache_attachment(id, index, &info, &bytes)?;
-            Ok(bytes)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1573,6 +1569,7 @@ mod tests {
         let engine = Engine {
             state: Arc::new(State {
                 history: Mutex::new(history),
+                download_slot: Semaphore::new(1),
                 _lock: File::open(folder.path())?,
             }),
             requests: mpsc::channel(1).0,

@@ -50,6 +50,7 @@ pub(crate) use facetime::{
     RingingRelay, SignedRelayKeys, SignedRelayPrekey,
 };
 pub(crate) use madrid::{Incoming, Madrid, Notification, OutgoingCallTargets};
+pub(crate) use mmcs::AuthorizedDownload;
 use openssl::{
     hash::MessageDigest,
     pkey::{Id, PKey, PKeyRef, Private},
