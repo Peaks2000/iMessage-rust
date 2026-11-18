@@ -284,9 +284,14 @@ impl CallMediaHandshake {
         &self.call
     }
 
-    /// Signed participant description. The media engine still needs to decode its contents.
+    /// The original participant description from verified IDS signaling.
     pub fn peer_description(&self) -> &[u8] {
         &self.description
+    }
+
+    /// Read the caller's media description directly from the authenticated join.
+    pub fn decode_peer_description(&self) -> Result<super::CallMediaDescription> {
+        super::CallMediaDescription::parse(&self.description, self.call.mode)
     }
 
     pub fn public_prekey(&self) -> &[u8; POINT_LEN] {

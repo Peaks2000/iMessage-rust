@@ -20,8 +20,8 @@ use crate::{
 };
 use crate::{
     apple::{
-        CallEndpoint, CallMediaExchange, CallMediaHandshake, CallRelayAllocation, CallSignal,
-        Identity, Incoming, Madrid, Notification, PeerMediaOffer, PeerPrekey,
+        CallEndpoint, CallKeyOffer, CallMediaExchange, CallMediaHandshake, CallRelayAllocation,
+        CallSignal, Identity, Incoming, Madrid, Notification, PeerMediaOffer, PeerPrekey,
     },
     history::History,
 };
@@ -56,6 +56,10 @@ enum Request {
     AllocateCallRelay {
         id: uuid::Uuid,
         reply: oneshot::Sender<Result<Arc<CallRelayAllocation>>>,
+    },
+    PublishCallKeys {
+        id: uuid::Uuid,
+        reply: oneshot::Sender<Result<Arc<CallKeyOffer>>>,
     },
     Download {
         id: uuid::Uuid,
@@ -187,6 +191,18 @@ impl Engine {
             .context("The Apple engine stopped during relay allocation")?
     }
 
+    /// Exchange the local prekey and wrapped keys with the verified device on a ringing call.
+    /// Use this after the local answer action has prepared media and obtained a relay.
+    pub async fn publish_call_keys(&self, id: uuid::Uuid) -> Result<Arc<CallKeyOffer>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests
+            .try_send(Request::PublishCallKeys { id, reply })
+            .context("The Apple engine is busy or stopped")?;
+        answer
+            .await
+            .context("The Apple engine stopped while exchanging keys")?
+    }
+
     pub async fn send(&self, mut request: SendText) -> Result<Message> {
         request.address = address(&request.address)?;
         ensure!(
@@ -307,6 +323,9 @@ async fn run_apple(
                         Request::AllocateCallRelay { reply, .. } => {
                             let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
                         }
+                        Request::PublishCallKeys { reply, .. } => {
+                            let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
+                        }
                     }
                 }
             }
@@ -391,6 +410,21 @@ async fn online(
                         });
                         let _ = reply.send(result);
                     }
+                    Request::PublishCallKeys { id, mut reply } => {
+                        for notification in madrid.take_queued() {
+                            receive_notification(identity, state, madrid, status, calls, notification).await?;
+                        }
+                        let result = tokio::select! {
+                            biased;
+                            _ = reply.closed() => continue,
+                            result = calls.publish_keys(identity, madrid, status, id) => result,
+                        };
+                        for notification in madrid.take_queued() {
+                            receive_notification(identity, state, madrid, status, calls, notification).await?;
+                        }
+                        let result = result.and_then(|offer| active_call(&status.borrow(), id).map(|_| offer));
+                        let _ = reply.send(result);
+                    }
                 }
             }
             _ = status.closed() => return Ok(()),
@@ -436,6 +470,7 @@ struct IncomingCallDetails {
     prekey: Option<PeerPrekey>,
     exchange: Option<CallMediaExchange>,
     relay: Option<Arc<CallRelayAllocation>>,
+    offer: Option<Arc<CallKeyOffer>>,
 }
 
 impl IncomingCallDetails {
@@ -474,6 +509,48 @@ impl IncomingCalls {
                 .allocate_call_relay(identity, &call, details.endpoint)
                 .await?,
         ))
+    }
+
+    async fn publish_keys(
+        &mut self,
+        identity: &Identity,
+        madrid: &mut Madrid,
+        status: &watch::Sender<Status>,
+        id: uuid::Uuid,
+    ) -> Result<Arc<CallKeyOffer>> {
+        let _ = active_call(&status.borrow(), id)?;
+        let details = self
+            .details
+            .get_mut(&id)
+            .context("Missing caller details")?;
+        let relay = details
+            .relay
+            .as_ref()
+            .context("This FaceTime call has no relay yet")?;
+        let exchange = details
+            .exchange
+            .as_ref()
+            .context("This FaceTime call has no local prekey yet")?;
+        ensure!(
+            relay.call_id == id && details.endpoint.participant() == Some(relay.caller_participant),
+            "FaceTime relay no longer matches the ringing device"
+        );
+        // Store the offer before sending so a retry cannot substitute different material
+        // for a generation the peer might have already installed.
+        if details.offer.is_none() {
+            let offer = exchange
+                .handshake
+                .build_key_offer(relay.local_participant)?;
+            details.offer = Some(Arc::new(offer));
+        }
+        let offer = details
+            .offer
+            .as_ref()
+            .context("Missing FaceTime key offer")?;
+        madrid
+            .publish_call_keys(identity, &exchange.handshake, details.endpoint, offer)
+            .await?;
+        Ok(offer.clone())
     }
 
     fn expire(&mut self, status: &mut Status, now: i64) -> bool {
@@ -557,6 +634,7 @@ impl IncomingCalls {
                         prekey: None,
                         exchange: None,
                         relay: None,
+                        offer: None,
                     };
                     details.learn_media(media);
                     self.details.insert(offer.id, details);
