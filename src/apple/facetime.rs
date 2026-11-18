@@ -10,7 +10,9 @@ use crate::{CallMode, IncomingCall, address, now_ms};
 
 pub use media::{CallKey, CallKeyOffer, CallMediaHandshake, CallMediaKey, CallPeerKeys};
 pub(crate) use media::{CallMediaExchange, PeerKeyOffer, PeerMediaOffer, PeerPrekey};
-pub use relay::{CallRelayAllocation, CallRelayKeys};
+pub use relay::{
+    CallRelayAllocation, CallRelayConnection, CallRelayKeys, CallRelayStream, RelayStreamDirection,
+};
 
 pub(super) const SIGNALING: &str = "com.apple.private.alloy.facetime.multi";
 pub(super) const VIDEO: &str = "com.apple.private.alloy.facetime.video";

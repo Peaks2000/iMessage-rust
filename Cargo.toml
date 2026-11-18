@@ -36,6 +36,7 @@ clap = { version = "4", features = ["derive"] }
 directories = "6"
 eframe = { version = "0.33.3", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"], optional = true }
 flate2 = "1"
+foreign-types = "0.3"
 fs2 = "0.4"
 futures-util = "0.3"
 heic-rs = { version = "0.1.4", default-features = false, features = ["std"], optional = true }
@@ -43,8 +44,10 @@ hex = "0.4"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "tiff", "webp"], optional = true }
 keyring = { version = "3.6.3", features = ["async-secret-service", "crypto-rust", "async-io"] }
 libloading = "0.8"
+libc = "0.2"
 linkify = { version = "0.11", optional = true }
 openssl = "0.10"
+openssl-sys = "0.9"
 phonenumber = { version = "0.3.10", optional = true }
 plist = "1"
 prost = "0.14"
