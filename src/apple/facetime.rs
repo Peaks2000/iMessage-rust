@@ -1,4 +1,5 @@
 mod media;
+pub(super) mod relay;
 
 use plist::Value;
 use prost::Message as _;
@@ -9,6 +10,7 @@ use crate::{CallMode, IncomingCall, address, now_ms};
 
 pub use media::{CallKey, CallKeyOffer, CallMediaHandshake, CallMediaKey, CallPeerKeys};
 pub(crate) use media::{CallMediaExchange, PeerKeyOffer, PeerMediaOffer, PeerPrekey};
+pub use relay::{CallRelayAllocation, CallRelayKeys};
 
 pub(super) const SIGNALING: &str = "com.apple.private.alloy.facetime.multi";
 pub(super) const VIDEO: &str = "com.apple.private.alloy.facetime.video";
@@ -44,6 +46,14 @@ impl CallEndpoint {
 
     pub(crate) fn same_device(self, other: Self) -> bool {
         self.push_token == other.push_token
+    }
+
+    pub(crate) fn participant(self) -> Option<u64> {
+        self.participant
+    }
+
+    pub(super) fn push_token(&self) -> &[u8; 32] {
+        &self.push_token
     }
 }
 

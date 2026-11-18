@@ -11,7 +11,7 @@ use rustls::{
     pki_types::{CertificateDer, ServerName},
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, WriteHalf},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
     sync::mpsc,
     task::JoinHandle,
@@ -44,7 +44,7 @@ impl Frame {
             .map(|(_, bytes)| bytes.as_slice())
     }
 
-    async fn read(reader: &mut (impl AsyncRead + Unpin)) -> Result<Self> {
+    pub(super) async fn read(reader: &mut (impl AsyncRead + Unpin)) -> Result<Self> {
         let code = reader.read_u8().await?;
         let size = reader.read_u32().await? as usize;
         ensure!(size <= MAX_FRAME, "APNs frame exceeds size limit");
@@ -63,7 +63,7 @@ impl Frame {
     }
 }
 
-async fn write_frame(
+pub(super) async fn write_frame(
     socket: &mut (impl AsyncWrite + Unpin),
     code: u8,
     fields: &[(u8, &[u8])],
@@ -83,7 +83,7 @@ async fn write_frame(
 }
 
 pub(super) struct Courier {
-    write: WriteHalf<TlsStream<TcpStream>>,
+    write: Box<dyn AsyncWrite + Send + Unpin>,
     frames: mpsc::Receiver<Result<Frame>>,
     reader: JoinHandle<()>,
     pub(super) token: [u8; 32],
@@ -117,11 +117,24 @@ impl Courier {
         let topics = [TOPIC, facetime::SIGNALING, facetime::VIDEO]
             .into_iter()
             .filter(|topic| identity.ids_certificate(topic).is_some())
+            .chain(
+                identity
+                    .facetime_registered()
+                    .then_some(facetime::relay::RELAY_TOPIC),
+            )
             .map(|topic| (topic, sha1(topic.as_bytes())))
             .collect::<Vec<_>>();
         let mut filter = vec![(1, token.as_slice())];
         filter.extend(topics.iter().map(|(_, digest)| (2, digest.as_slice())));
         write_frame(&mut stream, 0x09, &filter).await?;
+        Ok(Self::attach(stream, token, topics))
+    }
+
+    pub(super) fn attach(
+        stream: impl AsyncRead + AsyncWrite + Send + Unpin + 'static,
+        token: [u8; 32],
+        topics: Vec<(&'static str, [u8; 20])>,
+    ) -> Self {
         let (mut read, write) = tokio::io::split(stream);
         let (send, frames) = mpsc::channel(32);
         let reader = tokio::spawn(async move {
@@ -133,13 +146,13 @@ impl Courier {
                 }
             }
         });
-        Ok(Self {
-            write,
+        Self {
+            write: Box::new(write),
             frames,
             reader,
             token,
             topics,
-        })
+        }
     }
 
     pub(super) async fn next(&mut self) -> Result<Frame> {

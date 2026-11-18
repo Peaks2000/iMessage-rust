@@ -421,7 +421,11 @@ fn wrap_key(
     )
 }
 
-fn hkdf<const N: usize>(input: &[u8], salt: &[u8], info: &[&[u8]]) -> Result<Zeroizing<[u8; N]>> {
+pub(super) fn hkdf<const N: usize>(
+    input: &[u8],
+    salt: &[u8],
+    info: &[&[u8]],
+) -> Result<Zeroizing<[u8; N]>> {
     let mut kdf = PkeyCtx::new_id(Id::HKDF)?;
     kdf.derive_init()?;
     kdf.set_hkdf_md(Md::sha256())?;

@@ -29,8 +29,11 @@ pub(crate) use facetime::decode as decode_call_fixture;
 pub(crate) use facetime::{
     CallEndpoint, CallMediaExchange, CallSignal, PeerMediaOffer, PeerPrekey,
 };
-pub use facetime::{CallKey, CallKeyOffer, CallMediaHandshake, CallMediaKey, CallPeerKeys};
-pub(crate) use madrid::{Incoming, Madrid};
+pub use facetime::{
+    CallKey, CallKeyOffer, CallMediaHandshake, CallMediaKey, CallPeerKeys, CallRelayAllocation,
+    CallRelayKeys,
+};
+pub(crate) use madrid::{Incoming, Madrid, Notification};
 use openssl::{
     hash::MessageDigest,
     pkey::{Id, PKey, PKeyRef, Private},

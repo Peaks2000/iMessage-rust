@@ -136,6 +136,10 @@ impl Madrid {
         }
     }
 
+    pub(crate) fn take_queued(&mut self) -> VecDeque<Notification> {
+        std::mem::take(&mut self.queued)
+    }
+
     pub(crate) async fn acknowledge(&mut self, id: [u8; 4]) -> Result<()> {
         self.courier.ack(id).await
     }
@@ -204,6 +208,36 @@ impl Madrid {
         .context("Apple push acknowledgment timed out")?
     }
 
+    async fn wait_for_push(
+        &mut self,
+        matches: impl Fn(&Notification) -> bool,
+        timeout_message: &'static str,
+    ) -> Result<Dictionary> {
+        timeout(RESPONSE_TIMEOUT, async {
+            loop {
+                let item = if let Some(index) = self.queued.iter().position(&matches) {
+                    self.queued.remove(index)
+                } else {
+                    let frame = self.courier.next().await?;
+                    self.notification(frame).await?
+                };
+                if let Some(item) = item {
+                    if matches(&item) {
+                        self.acknowledge(item.id).await?;
+                        return Ok(item.data);
+                    }
+                    ensure!(
+                        self.queued.len() < MAX_QUEUE,
+                        "Apple notification queue is full"
+                    );
+                    self.queued.push_back(item);
+                }
+            }
+        })
+        .await
+        .context(timeout_message)?
+    }
+
     async fn query(
         &mut self,
         identity: &Identity,
@@ -266,34 +300,15 @@ impl Madrid {
             self.send_push_on(topic, push_id()?, &wire).await?,
             "Apple rejected the IDS directory request"
         );
-        let response = timeout(RESPONSE_TIMEOUT, async {
-            loop {
-                let candidate = if let Some(index) = self.queued.iter().position(|item| {
+        let response = self
+            .wait_for_push(
+                |item| {
                     item.topic == topic
                         && field_data(&item.data, "U") == Some(correlation.as_bytes())
-                }) {
-                    self.queued.remove(index)
-                } else {
-                    let frame = self.courier.next().await?;
-                    self.notification(frame).await?
-                };
-                if let Some(item) = candidate {
-                    if item.topic == topic
-                        && field_data(&item.data, "U") == Some(correlation.as_bytes())
-                    {
-                        self.courier.ack(item.id).await?;
-                        return Ok::<_, anyhow::Error>(item.data);
-                    }
-                    ensure!(
-                        self.queued.len() < MAX_QUEUE,
-                        "Apple notification queue is full"
-                    );
-                    self.queued.push_back(item);
-                }
-            }
-        })
-        .await
-        .context("Apple IDS lookup timed out")??;
+                },
+                "Apple IDS lookup timed out",
+            )
+            .await?;
         let bytes = field_data(&response, "b").with_context(|| {
             format!(
                 "Apple rejected the IDS lookup (status {})",
@@ -440,6 +455,66 @@ impl Madrid {
         Ok(())
     }
 
+    pub(crate) async fn allocate_call_relay(
+        &mut self,
+        identity: &Identity,
+        call: &IncomingCall,
+        endpoint: facetime::CallEndpoint,
+    ) -> Result<facetime::CallRelayAllocation> {
+        let remaining = call.expires_ms.saturating_sub(now_ms());
+        ensure!(remaining > 0, "This FaceTime call has ended");
+        ensure!(
+            endpoint.participant().is_some(),
+            "The caller has not joined FaceTime yet"
+        );
+        timeout(Duration::from_millis(remaining as u64), async {
+            let targets = self
+                .query(identity, facetime::SIGNALING, &[&call.caller], true)
+                .await?;
+            let caller = targets
+                .get(&call.caller)
+                .into_iter()
+                .flatten()
+                .find(|target| target.push == endpoint.push_token())
+                .context("The FaceTime caller device is no longer in the IDS directory")?;
+            ensure!(call.expires_ms > now_ms(), "This FaceTime call has ended");
+            let request = Uuid::new_v4();
+            let id = push_id()?;
+            let wire = facetime::relay::allocation_request(
+                request,
+                call.id,
+                id,
+                &identity.handle,
+                &identity.user_agent,
+                (&call.caller, endpoint.push_token(), &caller.session),
+            );
+            let topic = facetime::relay::RELAY_TOPIC;
+            ensure!(
+                self.send_push_on(topic, id, &binary(&wire)?).await?,
+                "Apple rejected the FaceTime relay request"
+            );
+            let response = self
+                .wait_for_push(
+                    |item| {
+                        item.topic == topic
+                            && field_data(&item.data, "U") == Some(request.as_bytes())
+                            && item.data.get("c").and_then(Value::as_unsigned_integer) != Some(255)
+                    },
+                    "Apple returned no FaceTime relay allocation",
+                )
+                .await?;
+            facetime::CallRelayAllocation::parse(
+                response,
+                request,
+                call.id,
+                (&identity.handle, &identity.token),
+                (&call.caller, endpoint),
+            )
+        })
+        .await
+        .context("The FaceTime call ended while waiting for a relay")?
+    }
+
     async fn message_destinations(
         &mut self,
         identity: &Identity,
@@ -580,29 +655,8 @@ impl Madrid {
                     .and_then(Value::as_signed_integer)
                     .is_some_and(|value| value as i32 == message_id)
         };
-        timeout(RESPONSE_TIMEOUT, async {
-            loop {
-                let item = if let Some(index) = self.queued.iter().position(&matches) {
-                    self.queued.remove(index)
-                } else {
-                    let frame = self.courier.next().await?;
-                    self.notification(frame).await?
-                };
-                if let Some(item) = item {
-                    if matches(&item) {
-                        self.acknowledge(item.id).await?;
-                        return Ok(item.data);
-                    }
-                    ensure!(
-                        self.queued.len() < MAX_QUEUE,
-                        "Apple notification queue is full"
-                    );
-                    self.queued.push_back(item);
-                }
-            }
-        })
-        .await
-        .context("Apple MMCS authorization timed out")?
+        self.wait_for_push(matches, "Apple MMCS authorization timed out")
+            .await
     }
 
     pub(crate) async fn decode(
@@ -838,6 +892,17 @@ pub(super) fn decompress(bytes: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::apple::{
+        aps::write_frame,
+        facetime::relay::tests::{CALLER, CALLER_ID, LOCAL, LOCAL_ID, allocation_fixture},
+    };
+    use openssl::{
+        ec::{EcGroup, EcKey},
+        nid::Nid,
+        pkey::PKey,
+        rsa::Rsa,
+        sha::sha1,
+    };
 
     #[test]
     fn ids_queries_encode_recipients_as_gzipped_xml() -> Result<()> {
@@ -851,6 +916,176 @@ mod tests {
             document["uris"],
             Value::Array(targets.iter().map(|uri| value(*uri)).collect())
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relay_request_uses_the_caller_device_and_preserves_unrelated_pushes() -> Result<()> {
+        let (client, mut mock) = tokio::io::duplex(16 * 1024);
+        let relay_topic = facetime::relay::RELAY_TOPIC;
+        let courier = Courier::attach(
+            client,
+            [1; 32],
+            [TOPIC, facetime::SIGNALING, relay_topic]
+                .map(|topic| (topic, sha1(topic.as_bytes())))
+                .to_vec(),
+        );
+        let mut madrid = Madrid {
+            courier,
+            queued: VecDeque::new(),
+            cached: HashMap::new(),
+            keepalive: Instant::now(),
+        };
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
+        let signing = EcKey::generate(&group)?;
+        let rsa = Rsa::generate(2048)?;
+        let identity = Identity {
+            handle: LOCAL.into(),
+            token: [1; 32],
+            push_cert: Vec::new(),
+            push_key: PKey::from_rsa(rsa.clone())?,
+            ids_cert: Vec::new(),
+            ids_key: PKey::from_rsa(rsa)?,
+            facetime_certificates: [(facetime::SIGNALING.to_owned(), b"fixture".to_vec())].into(),
+            message_keys: KeyPair::private(
+                &signing.private_key_to_der()?,
+                &Rsa::generate(1280)?.private_key_to_der()?,
+            )?,
+            protocol_version: 17,
+            user_agent: "mock".into(),
+        };
+        let recipient_key = identity.message_keys.public_der()?;
+        let call = IncomingCall {
+            id: Uuid::new_v4(),
+            caller: CALLER.into(),
+            mode: None,
+            received_ms: now_ms(),
+            expires_ms: now_ms() + 45_000,
+        };
+        let selected_device = facetime::CallEndpoint::new([2; 32], Some(CALLER_ID));
+        let simulate = async {
+            let query_frame = Frame::read(&mut mock).await?;
+            assert_eq!(
+                query_frame.field(1),
+                Some(sha1(facetime::SIGNALING.as_bytes()).as_slice())
+            );
+            let query: Dictionary =
+                plist::from_bytes(query_frame.field(3).context("Missing IDS query")?)?;
+            assert_eq!(query["c"].as_unsigned_integer(), Some(96));
+            let credential = |token| {
+                Value::Dictionary(dictionary([
+                    ("push-token", data(&[token; 32])),
+                    ("session-token", data(&[token; 20])),
+                    (
+                        "client-data",
+                        Value::Dictionary(dictionary([(
+                            "public-message-identity-key",
+                            data(&recipient_key),
+                        )])),
+                    ),
+                ]))
+            };
+            let body = binary(&dictionary([
+                ("status", Value::from(0)),
+                (
+                    "results",
+                    Value::Dictionary(dictionary([(
+                        CALLER,
+                        Value::Dictionary(dictionary([(
+                            "identities",
+                            Value::Array(vec![credential(3), credential(2)]),
+                        )])),
+                    )])),
+                ),
+            ]))?;
+            let directory = binary(&dictionary([("U", query["U"].clone()), ("b", data(&body))]))?;
+            let query_id = query_frame.field(4).context("Missing IDS push ID")?;
+            write_frame(&mut mock, 0x0b, &[(4, query_id), (8, &[0])]).await?;
+            write_frame(
+                &mut mock,
+                0x0a,
+                &[
+                    (2, &sha1(facetime::SIGNALING.as_bytes())),
+                    (3, &directory),
+                    (4, &[1; 4]),
+                ],
+            )
+            .await?;
+            assert_eq!(
+                Frame::read(&mut mock).await?.field(4),
+                Some([1; 4].as_slice())
+            );
+
+            let allocation_frame = Frame::read(&mut mock).await?;
+            let relay_digest = sha1(relay_topic.as_bytes());
+            assert_eq!(allocation_frame.field(1), Some(relay_digest.as_slice()));
+            let request: Dictionary =
+                plist::from_bytes(allocation_frame.field(3).context("Missing relay request")?)?;
+            assert_eq!(request["c"].as_unsigned_integer(), Some(200));
+            assert_eq!(
+                request["qids"].as_data(),
+                Some(call.id.as_bytes().as_slice())
+            );
+            assert_eq!(request["qai"].as_string(), Some(facetime::SIGNALING));
+            assert_eq!(request["qgmc"].as_unsigned_integer(), Some(2));
+            assert!(request.get("E").is_none());
+            let targets = request["dtl"].as_array().context("Missing relay targets")?;
+            assert_eq!(targets.len(), 1);
+            let target = targets[0].as_dictionary().context("Invalid relay target")?;
+            assert_eq!(target["tP"].as_string(), Some(CALLER));
+            assert_eq!(target["t"].as_data(), Some([2; 32].as_slice()));
+            assert_eq!(target["sT"].as_data(), Some([2; 20].as_slice()));
+            assert!(target.get("P").is_none());
+            let request_id =
+                Uuid::from_slice(request["U"].as_data().context("Invalid relay request ID")?)?;
+            let unrelated = binary(&dictionary([("c", Value::from(100))]))?;
+            let uncorrelated = binary(&allocation_fixture(Uuid::new_v4(), call.id))?;
+            let allocated = binary(&allocation_fixture(request_id, call.id))?;
+            write_frame(
+                &mut mock,
+                0x0a,
+                &[(2, &sha1(TOPIC.as_bytes())), (3, &unrelated), (4, &[2; 4])],
+            )
+            .await?;
+            write_frame(
+                &mut mock,
+                0x0a,
+                &[(2, &relay_digest), (3, &uncorrelated), (4, &[3; 4])],
+            )
+            .await?;
+            write_frame(
+                &mut mock,
+                0x0a,
+                &[(2, &relay_digest), (3, &allocated), (4, &[4; 4])],
+            )
+            .await?;
+            write_frame(
+                &mut mock,
+                0x0b,
+                &[
+                    (
+                        4,
+                        allocation_frame.field(4).context("Missing relay push ID")?,
+                    ),
+                    (8, &[0]),
+                ],
+            )
+            .await?;
+            assert_eq!(
+                Frame::read(&mut mock).await?.field(4),
+                Some([4; 4].as_slice())
+            );
+            Ok::<_, anyhow::Error>(())
+        };
+        let (relay, ()) = tokio::try_join!(
+            madrid.allocate_call_relay(&identity, &call, selected_device),
+            simulate
+        )?;
+        assert_eq!(relay.call_id, call.id);
+        assert_eq!(relay.local_participant, LOCAL_ID);
+        assert_eq!(relay.caller_participant, CALLER_ID);
+        assert_eq!(madrid.next_notification().await?.id, [2; 4]);
+        assert_eq!(madrid.next_notification().await?.id, [3; 4]);
         Ok(())
     }
 }

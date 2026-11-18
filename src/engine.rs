@@ -20,8 +20,8 @@ use crate::{
 };
 use crate::{
     apple::{
-        CallEndpoint, CallMediaExchange, CallMediaHandshake, CallSignal, Identity, Incoming,
-        Madrid, PeerMediaOffer, PeerPrekey,
+        CallEndpoint, CallMediaExchange, CallMediaHandshake, CallRelayAllocation, CallSignal,
+        Identity, Incoming, Madrid, Notification, PeerMediaOffer, PeerPrekey,
     },
     history::History,
 };
@@ -52,6 +52,10 @@ enum Request {
     PrepareCallMedia {
         id: uuid::Uuid,
         reply: oneshot::Sender<Result<Arc<CallMediaHandshake>>>,
+    },
+    AllocateCallRelay {
+        id: uuid::Uuid,
+        reply: oneshot::Sender<Result<Arc<CallRelayAllocation>>>,
     },
     Download {
         id: uuid::Uuid,
@@ -172,6 +176,17 @@ impl Engine {
             .context("The Apple engine stopped during media preparation")?
     }
 
+    /// Obtain the relay allocated by Apple for the caller after an explicit local answer action.
+    pub async fn allocate_call_relay(&self, id: uuid::Uuid) -> Result<Arc<CallRelayAllocation>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests
+            .try_send(Request::AllocateCallRelay { id, reply })
+            .context("The Apple engine is busy or stopped")?;
+        answer
+            .await
+            .context("The Apple engine stopped during relay allocation")?
+    }
+
     pub async fn send(&self, mut request: SendText) -> Result<Message> {
         request.address = address(&request.address)?;
         ensure!(
@@ -289,6 +304,9 @@ async fn run_apple(
                         Request::PrepareCallMedia { reply, .. } => {
                             let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
                         }
+                        Request::AllocateCallRelay { reply, .. } => {
+                            let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
+                        }
                     }
                 }
             }
@@ -317,14 +335,7 @@ async fn online(
                 status.send_if_modified(|status| calls.expire(status, now_ms()));
             }
             notification = madrid.next_notification() => {
-                let notification = notification?;
-                match madrid.decode(identity, &notification).await? {
-                    Some(Incoming::Message(message, media)) => state.history()?.insert(&message, media)?,
-                    Some(Incoming::Tapback(event)) => state.history()?.insert_tapback(&event)?,
-                    Some(Incoming::Call(signal)) => calls.update(status, identity.handle(), signal),
-                    None => (),
-                }
-                madrid.acknowledge(notification.id).await?;
+                receive_notification(identity, state, madrid, status, calls, notification?).await?;
             }
             request = requests.recv() => {
                 let Some(request) = request else { return Ok(()) };
@@ -359,11 +370,58 @@ async fn online(
                     Request::PrepareCallMedia { id, reply } => {
                         let _ = reply.send(calls.prepare_media(&status.borrow(), id));
                     }
+                    Request::AllocateCallRelay { id, mut reply } => {
+                        for notification in madrid.take_queued() {
+                            receive_notification(identity, state, madrid, status, calls, notification).await?;
+                        }
+                        let result = tokio::select! {
+                            biased;
+                            _ = reply.closed() => continue,
+                            result = calls.request_relay(identity, madrid, status, id) => result,
+                        };
+                        // A caller can hang up while the relay request is in flight.
+                        for notification in madrid.take_queued() {
+                            receive_notification(identity, state, madrid, status, calls, notification).await?;
+                        }
+                        let result = result.and_then(|allocation| {
+                            let state = status.borrow();
+                            let _ = active_call(&state, id)?;
+                            calls.details.get_mut(&id).context("This FaceTime call has ended")?.relay = Some(allocation.clone());
+                            Ok(allocation)
+                        });
+                        let _ = reply.send(result);
+                    }
                 }
             }
             _ = status.closed() => return Ok(()),
         }
     }
+}
+
+async fn receive_notification(
+    identity: &Identity,
+    state: &State,
+    madrid: &mut Madrid,
+    status: &watch::Sender<Status>,
+    calls: &mut IncomingCalls,
+    notification: Notification,
+) -> Result<()> {
+    match madrid.decode(identity, &notification).await? {
+        Some(Incoming::Message(message, media)) => state.history()?.insert(&message, media)?,
+        Some(Incoming::Tapback(event)) => state.history()?.insert_tapback(&event)?,
+        Some(Incoming::Call(signal)) => calls.update(status, identity.handle(), signal),
+        None => (),
+    }
+    madrid.acknowledge(notification.id).await
+}
+
+fn active_call(status: &Status, id: uuid::Uuid) -> Result<&crate::IncomingCall> {
+    let now = now_ms();
+    status
+        .incoming_calls
+        .iter()
+        .find(|call| call.id == id && call.expires_ms > now)
+        .context("This FaceTime call has ended")
 }
 
 #[derive(Default)]
@@ -377,6 +435,7 @@ struct IncomingCallDetails {
     description: Option<Vec<u8>>,
     prekey: Option<PeerPrekey>,
     exchange: Option<CallMediaExchange>,
+    relay: Option<Arc<CallRelayAllocation>>,
 }
 
 impl IncomingCallDetails {
@@ -398,6 +457,25 @@ impl IncomingCallDetails {
 }
 
 impl IncomingCalls {
+    async fn request_relay(
+        &self,
+        identity: &Identity,
+        madrid: &mut Madrid,
+        status: &watch::Sender<Status>,
+        id: uuid::Uuid,
+    ) -> Result<Arc<CallRelayAllocation>> {
+        let call = active_call(&status.borrow(), id)?.clone();
+        let details = self.details.get(&id).context("Missing caller details")?;
+        if let Some(relay) = &details.relay {
+            return Ok(relay.clone());
+        }
+        Ok(Arc::new(
+            madrid
+                .allocate_call_relay(identity, &call, details.endpoint)
+                .await?,
+        ))
+    }
+
     fn expire(&mut self, status: &mut Status, now: i64) -> bool {
         let previous = status.incoming_calls.len();
         status.incoming_calls.retain(|call| call.expires_ms > now);
@@ -422,11 +500,7 @@ impl IncomingCalls {
         status: &Status,
         id: uuid::Uuid,
     ) -> Result<Arc<CallMediaHandshake>> {
-        let call = status
-            .incoming_calls
-            .iter()
-            .find(|call| call.id == id && call.expires_ms > now_ms())
-            .context("This FaceTime call has ended")?;
+        let call = active_call(status, id)?;
         let details = self
             .details
             .get_mut(&id)
@@ -482,6 +556,7 @@ impl IncomingCalls {
                         description: None,
                         prekey: None,
                         exchange: None,
+                        relay: None,
                     };
                     details.learn_media(media);
                     self.details.insert(offer.id, details);
