@@ -1,6 +1,6 @@
 # Apple iMessage sessions
 
-The Linux desktop opens a saved iMessage registration from Linux Secret Service and connects directly to Apple. First-time device registration using Linux alone is unavailable. Apple Account authentication and SMS verification alone do not provide the push identity and device validation needed by Apple's iMessage registration service.
+The Linux desktop opens a saved iMessage registration from Linux Secret Service and connects directly to Apple. **Sign In on This Computer** runs setup locally with a configured device helper or an imported validation file. Linux generates Anisette and can activate a push identity with the installed push signer. Initial iMessage registration still requires Apple-accepted device validation.
 
 Open **Settings → This Computer → Import Registered Session** if you already have a compatible registered session. Linux Secret Service stores the session for future launches. The command-line tools below are available for already provisioned devices.
 
@@ -19,6 +19,8 @@ If Apple sends a sign-in alert to your iPhone or another trusted device, tap **A
 Setup requests iMessage and FaceTime registration in the same sign-in. Apple can grant iMessage access independently. If Apple rejects the combined request, setup retries iMessage with a new validation proof when the device helper can generate one.
 
 If an existing desktop session has iMessage access, **Settings → This Computer → Enable FaceTime** requests the FaceTime certificates for the saved device and iMessage address. It reuses a remembered Apple Account password when available and uses the configured local device helper or a Mac for fresh Apple device validation. Calling requests use the device metadata registered with FaceTime.
+
+Enabling FaceTime renews messaging and FaceTime together using the original push identity and message keys. Apple's returned certificates replace the previous registration. **Renew Registration** performs the same renewal when Apple requests refreshed credentials with IDS status 6005 or 6006.
 
 For a Mac you can reach in person, copy the latest [Mac device helper](../tools/macos-device-helper) to that Mac and make it executable. Run it with `export-facetime-validation` and an output path, for example `./macos-device-helper export-facetime-validation ~/Desktop/FaceTime-validation.plist`. Transfer the file privately, keep its permissions at `600`, and choose it with **Use Validation File** in **Enable FaceTime**. The file contains device metadata and fresh validation proofs. Linux uses the saved APNs and iMessage keys throughout the upgrade and contacts Apple directly.
 

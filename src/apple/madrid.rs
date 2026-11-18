@@ -132,6 +132,29 @@ struct LookupResponse {
     results: Option<HashMap<String, LookupAddress>>,
 }
 
+#[derive(Debug)]
+pub struct IdsRegistrationNeedsRenewal(u64);
+
+impl std::fmt::Display for IdsRegistrationNeedsRenewal {
+    fn fmt(&self, format: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            format,
+            "Apple requested a registration renewal (IDS {})",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for IdsRegistrationNeedsRenewal {}
+
+fn check_lookup_status(status: u64) -> Result<()> {
+    if matches!(status, 6005 | 6006) {
+        return Err(IdsRegistrationNeedsRenewal(status).into());
+    }
+    ensure!(status == 0, "Apple IDS lookup returned status {status}");
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct LookupAddress {
     identities: Vec<LookupDevice>,
@@ -360,21 +383,21 @@ impl Madrid {
                 "Apple IDS lookup timed out",
             )
             .await?;
-        let bytes = field_data(&response, "b").with_context(|| {
-            format!(
+        let Some(bytes) = field_data(&response, "b") else {
+            let status = response.get("s").and_then(Value::as_unsigned_integer);
+            if let Some(status @ (6005 | 6006)) = status {
+                return Err(IdsRegistrationNeedsRenewal(status).into());
+            }
+            anyhow::bail!(
                 "Apple rejected the IDS lookup (status {})",
                 response
                     .get("s")
                     .and_then(Value::as_signed_integer)
                     .unwrap_or(-1)
-            )
-        })?;
+            );
+        };
         let decoded: LookupResponse = plist::from_bytes(&decompress(bytes)?)?;
-        ensure!(
-            decoded.status == 0,
-            "Apple IDS lookup returned status {}",
-            decoded.status
-        );
+        check_lookup_status(decoded.status)?;
         let source = decoded
             .results
             .context("Apple IDS returned no directory results")?;
@@ -1380,6 +1403,22 @@ mod tests {
         rsa::Rsa,
         sha::sha1,
     };
+
+    #[test]
+    fn credential_refresh_statuses_request_registration_renewal() -> Result<()> {
+        check_lookup_status(0)?;
+        for status in [6005, 6006] {
+            let error = check_lookup_status(status).unwrap_err();
+            assert!(error.is::<IdsRegistrationNeedsRenewal>());
+            assert!(error.to_string().contains("registration renewal"));
+        }
+        assert!(
+            !check_lookup_status(6001)
+                .unwrap_err()
+                .is::<IdsRegistrationNeedsRenewal>()
+        );
+        Ok(())
+    }
 
     #[test]
     fn encrypted_tapbacks_on_long_messages_fit_the_courier_budget() -> Result<()> {

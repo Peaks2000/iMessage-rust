@@ -179,32 +179,40 @@ pub fn save_session(root: &Path, bytes: &[u8], key_file: Option<&Path>) -> Resul
     write_session(root, bytes, key_file)
 }
 
-/// Add FaceTime to the current desktop session after verifying the existing registration.
+/// Replace Apple registration certificates while preserving the desktop identity.
+pub fn save_registration_renewal(
+    root: &Path,
+    prior: &crate::apple::Identity,
+    bytes: &[u8],
+) -> Result<()> {
+    let renewed = crate::apple::Identity::parse(bytes).context("Invalid renewed Apple session")?;
+    ensure!(
+        renewed.same_messaging_identity(prior)?,
+        "The renewed registration does not match the saved iMessage device"
+    );
+    let _lock = lock_session_storage(root)?;
+    let saved = load_local_session(root)?
+        .context("The saved iMessage session was removed during renewal")?;
+    if saved.same_messaging_registration(&renewed)? && saved.same_facetime_registration(&renewed) {
+        return Ok(());
+    }
+    ensure!(
+        saved.same_messaging_registration(prior)? && saved.same_facetime_registration(prior),
+        "The saved Apple session changed during renewal"
+    );
+    write_session(root, bytes, None)
+}
+
 pub fn save_facetime_upgrade(
     root: &Path,
     prior: &crate::apple::Identity,
     bytes: &[u8],
 ) -> Result<()> {
-    let upgraded = crate::apple::Identity::parse(bytes).context("Invalid FaceTime session")?;
     ensure!(
-        upgraded.facetime_registered() && upgraded.same_messaging_registration(prior)?,
-        "FaceTime registration does not match the saved iMessage device"
+        crate::apple::Identity::parse(bytes)?.facetime_registered(),
+        "The renewed session has no FaceTime registration"
     );
-    let _lock = lock_session_storage(root)?;
-    let saved = load_local_session(root)?
-        .context("The saved iMessage session was removed during FaceTime setup")?;
-    ensure!(
-        saved.same_messaging_registration(prior)?,
-        "The saved Apple session changed during FaceTime setup"
-    );
-    if saved.same_facetime_registration(&upgraded) {
-        return Ok(());
-    }
-    ensure!(
-        saved.same_facetime_registration(prior),
-        "The saved FaceTime registration changed during setup"
-    );
-    write_session(root, bytes, None)
+    save_registration_renewal(root, prior, bytes)
 }
 
 fn lock_session_storage(root: &Path) -> Result<File> {

@@ -25,11 +25,17 @@ The Sequoia layout includes animated conversation selection, message arrival, th
 
 The desktop opens a registered iMessage session from Linux Secret Service and connects directly to Apple. For first-time registration, use **Settings → This Computer → Set Up with a Mac**. You can also restore a compatible registration using **Import Registered Session**. [Setup and session format](docs/apple-session.md)
 
+**Sign In on This Computer** uses a configured local device helper or an imported Apple device validation file. The installed Linux push signer can activate a new push identity for a validation file. Initial iMessage activation still requires Apple-accepted device validation.
+
+If Apple requests a credential refresh with IDS status 6005 or 6006, choose **Renew Registration** in Settings or next to the send error. Renewal keeps the saved device identity and message keys, registers messaging and enabled FaceTime services together, and saves Apple's returned certificates.
+
 The engine supports one-to-one text and attachments with devices that accept the legacy iMessage format. A message can contain up to eight attachments and 32 MiB of attachment data. **Sent** indicates that Apple’s courier accepted the send.
 
 With a local Apple session registered for FaceTime, open the camera menu beside a conversation to place a **FaceTime Audio** or **FaceTime Video** call. You can answer or decline an incoming call from the app or from a desktop notification that supports actions. For a video ring, choose **Answer Video** or **Answer as Audio**. If `canberra-gtk-play` is available, iMessage repeats the desktop sound theme's incoming-call tone until you respond or the call ends. **Mute** releases the microphone, and **Camera Off** stops camera capture. Move the pointer over the video to show the call controls. You can drag your mirrored camera preview within the video call. FaceTime audio uses the PulseAudio-compatible `parec` and `pacat` tools. Video uses FFmpeg with `libx265` and prefers hardware V4L2 cameras. If capture fails, you can keep talking and choose **Retry Camera**.
 
 With FaceTime enabled, closing the window minimizes iMessage so it can continue receiving calls. Answering or declining on another device signed in to the same FaceTime address dismisses the pending Linux ring. Press **Ctrl+Q** or right-click **Close Window** and choose **Quit iMessage** to exit.
+
+Video calls open in a separate resizable window. Your camera appears while a call rings or connects, then moves into a mirrored, draggable preview when the media connection is ready. Camera, mute, and end-call controls appear over the lower-left of the video. Closing the video window ends that call.
 
 ## Sync iCloud Contacts
 

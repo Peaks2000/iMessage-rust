@@ -309,6 +309,52 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore = "Uses the local webcam"]
+    async fn camera_self_view_runs_before_call_negotiation_and_releases_on_cancel() -> Result<()> {
+        let (camera, enabled) = watch::channel(true);
+        let (preview, mut frames) = watch::channel(None);
+        let mut prepared = VideoCallOptions {
+            camera: None,
+            camera_enabled: enabled,
+            frames: watch::channel(None).0,
+            preview,
+            status: watch::channel(VideoStatus::default()).0,
+        }
+        .prepare();
+        let observe = async {
+            frames.changed().await?;
+            ensure!(
+                frames.borrow_and_update().as_ref().is_some_and(|frame| {
+                    frame.width > 0
+                        && frame.rgba.len()
+                            == usize::from(frame.width) * usize::from(frame.height) * 4
+                }),
+                "No valid local camera frame before connecting"
+            );
+            Ok::<(), anyhow::Error>(())
+        };
+        tokio::select! {
+            _ = prepared.preview() => unreachable!(),
+            result = tokio::time::timeout(Duration::from_secs(8), observe) => result??,
+        }
+        camera.send_replace(false);
+        let cleared = async {
+            frames.changed().await?;
+            ensure!(
+                frames.borrow_and_update().is_none(),
+                "Camera preview remained after disabling the camera"
+            );
+            Ok::<(), anyhow::Error>(())
+        };
+        tokio::select! {
+            _ = prepared.preview() => unreachable!(),
+            result = tokio::time::timeout(Duration::from_secs(2), cleared) => result??,
+        }
+        drop(prepared);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn camera_off_discards_queued_video_without_opening_a_device() -> Result<()> {
         let (camera, enabled) = watch::channel(true);
         let (status, mut report) = watch::channel(VideoStatus::default());

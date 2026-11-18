@@ -20,6 +20,7 @@ pub use gsa::{
     login_device_sms,
 };
 pub use icloud_contacts::IcloudContactsGrant;
+pub use madrid::IdsRegistrationNeedsRenewal;
 pub use provisioning::{AutomaticSetup, DeviceConnection, default_device_helper};
 pub use registration::register_device;
 pub use ssh_setup::{SshPrompt, run_ssh_askpass};
@@ -135,6 +136,10 @@ impl Identity {
         self.ids_certificate(facetime::SIGNALING).is_some()
     }
 
+    pub fn facetime_video_registered(&self) -> bool {
+        self.facetime_registered() && self.ids_certificate(facetime::VIDEO).is_some()
+    }
+
     pub(crate) fn can_sign_relay_prekey(&self) -> bool {
         self.facetime_relay_signing.is_some()
     }
@@ -177,14 +182,19 @@ impl Identity {
         &self.handle
     }
 
-    pub(crate) fn same_messaging_registration(&self, other: &Self) -> Result<bool> {
+    pub(crate) fn same_messaging_identity(&self, other: &Self) -> Result<bool> {
         Ok(self.handle == other.handle
             && self.token == other.token
             && self.push_cert == other.push_cert
+            && self.ids_key.public_eq(&other.ids_key)
+            && self.message_keys.public_der()? == other.message_keys.public_der()?)
+    }
+
+    pub(crate) fn same_messaging_registration(&self, other: &Self) -> Result<bool> {
+        Ok(self.same_messaging_identity(other)?
             && self.ids_cert == other.ids_cert
             && self.user_agent == other.user_agent
-            && self.protocol_version == other.protocol_version
-            && self.message_keys.public_der()? == other.message_keys.public_der()?)
+            && self.protocol_version == other.protocol_version)
     }
 
     pub(crate) fn same_facetime_registration(&self, other: &Self) -> bool {

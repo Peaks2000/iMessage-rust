@@ -13,8 +13,9 @@ use eframe::egui::{
 };
 use linux_imessage::{
     CallMode, Conversation, Delivery, FILE_LIMIT, IncomingCall, MAX_ATTACHMENTS, Message,
-    PAGE_SIZE, SendText, SetTapback, Status, TEXT_LIMIT, TapbackKind, address, display_address,
-    engine::video::VideoFrame, now_ms, storage,
+    PAGE_SIZE, SendText, SetTapback, Status, TEXT_LIMIT, TapbackKind, address,
+    apple::IdsRegistrationNeedsRenewal, display_address, engine::video::VideoFrame, now_ms,
+    storage,
 };
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
@@ -36,7 +37,7 @@ use super::chrome::{
 
 const POLL: Duration = Duration::from_secs(4);
 const MOTION: f32 = 0.30;
-const LOCAL_UNREGISTERED: &str = "Open Settings → This Computer to set up iMessage with your Mac.";
+const LOCAL_UNREGISTERED: &str = "Open Settings → This Computer to sign in to iMessage.";
 const CALL_GREEN: Color32 = Color32::from_rgb(37, 158, 67);
 
 pub struct MessagesApp {
@@ -48,6 +49,7 @@ pub struct MessagesApp {
     mac_setup: Option<MacSetup>,
     contacts: Contacts,
     local_unregistered: bool,
+    registration_needs_renewal: bool,
     connection: Option<Connection>,
     candidate: Option<Connection>,
     status: Option<Status>,
@@ -154,6 +156,7 @@ impl MessagesApp {
             mac_setup: mac_setup.then(MacSetup::new),
             contacts,
             local_unregistered: false,
+            registration_needs_renewal: false,
             candidate,
             connection: None,
             status: None,
@@ -316,6 +319,12 @@ impl MessagesApp {
                     }
                 }
                 Event::Sent { request, result } => {
+                    if let Err(error) = &result
+                        && self.config.mode == Mode::Local
+                        && error.is::<IdsRegistrationNeedsRenewal>()
+                    {
+                        self.registration_needs_renewal = true;
+                    }
                     self.sending = false;
                     let draft = self.pending_draft.take();
                     match result {
@@ -372,7 +381,14 @@ impl MessagesApp {
                             }
                             self.error = None;
                         }
-                        Err(error) => self.error = Some(format!("{error:#}")),
+                        Err(error) => {
+                            if self.config.mode == Mode::Local
+                                && error.is::<IdsRegistrationNeedsRenewal>()
+                            {
+                                self.registration_needs_renewal = true;
+                            }
+                            self.error = Some(format!("{error:#}"));
+                        }
                     }
                     self.refresh_at = Instant::now();
                 }
@@ -1152,10 +1168,22 @@ impl MessagesApp {
             .show(ctx, |ui| {
                 if let Some(error) = &self.error {
                     let mut dismiss = false;
-                    ui.horizontal(|ui| {
+                    let mut renew = false;
+                    ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new(error).size(11.).color(DANGER));
+                        if self.registration_needs_renewal && self.config.mode == Mode::Local {
+                            renew = ui
+                                .add_enabled(
+                                    !self.sending && self.active_call.is_none(),
+                                    egui::Button::new("Renew Registration…").small(),
+                                )
+                                .clicked();
+                        }
                         dismiss = ui.small_button("Dismiss").clicked();
                     });
+                    if renew {
+                        self.mac_setup = Some(MacSetup::for_renewal(&self.root));
+                    }
                     if dismiss {
                         self.error = None;
                     }
@@ -2006,7 +2034,8 @@ impl MessagesApp {
             MacOutcome::Open => {}
             MacOutcome::Closed => {
                 self.mac_setup = None;
-                if self.settings.is_none() && !self.contacts.is_open() {
+                if self.settings.is_none() && !self.contacts.is_open() && self.connection.is_none()
+                {
                     self.candidate = Some(Connection::start(
                         ctx,
                         self.root.clone(),
@@ -2017,8 +2046,15 @@ impl MessagesApp {
                     ));
                 }
             }
-            MacOutcome::Saved => {
+            MacOutcome::Saved(warning) => {
                 self.mac_setup = None;
+                if self.registration_needs_renewal {
+                    self.registration_needs_renewal = false;
+                    self.error = None;
+                }
+                if let Some(warning) = warning {
+                    self.error = Some(warning.to_owned());
+                }
                 self.contacts.refresh_now(ctx);
                 self.open_saved_session(ctx);
             }
@@ -2060,6 +2096,8 @@ impl MessagesApp {
         let mut apply = false;
         let mut import = false;
         let mut setup_mac = false;
+        let mut sign_in_local = false;
+        let mut renew_registration = false;
         let mut enable_facetime = false;
         let mut contacts = false;
         let mut cancel = false;
@@ -2081,7 +2119,7 @@ impl MessagesApp {
                     match form.config.mode {
                         Mode::Local => {
                             let label = if self.local_unregistered {
-                                "Use your Mac to register iMessage on this computer."
+                                "Sign in to register iMessage on this computer."
                             } else if self.config.mode == Mode::Local {
                                 self.status.as_ref().map_or(
                                     "Connect directly to Apple using a registered session.",
@@ -2106,6 +2144,20 @@ impl MessagesApp {
                             }
                             ui.add_space(3.);
                             ui.horizontal_wrapped(|ui| {
+                                if self.config.mode == Mode::Local && self.status.is_some() {
+                                    renew_registration = ui
+                                        .add_enabled(
+                                            !self.sending && self.active_call.is_none(),
+                                            egui::Button::new("Renew Registration…"),
+                                        )
+                                        .clicked();
+                                }
+                                sign_in_local = ui
+                                    .add_enabled(
+                                        !self.sending && self.active_call.is_none(),
+                                        egui::Button::new("Sign In on This Computer…"),
+                                    )
+                                    .clicked();
                                 setup_mac = ui
                                     .add_enabled(
                                         !self.sending,
@@ -2186,6 +2238,12 @@ impl MessagesApp {
         } else if enable_facetime {
             form.error = None;
             self.mac_setup = Some(MacSetup::for_facetime(&self.root));
+        } else if renew_registration {
+            form.error = None;
+            self.mac_setup = Some(MacSetup::for_renewal(&self.root));
+        } else if sign_in_local {
+            form.error = None;
+            self.mac_setup = Some(MacSetup::for_local(&self.root));
         } else if setup_mac {
             form.error = None;
             self.mac_setup = Some(MacSetup::new());

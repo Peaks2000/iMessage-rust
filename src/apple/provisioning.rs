@@ -54,6 +54,11 @@ pub enum DeviceConnection {
     OnDeviceHelper(PathBuf),
 }
 
+struct Renewal<'a> {
+    identity: &'a Identity,
+    include_facetime: bool,
+}
+
 impl AutomaticSetup {
     pub async fn sign_in(
         self,
@@ -75,8 +80,38 @@ impl AutomaticSetup {
         password: Zeroizing<String>,
         prompts: &mut impl SmsPrompts,
     ) -> Result<Zeroizing<Vec<u8>>> {
-        self.sign_in_for(root, account, password, prompts, Some(identity))
-            .await
+        self.sign_in_for(
+            root,
+            account,
+            password,
+            prompts,
+            Some(Renewal {
+                identity,
+                include_facetime: true,
+            }),
+        )
+        .await
+    }
+
+    pub async fn renew_registration(
+        self,
+        root: &Path,
+        identity: &Identity,
+        account: &str,
+        password: Zeroizing<String>,
+        prompts: &mut impl SmsPrompts,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        self.sign_in_for(
+            root,
+            account,
+            password,
+            prompts,
+            Some(Renewal {
+                identity,
+                include_facetime: identity.facetime_registered(),
+            }),
+        )
+        .await
     }
 
     async fn sign_in_for(
@@ -85,8 +120,9 @@ impl AutomaticSetup {
         account: &str,
         password: Zeroizing<String>,
         prompts: &mut impl SmsPrompts,
-        existing: Option<&Identity>,
+        renewal: Option<Renewal<'_>>,
     ) -> Result<Zeroizing<Vec<u8>>> {
+        let existing = renewal.as_ref().map(|renewal| renewal.identity);
         let handle = match existing {
             Some(identity) => identity.handle.clone(),
             None => address(if self.address.trim().is_empty() {
@@ -111,7 +147,7 @@ impl AutomaticSetup {
         };
         if let DeviceProvider::OnDevice(local) = &provider {
             return local
-                .sign_in(root, handle, account, password, prompts, existing)
+                .sign_in(root, handle, account, password, prompts, renewal)
                 .await;
         }
         let computer = provider.describe().await?;
@@ -153,6 +189,9 @@ impl AutomaticSetup {
         let (push, token) =
             device_push(root, &profile, &computer, &provider, None, existing).await?;
         let mut device = computer.registration(handle, token, &push);
+        if let Some(renewal) = renewal {
+            device.include_facetime = renewal.include_facetime;
+        }
         login(
             &mut device,
             &mut anisette,
@@ -292,10 +331,9 @@ impl DeviceProvider {
 
     async fn activation_signature(&self, payload: &[u8]) -> Result<ActivationSignature> {
         if let Self::OnDevice(device) = self {
-            let signing = device
-                .activation
-                .as_ref()
-                .context("The device file has no activation credential")?;
+            let Some(signing) = device.activation.as_ref() else {
+                return sign_mac_push_activation(payload).await;
+            };
             let key = PKey::private_key_from_der(signing.key.as_ref())
                 .context("Invalid local activation signing key")?;
             let mut signer = Signer::new(MessageDigest::sha1(), &key)?;
@@ -446,9 +484,9 @@ impl LocalDevice {
         account: &str,
         password: Zeroizing<String>,
         prompts: &mut impl SmsPrompts,
-        existing: Option<&Identity>,
+        renewal: Option<Renewal<'_>>,
     ) -> Result<Zeroizing<Vec<u8>>> {
-        self.require_push_identity(existing)?;
+        let existing = renewal.as_ref().map(|renewal| renewal.identity);
         let profile = self.computer.profile();
         let _activation_lock = lock_profile(root, &profile)?;
         let mut adi = LocalAdi::new(format!("adi:{}:{profile}", root.display()), &self.computer)?;
@@ -465,6 +503,9 @@ impl LocalDevice {
         )
         .await?;
         let mut device = self.computer.registration(handle, token, &push);
+        if let Some(renewal) = renewal {
+            device.include_facetime = renewal.include_facetime;
+        }
         let mut anisette = Anisette::from_local(adi);
         login(
             &mut device,
@@ -479,14 +520,6 @@ impl LocalDevice {
             existing,
         )
         .await
-    }
-
-    fn require_push_identity(&self, existing: Option<&Identity>) -> Result<()> {
-        ensure!(
-            existing.is_some() || self.push.is_some() || self.activation.is_some(),
-            "This validation file needs an existing iMessage session. Use Enable FaceTime in Settings."
-        );
-        Ok(())
     }
 }
 
@@ -976,7 +1009,7 @@ mod tests {
         profile.remove("activation");
         storage::write_private(&path, &plist_xml(&profile)?)?;
         let file = std::sync::Arc::new(LocalDevice::load(&path)?);
-        assert!(file.require_push_identity(None).is_err());
+        assert!(file.activation.is_none() && file.push.is_none());
         let group = openssl::ec::EcGroup::from_curve_name(openssl::nid::Nid::X9_62_PRIME256V1)?;
         let signing = openssl::ec::EcKey::generate(&group)?;
         let identity = Identity {
@@ -996,7 +1029,6 @@ mod tests {
             protocol_version: MAC_IDS_PROTOCOL,
             user_agent: "[macOS,15.7,24G123,Macmini8,1]".into(),
         };
-        file.require_push_identity(Some(&identity))?;
         let provider = DeviceProvider::OnDevice(file.clone());
         let (push, token) = device_push(
             temp.path(),

@@ -24,13 +24,14 @@ use super::{
 pub(super) enum Outcome {
     Open,
     Closed,
-    Saved,
+    Saved(Option<&'static str>),
     ContactsAuthorized,
 }
 
 pub(super) struct MacSetup {
     purpose: Purpose,
     device_helper: Option<PathBuf>,
+    local_only: bool,
     validation_file: Option<PathBuf>,
     picking_validation: Option<Receiver<Result<Option<PathBuf>>>>,
     account_seeded: bool,
@@ -46,6 +47,7 @@ pub(super) struct MacSetup {
     error: Option<String>,
     worker: Option<Worker>,
     focus_code: bool,
+    completion_warning: Option<&'static str>,
     focus_password: bool,
     focus_ssh: bool,
 }
@@ -54,6 +56,7 @@ pub(super) struct MacSetup {
 enum Purpose {
     Messages,
     FaceTime,
+    Renewal,
     Contacts,
 }
 
@@ -91,7 +94,7 @@ enum Event {
     Ssh(SshPrompt, oneshot::Sender<Zeroizing<String>>),
     Save(oneshot::Sender<()>),
     StorageError(anyhow::Error, oneshot::Sender<()>),
-    Finished(Result<()>),
+    Finished(Result<Option<&'static str>>),
 }
 
 struct Request {
@@ -108,6 +111,7 @@ impl MacSetup {
         Self {
             purpose: Purpose::Messages,
             device_helper: None,
+            local_only: false,
             validation_file: None,
             picking_validation: None,
             account_seeded: false,
@@ -124,6 +128,7 @@ impl MacSetup {
             worker: None,
             focus_code: false,
             focus_password: false,
+            completion_warning: None,
             focus_ssh: false,
         }
     }
@@ -132,6 +137,20 @@ impl MacSetup {
         let mut setup = Self::new();
         setup.purpose = Purpose::Contacts;
         setup.seed_account(account, password_saved);
+        setup
+    }
+
+    pub(super) fn for_local(root: &Path) -> Self {
+        let mut setup = Self::new();
+        setup.local_only = true;
+        setup.device_helper = apple::default_device_helper(root);
+        setup
+    }
+
+    pub(super) fn for_renewal(root: &Path) -> Self {
+        let mut setup = Self::new();
+        setup.purpose = Purpose::Renewal;
+        setup.device_helper = apple::default_device_helper(root);
         setup
     }
 
@@ -159,7 +178,7 @@ impl MacSetup {
             return if self.purpose == Purpose::Contacts {
                 Outcome::ContactsAuthorized
             } else {
-                Outcome::Saved
+                Outcome::Saved(self.completion_warning)
             };
         }
 
@@ -172,8 +191,10 @@ impl MacSetup {
             .show(context, |ui| {
                 ui.set_width(404.);
                 let title = match self.purpose {
+                    Purpose::Messages if self.local_only => "Sign In to iMessage",
                     Purpose::Messages => "Set Up with a Mac",
                     Purpose::FaceTime => "Enable FaceTime",
+                    Purpose::Renewal => "Renew iMessage Registration",
                     Purpose::Contacts => "Authorize iCloud Contacts",
                 };
                 ui.label(chrome::bold(title, 19.));
@@ -302,6 +323,13 @@ impl MacSetup {
             if remove {
                 self.validation_file = None;
             }
+        } else if self.local_only && self.device_helper.is_none() {
+            ui.label(
+                RichText::new(
+                    "Select an Apple device validation file to sign in on this computer.",
+                )
+                .color(MUTED),
+            );
         } else if self.device_helper.is_none() {
             ui.label(
                 RichText::new(
@@ -326,17 +354,17 @@ impl MacSetup {
             ui.add_space(5.);
         } else {
             ui.label(
-                RichText::new("Register FaceTime using the local device helper.").color(MUTED),
+                RichText::new("Validate this sign-in with the local device helper.").color(MUTED),
             );
         }
-        if self.purpose == Purpose::FaceTime && self.validation_file.is_none() {
+        if self.purpose != Purpose::Contacts && self.validation_file.is_none() {
             if self.picking_validation.is_some() {
                 progress(ui, "Choosing a validation file…");
             } else if ui.button("Use Validation File…").clicked() {
                 self.error = None;
                 self.picking_validation = Some(attachments::task(ui.ctx(), || {
                     run_file_picker(
-                        "Choose FaceTime Validation File",
+                        "Choose Apple Device Validation File",
                         &["--file-filter=*.plist"],
                     )
                 }));
@@ -364,13 +392,15 @@ impl MacSetup {
             && (self.purpose == Purpose::Contacts
                 || self.validation_file.is_some()
                 || self.device_helper.is_some()
-                || mac_ready)
+                || (!self.local_only && mac_ready))
             && !self.account.trim().is_empty()
             && (saved || !self.password.is_empty());
         (
             match self.purpose {
+                Purpose::Messages if self.local_only => "Sign In",
                 Purpose::Messages => "Connect",
                 Purpose::FaceTime => "Enable FaceTime",
+                Purpose::Renewal => "Renew Registration",
                 Purpose::Contacts => "Authorize",
             },
             ready,
@@ -504,7 +534,10 @@ impl MacSetup {
                 self.step = Step::RetrySave(answer);
                 self.error = Some(format!("{error:#}"));
             }
-            Ok(Event::Finished(Ok(()))) => return true,
+            Ok(Event::Finished(Ok(warning))) => {
+                self.completion_warning = warning;
+                return true;
+            }
             Ok(Event::Finished(Err(error))) => self.fail(format!("{error:#}")),
             Err(TryRecvError::Disconnected) => {
                 self.fail("Apple account setup stopped unexpectedly".into())
@@ -550,7 +583,7 @@ fn run(
     request: Request,
     prompts: &mut GuiPrompts,
     mut canceled: oneshot::Receiver<()>,
-) -> Result<()> {
+) -> Result<Option<&'static str>> {
     let Request {
         purpose,
         setup,
@@ -587,11 +620,16 @@ fn run(
             _ = &mut canceled => anyhow::bail!("Apple account setup canceled"),
             result = async {
                 if let Some(setup) = setup {
-                    let session = if purpose == Purpose::FaceTime {
-                        let identity = current.as_ref().context("Sign in to iMessage to enable FaceTime")?;
-                        setup.enable_facetime(root, identity, account, password, prompts).await?
-                    } else {
-                        setup.sign_in(root, account, password, prompts).await?
+                    let session = match purpose {
+                        Purpose::FaceTime => {
+                            let identity = current.as_ref().context("Sign in to iMessage to enable FaceTime")?;
+                            setup.enable_facetime(root, identity, account, password, prompts).await?
+                        }
+                        Purpose::Renewal => {
+                            let identity = current.as_ref().context("No saved iMessage registration to renew")?;
+                            setup.renew_registration(root, identity, account, password, prompts).await?
+                        }
+                        _ => setup.sign_in(root, account, password, prompts).await?,
                     };
                     let identity = Identity::parse(&session)?;
                     Ok((Some(session), Some(identity), prompts.contacts_grant.take()))
@@ -607,6 +645,18 @@ fn run(
         .as_ref()
         .or(current.as_ref())
         .context("Missing Apple session")?;
+    let requested_facetime = purpose == Purpose::FaceTime
+        || purpose == Purpose::Renewal
+            && current.as_ref().is_some_and(Identity::facetime_registered);
+    let warning = if requested_facetime && !identity.facetime_registered() {
+        Some("iMessage registration was renewed. Apple did not grant FaceTime registration.")
+    } else if requested_facetime && !identity.facetime_video_registered() {
+        Some(
+            "iMessage and FaceTime audio were registered. Apple did not grant FaceTime video registration.",
+        )
+    } else {
+        None
+    };
     let mut saved = storage::SavedAppleAccount {
         account: account.to_owned(),
         password: prompts.remembered_password.take().unwrap_or_default(),
@@ -631,11 +681,11 @@ fn run(
             }
             storage::save_apple_account(root, identity, &saved)?;
             if let Some(session) = &session {
-                if purpose == Purpose::FaceTime {
+                if matches!(purpose, Purpose::FaceTime | Purpose::Renewal) {
                     let previous = current
                         .as_ref()
                         .context("Missing saved iMessage identity")?;
-                    storage::save_facetime_upgrade(root, previous, session)?;
+                    storage::save_registration_renewal(root, previous, session)?;
                 } else {
                     storage::save_session(root, session, None)?;
                 }
@@ -643,7 +693,7 @@ fn run(
             Ok(())
         })();
         match result {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(warning),
             Err(error) => {
                 let (retry, confirmation) = oneshot::channel();
                 confirmed = confirmation;

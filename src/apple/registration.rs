@@ -20,7 +20,7 @@ use zeroize::Zeroizing;
 use crate::address;
 
 use super::{
-    Identity, IdsDevice, Session,
+    Identity, Session,
     aps::TOPIC,
     certified_rsa,
     crypto::KeyPair,
@@ -192,7 +192,7 @@ async fn register_at(
     };
     let pair = KeyPair::private(&signing_bytes, &encryption_bytes)?;
     let public_identity = pair.public_der()?;
-    let relay_signing = if existing.is_some() || registration.include_facetime {
+    let relay_signing = if registration.include_facetime {
         Some(
             match existing.and_then(|identity| identity.facetime_relay_signing.clone()) {
                 Some(signing) => signing,
@@ -276,10 +276,15 @@ async fn register_at(
         plist::from_bytes::<RegisterReply>(&bytes)
             .context("Could not decode Apple's registration response")
     };
-    let (cert, facetime_certificates) = if let Some(identity) = existing {
-        let response = submit(registration, Services::FaceTime).await?;
-        let calls = required_facetime_certificates(&response, &auth, &handle)?;
-        (Data::new(identity.ids_cert.clone()), calls)
+    let (cert, facetime_certificates) = if existing.is_some() {
+        // Apple replaces the registrations for this push identity together.
+        let services = if registration.include_facetime {
+            Services::Both
+        } else {
+            Services::Messages
+        };
+        let response = submit(registration, services).await?;
+        select_certificates(&response, &auth, &handle, registration.include_facetime)?
     } else {
         let register_new = async |registration: &DeviceRegistration, include_facetime| {
             let services = if include_facetime {
@@ -320,23 +325,6 @@ async fn register_at(
         } else {
             None
         };
-    let messages_device = existing.map_or(
-        (
-            registration.protocol_version,
-            registration.user_agent.as_str(),
-        ),
-        |identity| identity.ids_device(TOPIC),
-    );
-    let calling_device = (
-        registration.protocol_version,
-        registration.user_agent.as_str(),
-    );
-    let facetime_device = (facetime_certificates.contains_key(facetime::SIGNALING)
-        && calling_device != messages_device)
-        .then(|| IdsDevice {
-            protocol_version: calling_device.0,
-            user_agent: calling_device.1.to_owned(),
-        });
     let session = Session {
         version: 1,
         handle,
@@ -347,11 +335,11 @@ async fn register_at(
         ids_private_key: Data::new(auth.key.private_key_to_der()?),
         facetime_certificates,
         facetime_relay_signing_private_key,
-        facetime_device,
+        facetime_device: None,
         signing_private_key: Data::new(signing_bytes.to_vec()),
         encryption_private_key: Data::new(encryption_bytes.to_vec()),
-        protocol_version: messages_device.0,
-        user_agent: messages_device.1.to_owned(),
+        protocol_version: registration.protocol_version,
+        user_agent: registration.user_agent.clone(),
     };
     let mut serialized = Zeroizing::new(Vec::new());
     plist::to_writer_binary(&mut *serialized, &session)?;
@@ -364,7 +352,6 @@ async fn register_at(
 enum Services {
     Both,
     Messages,
-    FaceTime,
 }
 
 fn registration_document(
@@ -415,17 +402,15 @@ fn registration_document(
         ])
     };
     let mut requested = Vec::new();
-    if !matches!(services, Services::FaceTime) {
-        let mut messaging_data = client_data.clone();
-        messaging_data.insert("supports-emoji-tapbacks".into(), Value::Boolean(true));
-        requested.push(service(
-            TOPIC,
-            &[],
-            "Messenger",
-            17,
-            Value::Dictionary(account(messaging_data)),
-        ));
-    }
+    let mut messaging_data = client_data.clone();
+    messaging_data.insert("supports-emoji-tapbacks".into(), Value::Boolean(true));
+    requested.push(service(
+        TOPIC,
+        &[],
+        "Messenger",
+        17,
+        Value::Dictionary(account(messaging_data)),
+    ));
     if !matches!(services, Services::Messages) {
         let calling_account = |capability: &str| {
             let mut calling_data = client_data.clone();
@@ -548,21 +533,6 @@ fn select_certificates(
         }
     }
     Ok((messages, calls))
-}
-
-fn required_facetime_certificates(
-    reply: &RegisterReply,
-    auth: &AccountAuth,
-    handle: &str,
-) -> Result<BTreeMap<String, Data>> {
-    check_status(reply.status, "FaceTime registration")?;
-    let signal = checked_facetime_certificate(reply, auth, handle, facetime::SIGNALING)
-        .context("Apple did not grant FaceTime to this iMessage address")?;
-    let mut calls = BTreeMap::from([(facetime::SIGNALING.to_owned(), signal)]);
-    if let Ok(video) = checked_facetime_certificate(reply, auth, handle, facetime::VIDEO_SERVICE) {
-        calls.insert(facetime::VIDEO_SERVICE.to_owned(), video);
-    }
-    Ok(calls)
 }
 
 fn checked_facetime_certificate(
@@ -789,11 +759,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enabling_face_time_reuses_the_original_keys_and_never_reregisters_messages()
-    -> Result<()> {
+    async fn enabling_face_time_renews_messaging_with_the_same_device_keys() -> Result<()> {
         let (push_key, push_cert) = identity_certificate()?;
         let (ids_key, messages_cert) = identity_certificate()?;
         let authorization = certificate_for(&ids_key, "Fresh account authorization")?;
+        let renewed_messages = certificate_for(&ids_key, "Renewed message registration")?;
         let face_time = certificate_for(&ids_key, "FaceTime registration")?;
         let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
         let signing = PKey::from_ec_key(EcKey::generate(&group)?)?;
@@ -819,17 +789,46 @@ mod tests {
         let previous = Identity::parse(&encoded)?;
 
         let responses = [
-            reply(
-                0,
-                vec![
-                    accepted(facetime::SIGNALING, &face_time),
-                    accepted(facetime::VIDEO_SERVICE, &face_time),
-                ],
-            )?,
-            reply(71, Vec::new())?,
-            reply(0, vec![accepted(facetime::SIGNALING, &push_cert)])?,
+            (
+                true,
+                true,
+                true,
+                reply(
+                    0,
+                    vec![
+                        accepted(TOPIC, &renewed_messages),
+                        accepted(facetime::SIGNALING, &face_time),
+                        accepted(facetime::VIDEO_SERVICE, &face_time),
+                    ],
+                )?,
+            ),
+            (true, false, false, reply(71, Vec::new())?),
+            (
+                true,
+                true,
+                false,
+                reply(
+                    0,
+                    vec![
+                        accepted(TOPIC, &renewed_messages),
+                        accepted(facetime::SIGNALING, &push_cert),
+                    ],
+                )?,
+            ),
+            (
+                true,
+                false,
+                false,
+                reply(0, vec![accepted(facetime::SIGNALING, &face_time)])?,
+            ),
+            (
+                false,
+                true,
+                false,
+                reply(0, vec![accepted(TOPIC, &renewed_messages)])?,
+            ),
         ];
-        for (index, response) in responses.into_iter().enumerate() {
+        for (include_facetime, success, face_time_granted, response) in responses {
             let (requests, mut captured) = tokio::sync::mpsc::unbounded_channel();
             let router = Router::new().route(
                 "/register",
@@ -847,10 +846,12 @@ mod tests {
                 certificate: authorization.clone(),
                 key: ids_key.clone(),
             };
+            let mut registration = device(&push_key, &push_cert)?;
+            registration.include_facetime = include_facetime;
             let result = register_at(
                 &Client::builder().no_proxy().build()?,
                 &url,
-                &mut device(&push_key, &push_cert)?,
+                &mut registration,
                 auth,
                 None,
                 Some(&previous),
@@ -859,67 +860,82 @@ mod tests {
             let (headers, payload) = captured.try_recv()?;
             let (document, advertised_key) =
                 request_identity(&headers, &payload, &push_key, &ids_key)?;
-            assert_eq!(
-                advertised_capability(&document, 0, "supports-modern-gft"),
-                Some(true)
-            );
-            assert_eq!(
-                advertised_capability(&document, 0, "supports-live-delivery"),
+            let advertised_relay_key = if include_facetime {
+                assert_eq!(
+                    advertised_capability(&document, 1, "supports-modern-gft"),
+                    Some(true)
+                );
+                assert_eq!(
+                    advertised_capability(&document, 1, "supports-live-delivery"),
+                    None
+                );
+                assert_eq!(
+                    advertised_capability(&document, 2, "supports-live-delivery"),
+                    Some(true)
+                );
+                let key =
+                    advertised_relay_key(&document, 1).context("Missing FaceTime device key")?;
+                facetime::PeerDeviceKey::from_directory(key)?;
+                Some(key)
+            } else {
                 None
-            );
-            assert_eq!(
-                advertised_capability(&document, 1, "supports-live-delivery"),
-                Some(true)
-            );
-            let advertised_relay_key =
-                advertised_relay_key(&document, 0).context("Missing FaceTime device key")?;
-            facetime::PeerDeviceKey::from_directory(advertised_relay_key)?;
-            if index == 0 {
+            };
+            if success {
                 let upgraded = Identity::parse(&result?)?;
-                assert!(upgraded.same_messaging_registration(&previous)?);
+                assert!(upgraded.same_messaging_identity(&previous)?);
                 assert_eq!(upgraded.profile_id(), previous.profile_id());
                 let registered_device = (1660, "[macOS,15.7.5,24G624,Mac14,2]");
-                assert_eq!(
-                    upgraded.ids_device(TOPIC),
-                    (1650, "[Mac OS X,10.11.6,15G31,MacBookPro11,3]")
-                );
-                for topic in [
-                    facetime::SIGNALING,
-                    facetime::VIDEO,
-                    facetime::relay::RELAY_TOPIC,
-                ] {
-                    assert_eq!(upgraded.ids_device(topic), registered_device);
+                assert_eq!(upgraded.ids_device(TOPIC), registered_device);
+                if face_time_granted {
+                    for topic in [
+                        facetime::SIGNALING,
+                        facetime::VIDEO,
+                        facetime::relay::RELAY_TOPIC,
+                    ] {
+                        assert_eq!(upgraded.ids_device(topic), registered_device);
+                    }
+                    #[cfg(feature = "desktop")]
+                    assert_eq!(
+                        upgraded
+                            .call_device()
+                            .context("Missing FaceTime device")?
+                            .model,
+                        "Mac14,2"
+                    );
                 }
-                #[cfg(feature = "desktop")]
-                assert_eq!(
-                    upgraded
-                        .call_device()
-                        .context("Missing FaceTime device")?
-                        .model,
-                    "Mac14,2"
-                );
                 assert_eq!(
                     upgraded.ids_certificate(TOPIC),
-                    Some(messages_cert.as_ref())
+                    Some(renewed_messages.as_ref())
                 );
-                assert_eq!(
-                    upgraded.ids_certificate(facetime::SIGNALING),
-                    Some(face_time.as_ref())
-                );
-                assert_eq!(
-                    upgraded.ids_certificate(facetime::VIDEO),
-                    Some(face_time.as_ref())
-                );
-                let signer = upgraded
-                    .facetime_relay_signing
-                    .context("Missing persisted FaceTime relay key")?;
-                assert_eq!(signer.directory_data()?.as_slice(), advertised_relay_key);
+                if face_time_granted {
+                    assert_eq!(
+                        upgraded.ids_certificate(facetime::SIGNALING),
+                        Some(face_time.as_ref())
+                    );
+                    assert_eq!(
+                        upgraded.ids_certificate(facetime::VIDEO),
+                        Some(face_time.as_ref())
+                    );
+                    let signer = upgraded
+                        .facetime_relay_signing
+                        .context("Missing persisted FaceTime relay key")?;
+                    assert_eq!(
+                        Some(signer.directory_data()?.as_slice()),
+                        advertised_relay_key
+                    );
+                } else {
+                    assert!(!upgraded.facetime_registered());
+                }
             } else {
                 assert!(result.is_err());
             }
             assert_eq!(
                 service_names(&document),
-                [facetime::SIGNALING, facetime::VIDEO_SERVICE]
+                if include_facetime {
+                    vec![TOPIC, facetime::SIGNALING, facetime::VIDEO_SERVICE]
+                } else {
+                    vec![TOPIC]
+                }
             );
             assert_eq!(advertised_key, previous.message_keys.public_der()?);
             assert_eq!(
