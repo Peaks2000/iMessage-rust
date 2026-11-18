@@ -15,6 +15,8 @@ cargo build --locked --release
 
 Use the compose icon or **Ctrl+N** to start a conversation. Enter sends and Shift+Enter adds a line break. Open **Settings** with **Ctrl+,** or from the conversation’s details button. Right-click a conversation to pin, unpin, or delete it. Deletion removes its history and attachments from the local profile or the connected server.
 
+Right-click a message or attachment to add a Tapback. Select the same reaction again to remove it. Received Tapbacks appear on the original message.
+
 Use **Ctrl+V** in the message field to attach a copied image or screenshot. You can also drop a file on the conversation or use the **+** next to the composer to choose **Photos** or **Files**. The file picker uses Zenity. Photos render inline and open in a larger viewer where you can save the original. The app previews JPEG, PNG, HEIC, WebP, GIF, BMP, ICO, and TIFF images. Click a web link to open it in your default browser.
 
 The Sequoia layout includes animated conversation selection, message arrival, the composer’s send button, and settings sheets. Translucency uses the Linux compositor. [Apple’s Sequoia Messages guide](https://support.apple.com/guide/messages/welcome/14.0/mac/15.0)

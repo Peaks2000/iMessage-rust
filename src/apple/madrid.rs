@@ -14,14 +14,14 @@ use tokio::time::{Instant, timeout};
 use uuid::Uuid;
 
 use crate::media::{MediaReference, MediaSource};
-use crate::{Delivery, Message, SendText, address, now_ms};
+use crate::{Delivery, Message, SendText, TapbackEvent, address, now_ms};
 
 use super::{
     Identity,
     aps::{Courier, Frame, TOPIC, push_id},
     crypto::KeyPair,
     http::plist_xml_gzip,
-    message_content, mmcs, nonce, rsa_signature,
+    message_content, mmcs, nonce, rsa_signature, tapback,
 };
 
 const QUERY_URL: &str = "https://query.ess.apple.com/WebObjects/QueryService.woa/wa/query";
@@ -41,6 +41,11 @@ pub(crate) struct Madrid {
 pub(crate) struct Notification {
     pub id: [u8; 4],
     data: Dictionary,
+}
+
+pub(crate) enum Incoming {
+    Message(Message, Vec<MediaSource>),
+    Tapback(TapbackEvent),
 }
 
 struct Destination {
@@ -299,17 +304,9 @@ impl Madrid {
         message: &SendText,
     ) -> Result<Delivery> {
         let participants = [&identity.handle[..], &message.address[..]];
-        let targets = self.query(identity, &participants, true).await?;
-        let target_entries = targets
-            .get(&message.address)
-            .context("Apple IDS has no result for this recipient")?;
-        ensure!(
-            target_entries
-                .iter()
-                .any(|device| device.push != identity.token),
-            "Apple IDS returned no compatible iMessage devices for this recipient"
-        );
-
+        let targets = self
+            .message_destinations(identity, &message.address)
+            .await?;
         let plain = format!("{}{}", "\u{fffc}".repeat(message.files.len()), message.body);
         let mut content = dictionary([
             ("t", value(plain)),
@@ -335,15 +332,58 @@ impl Madrid {
             );
             binary(&content)?
         };
+        self.deliver_message(identity, message.id, &message.address, &text, &targets)
+            .await
+    }
+
+    pub(crate) async fn send_tapback(
+        &mut self,
+        identity: &Identity,
+        target: &Message,
+        event: &TapbackEvent,
+    ) -> Result<Delivery> {
+        let payload = tapback::encode(event, target, &identity.handle)?;
+        let payload = compress(&binary(&payload)?)?;
+        let targets = self.message_destinations(identity, &event.chat).await?;
+        self.deliver_message(identity, event.id, &event.chat, &payload, &targets)
+            .await
+    }
+
+    async fn message_destinations(
+        &mut self,
+        identity: &Identity,
+        recipient: &str,
+    ) -> Result<HashMap<String, Vec<Destination>>> {
+        let targets = self
+            .query(identity, &[&identity.handle, recipient], true)
+            .await?;
+        let entries = targets
+            .get(recipient)
+            .context("Apple IDS has no result for this recipient")?;
+        ensure!(
+            entries.iter().any(|device| device.push != identity.token),
+            "Apple IDS returned no compatible iMessage devices for this recipient"
+        );
+        Ok(targets)
+    }
+
+    async fn deliver_message(
+        &mut self,
+        identity: &Identity,
+        guid: Uuid,
+        recipient: &str,
+        text: &[u8],
+        targets: &HashMap<String, Vec<Destination>>,
+    ) -> Result<Delivery> {
         let mut batches = vec![Vec::new()];
         let mut batch_bytes = 0;
         let mut seen = HashSet::new();
-        for uri in [message.address.as_str(), identity.handle.as_str()] {
+        for uri in [recipient, identity.handle.as_str()] {
             for device in targets.get(uri).into_iter().flatten() {
                 if device.push == identity.token || !seen.insert(device.push.as_slice()) {
                     continue;
                 }
-                let encrypted = identity.message_keys.seal(&device.public_key, &text)?;
+                let encrypted = identity.message_keys.seal(&device.public_key, text)?;
                 let cost = encrypted.len() + device.session.len() + 512;
                 ensure!(
                     cost <= MAX_BATCH && seen.len() <= 64,
@@ -359,7 +399,7 @@ impl Madrid {
                     .expect("A batch always exists")
                     .push(Value::Dictionary(dictionary([
                         ("tP", value(uri)),
-                        ("D", Value::Boolean(uri == message.address)),
+                        ("D", Value::Boolean(uri == recipient)),
                         ("sT", data(&device.session)),
                         ("P", data(&encrypted)),
                         ("t", data(&device.push)),
@@ -378,7 +418,7 @@ impl Madrid {
                     ("ua", value(&identity.user_agent)),
                     ("v", 8.into()),
                     ("i", i32::from_be_bytes(id).into()),
-                    ("U", data(message.id.as_bytes())),
+                    ("U", data(guid.as_bytes())),
                     ("sP", value(&identity.handle)),
                     ("fcn", (index as u32 + 1).into()),
                     ("dtl", Value::Array(bundle)),
@@ -463,7 +503,7 @@ impl Madrid {
         &mut self,
         identity: &Identity,
         notice: &Notification,
-    ) -> Result<Option<(Message, Vec<MediaSource>)>> {
+    ) -> Result<Option<Incoming>> {
         let wire = &notice.data;
         let command = wire.get("c").and_then(Value::as_unsigned_integer);
         if command != Some(100) || field_str(wire, "E").is_some_and(|name| name != "pair") {
@@ -512,7 +552,7 @@ impl Madrid {
         let Some(device) = devices.iter().find(|entry| entry.push == token) else {
             return Ok(None);
         };
-        let decoded = (|| -> Result<Option<(Message, Vec<MediaSource>)>> {
+        let decoded = (|| -> Result<Option<Incoming>> {
             let plaintext = identity.message_keys.open(&device.public_key, envelope)?;
             let body: Dictionary = plist::from_bytes(&decompress(&plaintext)?)?;
             let Some(participants) = body
@@ -536,24 +576,36 @@ impl Madrid {
                 .into_iter()
                 .find(|part| *part != identity.handle)
                 .context("Missing conversation recipient")?;
+            let outgoing = sender == identity.handle;
+            let timestamp_ns = wire
+                .get("e")
+                .and_then(Value::as_unsigned_integer)
+                .and_then(|ns| i64::try_from(ns).ok())
+                .filter(|ns| *ns > 0 && *ns / 1_000_000 <= now_ms() + 120_000)
+                .unwrap_or_else(crate::now_ns);
+            if body.contains_key("amk")
+                && matches!(
+                    body.get("amt").and_then(Value::as_unsigned_integer),
+                    Some(2000..=2007 | 3000..=3007)
+                )
+            {
+                return Ok(tapback::decode(&body, guid, peer, outgoing, timestamp_ns)
+                    .map(Incoming::Tapback));
+            }
             let (text, files) = message_content::decode(&body);
             if text.trim().is_empty() && files.is_empty() {
                 return Ok(None);
             }
             let (attachments, sources) = files.into_iter().unzip();
-            Ok(Some((
+            Ok(Some(Incoming::Message(
                 Message {
                     id: guid.to_string(),
                     address: peer,
                     body: text,
                     attachments,
-                    outgoing: sender == identity.handle,
-                    timestamp_ms: wire
-                        .get("e")
-                        .and_then(Value::as_unsigned_integer)
-                        .map(|ns| (ns / 1_000_000) as i64)
-                        .filter(|time| *time > 0 && *time <= now_ms() + 120_000)
-                        .unwrap_or_else(now_ms),
+                    outgoing,
+                    timestamp_ms: timestamp_ns / 1_000_000,
+                    tapbacks: Vec::new(),
                     status: if sender == identity.handle {
                         Delivery::Accepted
                     } else {

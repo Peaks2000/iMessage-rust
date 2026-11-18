@@ -157,9 +157,9 @@ impl TranscriptMedia {
         id: AttachmentId,
         info: &Attachment,
         connection: Option<&Connection>,
-    ) {
+    ) -> Option<egui::Response> {
         if !ui.is_rect_visible(rect) {
-            return;
+            return None;
         }
         let send = |purpose| {
             connection.is_some_and(|connection| {
@@ -211,11 +211,10 @@ impl TranscriptMedia {
             );
             label.add(egui::Label::new(RichText::new(&info.name).size(12.).color(INK)).truncate());
         }
-        if response
+        let response = response
             .on_hover_text(&info.name)
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .clicked()
-        {
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if response.clicked() {
             let loading = send(Purpose::Open);
             self.viewer = Some(Viewer {
                 id,
@@ -226,6 +225,7 @@ impl TranscriptMedia {
                 error: (!loading).then(|| "Could not load the attachment".to_owned()),
             });
         }
+        Some(response)
     }
 
     pub fn received(

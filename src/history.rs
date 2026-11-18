@@ -4,7 +4,7 @@ use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::media::MediaSource;
-use crate::{Attachment, Conversation, Delivery, Message, PAGE_SIZE};
+use crate::{Attachment, Conversation, Delivery, Message, PAGE_SIZE, Tapback, TapbackEvent};
 
 pub struct History(Connection);
 
@@ -35,6 +35,18 @@ impl History {
                 CHECK ((bytes IS NULL) != (reference IS NULL)),
                 PRIMARY KEY (message_id, position)
             );
+            CREATE TABLE IF NOT EXISTS tapback_events (
+                id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                address TEXT NOT NULL,
+                timestamp_ns INTEGER NOT NULL,
+                part INTEGER NOT NULL,
+                outgoing INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                removed INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS tapbacks_for_message
+                ON tapback_events(address, message_id, timestamp_ns, id);
         ")?;
         Ok(Self(db))
     }
@@ -71,6 +83,7 @@ impl History {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for row in &mut rows {
             row.attachments = self.attachment_info(&row.id)?;
+            row.tapbacks = self.tapbacks(&row.id, &row.address)?;
         }
         rows.reverse();
         Ok(rows)
@@ -89,6 +102,7 @@ impl History {
             [address],
         )?;
         transaction.execute("DELETE FROM messages WHERE address = ?1", [address])?;
+        transaction.execute("DELETE FROM tapback_events WHERE address = ?1", [address])?;
         transaction.commit()?;
         Ok(())
     }
@@ -106,8 +120,50 @@ impl History {
             [id], read_message).optional()?;
         if let Some(row) = &mut row {
             row.attachments = self.attachment_info(id)?;
+            row.tapbacks = self.tapbacks(id, &row.address)?;
         }
         Ok(row)
+    }
+
+    pub fn insert_tapback(&self, event: &TapbackEvent) -> Result<()> {
+        self.0.execute(
+            "INSERT INTO tapback_events (id, message_id, address, timestamp_ns, part, outgoing, kind, removed)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+             WHERE NOT EXISTS (SELECT 1 FROM deleted_messages WHERE id = ?2)
+             ON CONFLICT(id) DO NOTHING",
+            params![event.id.to_string(), event.target.to_string(), event.chat, event.timestamp_ns,
+                event.tapback.part, event.tapback.outgoing, serde_json::to_string(&event.tapback.kind)?,
+                event.removed],
+        )?;
+        Ok(())
+    }
+
+    pub fn tapbacks(&self, id: &str, address: &str) -> Result<Vec<Tapback>> {
+        let mut query = self.0.prepare_cached(
+            "SELECT part, outgoing, kind, removed FROM tapback_events
+             WHERE address = ?1 AND message_id = ?2 ORDER BY timestamp_ns, id",
+        )?;
+        let mut rows = query.query(params![address, id])?;
+        let mut active = std::collections::BTreeMap::new();
+        while let Some(row) = rows.next()? {
+            let part = row.get(0)?;
+            let outgoing = row.get(1)?;
+            let kind = serde_json::from_str(&row.get::<_, String>(2)?)?;
+            let removed: bool = row.get(3)?;
+            if !removed {
+                active.insert((part, outgoing), kind);
+            } else if active.get(&(part, outgoing)) == Some(&kind) {
+                active.remove(&(part, outgoing));
+            }
+        }
+        Ok(active
+            .into_iter()
+            .map(|((part, outgoing), kind)| Tapback {
+                kind,
+                outgoing,
+                part,
+            })
+            .collect())
     }
 
     fn attachment_info(&self, id: &str) -> Result<Vec<Attachment>> {
@@ -236,5 +292,53 @@ fn read_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
             _ => Delivery::Unknown,
         },
         attachments: Vec::new(),
+        tapbacks: Vec::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::TapbackKind;
+    use uuid::Uuid;
+
+    #[test]
+    fn tapbacks_survive_out_of_order_delivery_and_stay_in_the_right_conversation() -> Result<()> {
+        let folder = tempfile::tempdir()?;
+        let history = History::open(folder.path(), "reactions")?;
+        let target = Uuid::new_v4();
+        let chat = "mailto:friend@example.org";
+        let make = |timestamp_ns, kind, removed| TapbackEvent {
+            id: Uuid::new_v4(),
+            target,
+            chat: chat.into(),
+            timestamp_ns,
+            removed,
+            tapback: Tapback {
+                part: 0,
+                outgoing: false,
+                kind,
+            },
+        };
+        history.insert_tapback(&make(3, TapbackKind::Like, true))?;
+        history.insert_tapback(&make(1, TapbackKind::Heart, false))?;
+        history.insert_tapback(&make(2, TapbackKind::Like, false))?;
+        assert!(history.tapbacks(&target.to_string(), chat)?.is_empty());
+        let latest = make(5, TapbackKind::Laugh, false);
+        history.insert_tapback(&latest)?;
+        history.insert_tapback(&latest)?;
+        history.insert_tapback(&make(6, TapbackKind::Heart, true))?;
+        assert_eq!(
+            history.tapbacks(&target.to_string(), chat)?,
+            vec![latest.tapback]
+        );
+        assert!(
+            history
+                .tapbacks(&target.to_string(), "mailto:other@example.org")?
+                .is_empty()
+        );
+        history.delete_conversation(chat)?;
+        assert!(history.tapbacks(&target.to_string(), chat)?.is_empty());
+        Ok(())
+    }
 }

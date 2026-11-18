@@ -29,6 +29,56 @@ pub struct Message {
     pub status: Delivery,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tapbacks: Vec<Tapback>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TapbackKind {
+    Heart,
+    Like,
+    Dislike,
+    Laugh,
+    Emphasize,
+    Question,
+    Emoji(String),
+}
+
+impl TapbackKind {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        if let Self::Emoji(emoji) = self {
+            anyhow::ensure!(
+                (1..=64).contains(&emoji.len())
+                    && !emoji
+                        .chars()
+                        .any(|ch| ch.is_whitespace() || ch.is_control()),
+                "Choose a valid emoji reaction"
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Tapback {
+    pub kind: TapbackKind,
+    pub outgoing: bool,
+    pub part: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SetTapback {
+    pub reaction: Option<TapbackKind>,
+}
+
+pub(crate) struct TapbackEvent {
+    pub id: uuid::Uuid,
+    pub target: uuid::Uuid,
+    pub chat: String,
+    pub timestamp_ns: i64,
+    pub removed: bool,
+    pub tapback: Tapback,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
@@ -100,6 +150,10 @@ pub fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+pub(crate) fn now_ns() -> i64 {
+    chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
 }
 
 pub fn install_tls_provider() {

@@ -48,11 +48,8 @@ impl MessageText {
         }
     }
 
-    pub fn show(&self, ui: &mut Ui) -> Response {
+    pub fn show(&self, ui: &mut Ui, additional_menu: Option<impl FnOnce(&mut Ui)>) -> Response {
         let response = ui.add(egui::Label::new(self.galley.clone()).selectable(true));
-        if self.links.is_empty() {
-            return response;
-        }
         let link = self.pointer_link(ui, &response);
         let menu = response.id.with("link-menu");
         if response.secondary_clicked() {
@@ -64,15 +61,24 @@ impl MessageText {
                 }
             });
         }
-        if let Some(url) = ui.ctx().data_mut(|data| data.get_temp::<Url>(menu)) {
+        let menu_link = ui.ctx().data_mut(|data| data.get_temp::<Url>(menu));
+        if additional_menu.is_some() || menu_link.is_some() {
             response.context_menu(|ui| {
-                if ui.button("Open Link").clicked() {
-                    ui.ctx().open_url(egui::OpenUrl::new_tab(url.as_str()));
-                    ui.close();
+                if let Some(additional) = additional_menu {
+                    additional(ui);
+                    if menu_link.is_some() {
+                        ui.separator();
+                    }
                 }
-                if ui.button("Copy Link").clicked() {
-                    ui.ctx().copy_text(url.to_string());
-                    ui.close();
+                if let Some(url) = menu_link {
+                    if ui.button("Open Link").clicked() {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(url.as_str()));
+                        ui.close();
+                    }
+                    if ui.button("Copy Link").clicked() {
+                        ui.ctx().copy_text(url.to_string());
+                        ui.close();
+                    }
                 }
             });
         }

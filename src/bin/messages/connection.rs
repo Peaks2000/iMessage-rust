@@ -10,7 +10,8 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use eframe::egui;
 use linux_imessage::{
-    Conversation, FILE_LIMIT, Message, SendText, Status, api, engine::Engine, storage,
+    Conversation, FILE_LIMIT, Message, SendText, SetTapback, Status, Tapback, api, engine::Engine,
+    storage,
 };
 use reqwest::{Client, Method, RequestBuilder, StatusCode, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -70,6 +71,7 @@ pub enum Action {
     Refresh(Option<String>),
     Older { chat: String, offset: u32 },
     Send(SendText),
+    Tapback { id: uuid::Uuid, request: SetTapback },
     DeleteConversation(String),
     Attachment { id: AttachmentId, purpose: Purpose },
 }
@@ -90,6 +92,10 @@ pub enum Event {
     Sent {
         request: SendText,
         result: Result<Message>,
+    },
+    Tapback {
+        id: uuid::Uuid,
+        result: Result<Vec<Tapback>>,
     },
     ConversationDeleted {
         chat: String,
@@ -233,6 +239,10 @@ async fn work(
                 let result = backend.send(&request).await;
                 Event::Sent { request, result }
             }
+            Action::Tapback { id, request } => {
+                let result = backend.set_tapback(id, request).await;
+                Event::Tapback { id, result }
+            }
             Action::DeleteConversation(chat) => {
                 let result = backend.delete_conversation(&chat).await;
                 Event::ConversationDeleted { chat, result }
@@ -348,6 +358,21 @@ impl Backend {
                     )
                     .await?;
                 Ok(())
+            }
+        }
+    }
+
+    async fn set_tapback(&self, id: uuid::Uuid, request: SetTapback) -> Result<Vec<Tapback>> {
+        match self {
+            Self::Local(engine) => engine.set_tapback(id, request.reaction).await,
+            Self::Remote(remote) => {
+                remote
+                    .fetch(
+                        remote
+                            .request(Method::PUT, &format!("/v1/messages/{id}/tapback"))
+                            .json(&request),
+                    )
+                    .await
             }
         }
     }

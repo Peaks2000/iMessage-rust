@@ -15,10 +15,10 @@ use tokio::{
 use crate::media::MediaSource;
 use crate::{
     Conversation, Delivery, FILE_LIMIT, MAX_ATTACHMENTS, Message, SendText, Status, TEXT_LIMIT,
-    address, now_ms,
+    Tapback, TapbackEvent, TapbackKind, address, now_ms, now_ns,
 };
 use crate::{
-    apple::{Identity, Madrid},
+    apple::{Identity, Incoming, Madrid},
     history::History,
 };
 
@@ -36,6 +36,11 @@ struct State {
 
 enum Request {
     Send(SendText, oneshot::Sender<Result<Message>>),
+    Tapback {
+        target: uuid::Uuid,
+        reaction: Option<TapbackKind>,
+        reply: oneshot::Sender<Result<Vec<Tapback>>>,
+    },
     Download {
         id: uuid::Uuid,
         index: usize,
@@ -86,6 +91,27 @@ impl Engine {
 
     pub fn delete_conversation(&self, chat: &str) -> Result<()> {
         self.state.history()?.delete_conversation(&address(chat)?)
+    }
+
+    pub async fn set_tapback(
+        &self,
+        target: uuid::Uuid,
+        reaction: Option<TapbackKind>,
+    ) -> Result<Vec<Tapback>> {
+        if let Some(kind) = &reaction {
+            kind.validate()?;
+        }
+        let (reply, answer) = oneshot::channel();
+        self.requests
+            .try_send(Request::Tapback {
+                target,
+                reaction,
+                reply,
+            })
+            .context("The Apple engine is busy or stopped")?;
+        answer
+            .await
+            .context("The Apple engine stopped during the reaction")?
     }
 
     pub async fn send(&self, mut request: SendText) -> Result<Message> {
@@ -185,6 +211,9 @@ async fn run_apple(
                         Request::Download { reply, .. } => {
                             let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
                         }
+                        Request::Tapback { reply, .. } => {
+                            let _ = reply.send(Err(anyhow::anyhow!("Apple courier is disconnected")));
+                        }
                     }
                 }
             }
@@ -204,8 +233,10 @@ async fn online(
         tokio::select! {
             notification = madrid.next_notification() => {
                 let notification = notification?;
-                if let Some((message, media)) = madrid.decode(identity, &notification).await? {
-                    state.history()?.insert(&message, media)?;
+                match madrid.decode(identity, &notification).await? {
+                    Some(Incoming::Message(message, media)) => state.history()?.insert(&message, media)?,
+                    Some(Incoming::Tapback(event)) => state.history()?.insert_tapback(&event)?,
+                    None => (),
                 }
                 madrid.acknowledge(notification.id).await?;
             }
@@ -218,11 +249,63 @@ async fn online(
                     Request::Download { id, index, reply } => {
                         let _ = reply.send(download(identity, state, madrid, id, index).await);
                     }
+                    Request::Tapback { target, reaction, reply } => {
+                        let _ = reply.send(send_tapback(identity, state, madrid, target, reaction).await);
+                    }
                 }
             }
             _ = status.closed() => return Ok(()),
         }
     }
+}
+
+async fn send_tapback(
+    identity: &Identity,
+    state: &State,
+    madrid: &mut Madrid,
+    target: uuid::Uuid,
+    desired: Option<TapbackKind>,
+) -> Result<Vec<Tapback>> {
+    let message = state
+        .history()?
+        .get(&target.to_string())?
+        .context("This message is unavailable")?;
+    ensure!(
+        matches!(message.status, Delivery::Received | Delivery::Accepted),
+        "This message is awaiting delivery"
+    );
+    let previous = message
+        .tapbacks
+        .iter()
+        .find(|tapback| tapback.outgoing && tapback.part == 0)
+        .or_else(|| message.tapbacks.iter().find(|tapback| tapback.outgoing));
+    if previous.map(|tapback| &tapback.kind) == desired.as_ref() {
+        return Ok(message.tapbacks);
+    }
+    let removed = desired.is_none();
+    let kind = desired
+        .or_else(|| previous.map(|tapback| tapback.kind.clone()))
+        .context("No tapback to remove")?;
+    let event = TapbackEvent {
+        id: uuid::Uuid::new_v4(),
+        target,
+        chat: message.address.clone(),
+        timestamp_ns: now_ns(),
+        removed,
+        tapback: Tapback {
+            kind,
+            outgoing: true,
+            part: previous.map_or(0, |tapback| tapback.part),
+        },
+    };
+    let result = madrid.send_tapback(identity, &message, &event).await?;
+    ensure!(
+        result == Delivery::Accepted,
+        "Apple did not confirm the reaction"
+    );
+    let history = state.history()?;
+    history.insert_tapback(&event)?;
+    history.tapbacks(&message.id, &message.address)
 }
 
 async fn send_on_courier(
@@ -285,6 +368,7 @@ fn start_send(history: &History, request: &SendText) -> Result<(Message, bool)> 
         timestamp_ms: now_ms(),
         status: Delivery::Pending,
         attachments: request.files.iter().map(|file| file.info.clone()).collect(),
+        tapbacks: Vec::new(),
     };
     history.insert(
         &item,
@@ -394,6 +478,7 @@ mod tests {
             timestamp_ms: now_ms(),
             status: Delivery::Received,
             attachments: Vec::new(),
+            tapbacks: Vec::new(),
         };
         history.insert(&other, [])?;
         let engine = Engine {

@@ -8,7 +8,7 @@ use axum::{
     http::{HeaderValue, StatusCode, header, uri::Authority},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, put},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use openssl::{rand::rand_bytes, sha::sha256};
@@ -19,7 +19,8 @@ use url::{Host, Url};
 use zeroize::Zeroizing;
 
 use crate::{
-    Conversation, FILE_LIMIT, MAX_ATTACHMENTS, Message, SendText, Status, engine::Engine, storage,
+    Conversation, FILE_LIMIT, MAX_ATTACHMENTS, Message, SendText, SetTapback, Status, Tapback,
+    engine::Engine, storage,
 };
 
 #[derive(Clone)]
@@ -143,6 +144,7 @@ pub fn router(engine: Engine, access: AccessPolicy) -> Router {
             get(conversations).delete(delete_conversation),
         )
         .route("/v1/messages", get(messages).post(send))
+        .route("/v1/messages/{id}/tapback", put(set_tapback))
         .route("/v1/attachments/{id}/{index}", get(attachment))
         .layer(DefaultBodyLimit::max(
             FILE_LIMIT.div_ceil(3) * 4 + 48 * 1024,
@@ -180,6 +182,14 @@ async fn send(
     Json(request): Json<SendText>,
 ) -> Result<Json<Message>, Failure> {
     Ok(Json(engine.send(request).await?))
+}
+
+async fn set_tapback(
+    State(engine): State<Engine>,
+    RoutePath(id): RoutePath<uuid::Uuid>,
+    Json(request): Json<SetTapback>,
+) -> Result<Json<Vec<Tapback>>, Failure> {
+    Ok(Json(engine.set_tapback(id, request.reaction).await?))
 }
 
 async fn attachment(

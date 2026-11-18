@@ -13,6 +13,7 @@ mod provider_command;
 mod provisioning;
 mod registration;
 mod ssh_setup;
+mod tapback;
 pub use gsa::{
     SmsPrompts, TrustedDeviceResponse, TrustedPhone, authorize_icloud_contacts, login_device_sms,
 };
@@ -22,7 +23,7 @@ pub use registration::register_device;
 pub use ssh_setup::{SshPrompt, run_ssh_askpass};
 
 use anyhow::{Context, Result, ensure};
-pub(crate) use madrid::Madrid;
+pub(crate) use madrid::{Incoming, Madrid};
 use openssl::{
     hash::MessageDigest,
     pkey::{Id, PKey, PKeyRef, Private},
