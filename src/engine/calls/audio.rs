@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     future::pending,
     process::Stdio,
     time::{Duration, Instant},
@@ -10,6 +11,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     process::{Child, ChildStdout, Command},
     sync::{mpsc, watch},
+    time::{Instant as PlaybackInstant, timeout_at},
 };
 use zeroize::Zeroizing;
 
@@ -27,6 +29,8 @@ use super::{
 const PCM_BYTES: usize = FRAME_SAMPLES * size_of::<i16>();
 const MAX_ACCESS_UNITS: usize = 8;
 const MAX_CONCEALED_PACKETS: u16 = 3;
+const MAX_QUEUED_AUDIO_PACKETS: usize = 6;
+const AUDIO_REORDER_DELAY: Duration = Duration::from_millis(30);
 
 impl AnsweredCall {
     /// Run an accepted audio call on the default Linux microphone and speakers.
@@ -102,7 +106,7 @@ impl AnsweredCall {
             .stdin
             .take()
             .context("Opening FaceTime speaker stream")?;
-        let (packets, queued) = mpsc::channel(6);
+        let (packets, queued) = mpsc::channel(MAX_QUEUED_AUDIO_PACKETS);
         let mut rtp = AudioSender::new(self.local_description.audio.ssrc)?;
         let mut feedback = AudioFeedback::default();
         let incoming_ssrc = self.remote_description.audio.ssrc;
@@ -480,6 +484,90 @@ fn red_primary(mut payload: &[u8]) -> Option<(u8, &[u8])> {
     }
 }
 
+struct QueuedAudio {
+    header: CallRtpHeader,
+    packet: Zeroizing<Vec<u8>>,
+    deadline: PlaybackInstant,
+}
+
+#[derive(Default)]
+struct AudioQueue {
+    expected: Option<u16>,
+    waiting: VecDeque<QueuedAudio>,
+}
+
+impl AudioQueue {
+    fn insert(&mut self, packet: QueuedAudio) {
+        let sequence = packet.header.sequence;
+        let expected = *self.expected.get_or_insert(sequence);
+        let distance = sequence.wrapping_sub(expected);
+        if distance >= 0x8000 {
+            return;
+        }
+        let index = self
+            .waiting
+            .partition_point(|pending| pending.header.sequence.wrapping_sub(expected) < distance);
+        if self
+            .waiting
+            .get(index)
+            .is_none_or(|pending| pending.header.sequence != sequence)
+        {
+            self.waiting.insert(index, packet);
+        }
+    }
+
+    async fn next(
+        &mut self,
+        input: &mut mpsc::Receiver<Zeroizing<Vec<u8>>>,
+        ssrc: u32,
+    ) -> Option<(QueuedAudio, u16)> {
+        loop {
+            let incoming = if let Some(first) = self.waiting.front() {
+                let sequence = first.header.sequence;
+                let gap = sequence.wrapping_sub(self.expected.unwrap_or(sequence));
+                let deadline = self
+                    .waiting
+                    .iter()
+                    .map(|packet| packet.deadline)
+                    .min()
+                    .unwrap_or(first.deadline);
+                // Give an out-of-order packet a short chance to arrive before concealing the loss.
+                if gap == 0
+                    || self.waiting.len() >= MAX_QUEUED_AUDIO_PACKETS
+                    || deadline <= PlaybackInstant::now()
+                    || (input.is_closed() && input.is_empty())
+                {
+                    self.expected = Some(sequence.wrapping_add(1));
+                    return self.waiting.pop_front().map(|packet| (packet, gap));
+                }
+                match timeout_at(deadline, input.recv()).await {
+                    Ok(packet) => packet,
+                    Err(_) => continue,
+                }
+            } else {
+                input.recv().await
+            };
+            let Some(packet) = incoming else {
+                // A closed channel can still have packets queued for playback above.
+                if self.waiting.is_empty() {
+                    return None;
+                }
+                continue;
+            };
+            let Some(header) = CallRtpHeader::parse(&packet).filter(|header| {
+                header.ssrc == ssrc && matches!(header.payload_type, AAC_ELD_PT | AUDIO_RED_PT)
+            }) else {
+                continue;
+            };
+            self.insert(QueuedAudio {
+                header,
+                packet,
+                deadline: PlaybackInstant::now() + AUDIO_REORDER_DELAY,
+            });
+        }
+    }
+}
+
 async fn play_audio(
     mut output: impl AsyncWrite + Unpin,
     mut decoder: Decoder,
@@ -488,24 +576,16 @@ async fn play_audio(
 ) -> Result<()> {
     let mut samples = Zeroizing::new([0i16; FRAME_SAMPLES]);
     let mut bytes = Zeroizing::new([0u8; PCM_BYTES]);
-    let mut previous: Option<u16> = None;
-    while let Some(packet) = packets.recv().await {
-        let Some(header) = CallRtpHeader::parse(&packet).filter(|header| header.ssrc == ssrc)
-        else {
-            continue;
-        };
-        let distance = previous.map_or(1, |sequence| header.sequence.wrapping_sub(sequence));
-        if distance == 0 || distance >= 0x8000 {
-            continue;
-        }
-        previous = Some(header.sequence);
+    let mut queue = AudioQueue::default();
+    while let Some((QueuedAudio { header, packet, .. }, gap)) = queue.next(&mut packets, ssrc).await
+    {
         let Some(units) = header
             .payload(&packet)
             .and_then(|payload| access_units(header.payload_type, payload))
         else {
             continue;
         };
-        let gaps = distance.saturating_sub(1).min(MAX_CONCEALED_PACKETS);
+        let gaps = gap.min(MAX_CONCEALED_PACKETS);
         for unit in std::iter::repeat_n(None, gaps.into()).chain(units.into_iter().map(Some)) {
             if decoder.decode(unit, &mut samples).is_err() {
                 continue;
@@ -646,6 +726,42 @@ mod tests {
             assert!(access_units(20, malformed).is_none());
         }
         assert!(access_units(104, &[1, 0].repeat(9)).is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audio_queue_recovers_late_frames_across_rollover_and_bounds_loss_wait() -> Result<()> {
+        let (send, mut receive) = mpsc::channel(MAX_QUEUED_AUDIO_PACKETS);
+        let mut queue = AudioQueue::default();
+        let mut rtp = AudioSender::new(42)?;
+        let feedback = AudioFeedback::default();
+        let mut packet = |sequence| {
+            rtp.sequence = sequence;
+            rtp.frame(&[1], &feedback).unwrap()
+        };
+
+        send.try_send(packet(u16::MAX - 1))?;
+        let (first, gaps) = queue.next(&mut receive, 42).await.unwrap();
+        assert_eq!((first.header.sequence, gaps), (u16::MAX - 1, 0));
+        send.try_send(packet(0))?;
+        send.try_send(packet(0))?;
+        let mut next = Box::pin(queue.next(&mut receive, 42));
+        assert!(futures_util::poll!(&mut next).is_pending());
+        send.try_send(packet(u16::MAX))?;
+        let (recovered, gaps) = next.await.unwrap();
+        assert_eq!((recovered.header.sequence, gaps), (u16::MAX, 0));
+        let (following, gaps) = queue.next(&mut receive, 42).await.unwrap();
+        assert_eq!((following.header.sequence, gaps), (0, 0));
+
+        send.try_send(packet(u16::MAX))?;
+        send.try_send(packet(2))?;
+        let (newest, gaps) =
+            tokio::time::timeout(Duration::from_millis(500), queue.next(&mut receive, 42))
+                .await?
+                .unwrap();
+        assert_eq!((newest.header.sequence, gaps), (2, 1));
+        drop(send);
+        assert!(queue.next(&mut receive, 42).await.is_none());
         Ok(())
     }
 
