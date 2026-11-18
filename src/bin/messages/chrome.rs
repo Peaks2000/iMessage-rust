@@ -297,14 +297,14 @@ pub(super) fn icon_button(
     response.on_hover_text(label)
 }
 
-pub(super) fn traffic_lights(ui: &mut Ui) {
+pub(super) fn traffic_lights(ui: &mut Ui) -> bool {
     let size = vec2(56., 20.);
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     let controls = [
         (
             Color32::from_rgb(255, 95, 87),
             Color32::from_rgb(149, 33, 29),
-            "Close",
+            "Close Window",
         ),
         (
             Color32::from_rgb(254, 188, 46),
@@ -323,6 +323,7 @@ pub(super) fn traffic_lights(ui: &mut Ui) {
         ui.rect_contains_pointer(rect.expand(2.0)),
         0.12,
     );
+    let mut quit = false;
     for (index, (fill, glyph, label)) in controls.into_iter().enumerate() {
         let at = pos2(rect.left() + 7.5 + index as f32 * 18.5, rect.center().y);
         let button = ui.interact(
@@ -378,8 +379,19 @@ pub(super) fn traffic_lights(ui: &mut Ui) {
             };
             ui.ctx().send_viewport_cmd(command);
         }
+        if index == 0 {
+            button.context_menu(|ui| {
+                quit = ui
+                    .add(egui::Button::new("Quit iMessage").shortcut_text("Ctrl+Q"))
+                    .clicked();
+                if quit {
+                    ui.close();
+                }
+            });
+        }
         button.on_hover_text(label);
     }
+    quit
 }
 
 pub(super) fn drag_region(ui: &mut Ui, rect: Rect) {

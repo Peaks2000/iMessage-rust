@@ -38,6 +38,7 @@ pub(super) struct Clipboard {
     queue: EventQueue<Selection>,
     selection: Selection,
     activation: Option<XdgActivationV1>,
+    surface: Option<WlSurface>,
 }
 
 struct Selection {
@@ -71,20 +72,37 @@ impl Clipboard {
             queue,
             selection,
             activation,
+            surface: None,
         })
     }
 
-    pub(super) fn activate_window(&self, window: WindowHandle<'_>, token: String) -> Result<()> {
-        if let (Some(activation), RawWindowHandle::Wayland(window)) =
-            (&self.activation, window.as_raw())
+    pub(super) fn remember_surface(&mut self, window: WindowHandle<'_>) {
+        if self.activation.is_some()
+            && self
+                .surface
+                .as_ref()
+                .is_none_or(|surface| !surface.is_alive())
+            && let RawWindowHandle::Wayland(window) = window.as_raw()
         {
-            // Eframe borrows the current window. Its surface belongs to the same display
-            // as our event queue and is used only for the synchronous activation request.
-            let id = unsafe {
+            // Winit owns this proxy on our display. Its Wayland backend tracks when it is
+            // destroyed. The event loop uses it only on this thread and clears it on teardown.
+            self.surface = unsafe {
                 ObjectId::from_ptr(WlSurface::interface(), window.surface.as_ptr().cast())
-            }?;
-            let surface = WlSurface::from_id(&self.connection, id)?;
-            activation.activate(token, &surface);
+            }
+            .ok()
+            .and_then(|id| WlSurface::from_id(&self.connection, id).ok());
+        }
+    }
+
+    pub(super) fn forget_surface(&mut self) {
+        self.surface = None;
+    }
+
+    pub(super) fn activate_window(&self, token: String) -> Result<()> {
+        if let (Some(activation), Some(surface)) = (&self.activation, &self.surface)
+            && surface.is_alive()
+        {
+            activation.activate(token, surface);
             self.connection.flush()?;
         }
         Ok(())

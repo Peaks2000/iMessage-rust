@@ -1,8 +1,8 @@
 use std::{
-    cell::{Cell, RefCell},
+    cell::{Cell, OnceCell, RefCell},
     rc::Rc,
     sync::mpsc::Receiver,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -11,15 +11,20 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle};
 use winit::{
     application::ApplicationHandler,
     event::{DeviceEvent, DeviceId, ElementState, KeyEvent, StartCause, WindowEvent},
-    event_loop::{ActiveEventLoop, EventLoop},
+    event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy},
     keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey},
     window::WindowId,
 };
 
-use super::attachments::{self, LoadedFile};
+use super::{
+    attachments::{self, LoadedFile},
+    window::MessagesApp,
+};
 
 #[path = "clipboard/wayland.rs"]
 mod wayland;
+
+const RING_ACTION_WAKE: &str = "native-call-wake";
 
 pub(super) struct Clipboard {
     requested: Cell<bool>,
@@ -35,11 +40,23 @@ impl Clipboard {
         })
     }
 
-    pub(super) fn activate_window(&self, frame: &eframe::Frame, token: String) {
-        if let Some(wayland) = &*self.wayland.borrow()
+    pub(super) fn remember_window(&self, frame: &eframe::Frame) {
+        if let Some(wayland) = &mut *self.wayland.borrow_mut()
             && let Ok(window) = frame.window_handle()
         {
-            let _ = wayland.activate_window(window, token);
+            wayland.remember_surface(window);
+        }
+    }
+
+    pub(super) fn activate_window(&self, token: String) {
+        if let Some(wayland) = &*self.wayland.borrow() {
+            let _ = wayland.activate_window(token);
+        }
+    }
+
+    fn forget_window(&self) {
+        if let Some(wayland) = &mut *self.wayland.borrow_mut() {
+            wayland.forget_surface();
         }
     }
 
@@ -105,16 +122,20 @@ impl Clipboard {
 
 pub(super) fn run(
     name: &str,
-    options: NativeOptions,
-    create: impl FnOnce(&CreationContext<'_>, Rc<Clipboard>) -> Box<dyn eframe::App>,
+    mut options: NativeOptions,
+    create: impl FnOnce(&CreationContext<'_>, Rc<Clipboard>) -> MessagesApp,
 ) -> Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
+    let proxy = event_loop.create_proxy();
     let wayland = match event_loop
         .display_handle()
         .ok()
         .map(|handle| handle.as_raw())
     {
         Some(RawDisplayHandle::Wayland(display)) => {
+            // The compositor paces redraws. Waiting for a swap can block the event loop
+            // when a minimized window no longer receives frame callbacks.
+            options.vsync = false;
             // This clipboard is dropped in exiting, while the event loop owns the display.
             unsafe { wayland::Clipboard::new(display) }.ok()
         }
@@ -125,18 +146,76 @@ pub(super) fn run(
         wayland: RefCell::new(wayland),
     });
     let app_clipboard = clipboard.clone();
+    let state = Rc::new(OnceCell::new());
+    let app_state = state.clone();
     let app = eframe::create_native(
         name,
         options,
-        Box::new(move |context| Ok(create(context, app_clipboard))),
+        Box::new(move |context| {
+            context.egui_ctx.data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new(RING_ACTION_WAKE),
+                    Some(RingActionWake {
+                        proxy,
+                        pending: false,
+                    }),
+                );
+            });
+            let app = Rc::new(RefCell::new(create(context, app_clipboard)));
+            app_state.get_or_init(|| (context.egui_ctx.clone(), app.clone()));
+            Ok(Box::new(SharedApp(app)))
+        }),
         &event_loop,
     );
     event_loop.run_app(&mut NativeApp {
         app,
         clipboard,
+        state,
         modifiers: ModifiersState::empty(),
     })?;
     Ok(())
+}
+
+type AppState = Rc<OnceCell<(egui::Context, Rc<RefCell<MessagesApp>>)>>;
+
+struct SharedApp(Rc<RefCell<MessagesApp>>);
+
+impl eframe::App for SharedApp {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+        self.0.borrow_mut().raw_input_hook(ctx, input);
+    }
+
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        self.0.borrow().clear_color(visuals)
+    }
+
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.0.borrow_mut().update(ctx, frame);
+    }
+}
+
+#[derive(Clone)]
+struct RingActionWake {
+    proxy: EventLoopProxy<UserEvent>,
+    pending: bool,
+}
+
+pub(super) fn wake_for_ring_action(ctx: &egui::Context) {
+    let proxy = ctx.data_mut(|data| {
+        let wake =
+            data.get_temp_mut_or_default::<Option<RingActionWake>>(egui::Id::new(RING_ACTION_WAKE));
+        let wake = wake.as_mut()?;
+        wake.pending = true;
+        Some(wake.proxy.clone())
+    });
+    if let Some(proxy) = proxy {
+        // A compositor can suspend redraws for a minimized window. Wake the event loop directly.
+        let _ = proxy.send_event(UserEvent::RequestRepaint {
+            viewport_id: egui::ViewportId::ROOT,
+            when: Instant::now(),
+            cumulative_pass_nr: ctx.cumulative_pass_nr_for(egui::ViewportId::ROOT),
+        });
+    }
 }
 
 // egui-winit 0.33 turns paste into a text event and consumes the key press.
@@ -144,12 +223,14 @@ pub(super) fn run(
 struct NativeApp<'a> {
     app: EframeWinitApplication<'a>,
     clipboard: Rc<Clipboard>,
+    state: AppState,
     modifiers: ModifiersState,
 }
 
 impl ApplicationHandler<UserEvent> for NativeApp<'_> {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         match &event {
+            WindowEvent::Destroyed => self.clipboard.forget_window(),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::Focused(false) => {
                 self.modifiers = ModifiersState::empty();
@@ -176,6 +257,18 @@ impl ApplicationHandler<UserEvent> for NativeApp<'_> {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        if let Some((ctx, app)) = self.state.get() {
+            let pending = ctx.data_mut(|data| {
+                data.get_temp_mut_or_default::<Option<RingActionWake>>(egui::Id::new(
+                    RING_ACTION_WAKE,
+                ))
+                .as_mut()
+                .is_some_and(|wake| std::mem::take(&mut wake.pending))
+            });
+            if pending {
+                app.borrow_mut().process_notification_action(ctx);
+            }
+        }
         self.app.user_event(event_loop, event);
     }
 
@@ -188,6 +281,7 @@ impl ApplicationHandler<UserEvent> for NativeApp<'_> {
     }
 
     fn suspended(&mut self, event_loop: &ActiveEventLoop) {
+        self.clipboard.forget_window();
         self.app.suspended(event_loop);
     }
 

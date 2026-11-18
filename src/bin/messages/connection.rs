@@ -28,6 +28,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use super::attachments::{AttachmentId, Contents, Purpose};
+use super::clipboard::wake_for_ring_action;
 use super::ringing::{RingAction, RingAlert, RingPause};
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -486,11 +487,12 @@ async fn watch_calls(
                     call.clone(),
                     can_answer,
                     move |action, token| {
-                        emit(
-                            &events,
-                            &context,
-                            Event::IncomingCallAction { id, action, token },
-                        );
+                        if events
+                            .send(Event::IncomingCallAction { id, action, token })
+                            .is_ok()
+                        {
+                            wake_for_ring_action(&context);
+                        }
                     },
                 ));
             }

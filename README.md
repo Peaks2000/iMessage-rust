@@ -29,6 +29,8 @@ The engine supports one-to-one text and attachments with devices that accept the
 
 With a local Apple session registered for FaceTime, open the camera menu beside a conversation to place a **FaceTime Audio** or **FaceTime Video** call. You can answer or decline an incoming call from the app or from a desktop notification that supports actions. For a video ring, choose **Answer Video** or **Answer as Audio**. If `canberra-gtk-play` is available, iMessage repeats the desktop sound theme's incoming-call tone until you respond or the call ends. During a video call, **Camera Off** stops local capture. FaceTime audio uses the PulseAudio-compatible `parec` and `pacat` tools. Video uses a V4L2 camera and FFmpeg with `libx265`.
 
+With FaceTime enabled, closing the window minimizes iMessage so it can continue receiving calls. Press **Ctrl+Q** or right-click **Close Window** and choose **Quit iMessage** to exit.
+
 ## Sync iCloud Contacts
 
 The Linux desktop uses the Apple Account from local iMessage setup to authorize iCloud Contacts. If you already signed in with an older build or imported a session, open **Settings → iCloud Contacts → Authorize Contacts…** once. You can also connect Contacts with an [app-specific password from Apple](https://support.apple.com/en-us/102654) when you use Server mode without a local Apple session.

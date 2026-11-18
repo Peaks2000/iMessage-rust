@@ -83,6 +83,7 @@ pub struct MessagesApp {
     declining_call: Option<Uuid>,
     call_error: Option<(Uuid, String)>,
     call_activation: Option<String>,
+    quitting: bool,
 }
 
 struct DesktopCall {
@@ -186,6 +187,7 @@ impl MessagesApp {
             declining_call: None,
             call_error: None,
             call_activation: None,
+            quitting: false,
         }
     }
 
@@ -674,7 +676,9 @@ impl MessagesApp {
                         bar.min + vec2(16., 14.),
                         vec2(56., 20.),
                     )));
-                    chrome::traffic_lights(&mut lights);
+                    if chrome::traffic_lights(&mut lights) {
+                        self.quit(ctx);
+                    }
                 }
                 let compose_width = if compact { 30. } else { 38. };
                 if compact {
@@ -1810,7 +1814,7 @@ impl MessagesApp {
     }
 
     fn respond_to_ring(&mut self, id: Uuid, action: RingAction) -> bool {
-        if self.active_call.is_some() || self.declining_call.is_some() {
+        if self.quitting || self.active_call.is_some() || self.declining_call.is_some() {
             return false;
         }
         let Some(connection) = &self.connection else {
@@ -1875,6 +1879,38 @@ impl MessagesApp {
                 });
             }
             Err(error) => self.error = Some(error.to_string()),
+        }
+    }
+
+    fn quit(&mut self, ctx: &egui::Context) {
+        self.quitting = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    fn handle_window_actions(&mut self, ctx: &egui::Context) {
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Q)) {
+            self.quit(ctx);
+        } else if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::W)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
+        if !self.quitting
+            && ctx.input(|input| input.viewport().close_requested())
+            && self.connection.is_some()
+            && self
+                .status
+                .as_ref()
+                .is_some_and(|status| status.facetime_registered)
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+    }
+
+    pub(super) fn process_notification_action(&mut self, ctx: &egui::Context) {
+        self.process(ctx);
+        if let Some(token) = self.call_activation.take() {
+            self.clipboard.activate_window(token);
         }
     }
 
@@ -2197,10 +2233,9 @@ impl eframe::App for MessagesApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        self.process(ctx);
-        if let Some(token) = self.call_activation.take() {
-            self.clipboard.activate_window(frame, token);
-        }
+        self.clipboard.remember_window(frame);
+        self.process_notification_action(ctx);
+        self.handle_window_actions(ctx);
         let paste = self.clipboard.take_paste_request(ctx);
         if self.settings.is_none()
             && self.delete_conversation.is_none()
@@ -2795,6 +2830,60 @@ fn window_edge(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_the_window_keeps_a_face_time_session_available_until_quit() -> anyhow::Result<()> {
+        let ctx = egui::Context::default();
+        let root = tempfile::tempdir()?;
+        let mut app = MessagesApp::new(&ctx, root.path().to_owned(), true, Clipboard::empty());
+        let (connection, _actions, _events) = Connection::test_channels();
+        app.connection = Some(connection);
+        let mut frame = |registered, quit| {
+            app.status = Some(Status {
+                connected: false,
+                detail: String::new(),
+                tapback_revision: None,
+                facetime_registered: registered,
+                incoming_calls: Vec::new(),
+            });
+            let mut input = egui::RawInput::default();
+            input
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .events
+                .push(egui::ViewportEvent::Close);
+            if quit {
+                let modifiers = egui::Modifiers {
+                    ctrl: true,
+                    command: true,
+                    ..Default::default()
+                };
+                input.modifiers = modifiers;
+                input.events.push(egui::Event::Key {
+                    key: egui::Key::Q,
+                    physical_key: Some(egui::Key::Q),
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                });
+            }
+            ctx.run(input, |ctx| app.handle_window_actions(ctx))
+                .viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .clone()
+        };
+        assert!(frame(false, false).is_empty());
+        assert_eq!(
+            frame(true, false),
+            [
+                egui::ViewportCommand::CancelClose,
+                egui::ViewportCommand::Minimized(true)
+            ]
+        );
+        assert_eq!(frame(true, true), [egui::ViewportCommand::Close]);
+        Ok(())
+    }
 
     #[test]
     fn tapback_menu_replaces_a_legacy_reaction_with_a_pasted_emoji() -> anyhow::Result<()> {

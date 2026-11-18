@@ -58,11 +58,6 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
     clipboard::run("Messages for Linux", options, move |context, clipboard| {
-        Box::new(window::MessagesApp::new(
-            &context.egui_ctx,
-            root,
-            args.mac_setup,
-            clipboard,
-        ))
+        window::MessagesApp::new(&context.egui_ctx, root, args.mac_setup, clipboard)
     })
 }
