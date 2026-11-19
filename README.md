@@ -1,5 +1,5 @@
 # Messages for Linux
-# !!⚠️Warning⚠️!! I actually got banned from iMessage it might have been due to this project.
+# !!⚠️Warning⚠️!! I actually got banned from iMessage it might have been due to this project within only 2 days of using it I strongly encourage you to not use it.
 
 A desktop app for Linux modelled on macOS Sequoia Messages, an optional self-hosted server, and an experimental Rust engine that talks directly to Apple's APNs and Identity Service (IDS). The desktop app can run the engine on the same computer or connect to the Rust server.
 
